@@ -13,6 +13,8 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 
 import java.nio.charset.StandardCharsets;
@@ -54,8 +56,15 @@ public class LLMAnalysisService {
     @Value("${gemini.api.key:YOUR_GEMINI_API_KEY_HERE}")
     private String geminiApiKey;
 
-    @Value("${gemini.model:gemini-3.5-flash-lite}")
+    @Value("${gemini.model:gemini-2.5-flash}")
     private String geminiModel;
+
+    private static final List<String> STABLE_GEMINI_MODELS = List.of(
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro"
+    );
 
     /**
      * SBOM 인벤토리 통계 레코드
@@ -316,8 +325,13 @@ public class LLMAnalysisService {
                 // 5. Reachability, 비즈니스 로직, 런타임/Base Image 검증 및 커스텀 정책 주입 프롬프트 생성
                 String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config);
 
-                // 6. Google Gemini API 호출
-                reportText = callGeminiApi(prompt);
+                // 6. Google Gemini API 호출 (일시적 503/429 장애 시 지수 백오프 및 다중 모델 Fallback 후 자가 복구 리포트 생성)
+                try {
+                    reportText = callGeminiApi(prompt);
+                } catch (Exception llmEx) {
+                    log.warn("[LLMAnalysis] ⚠️ 모든 Gemini 모델 호출 일시 장애 발생({}). Trivy 정적 전수 검사 결과 기반으로 자가 복구 리포트를 생성합니다.", llmEx.getMessage());
+                    reportText = buildFallbackDeterministicReport(summaryPayload, config);
+                }
 
                 // 7. SecurityVerdict 종합 판정
                 if (reportText.contains("[!CAUTION]") || hasBlockingVulnerabilities(summaryPayload, config)) {
@@ -865,7 +879,7 @@ public class LLMAnalysisService {
     }
 
     /**
-     * Google Gemini API 호출 (최신 모델: gemini-3.5-flash-lite / fallback: gemini-3.8-flash)
+     * Google Gemini API 호출 (지수 백오프 재시도 및 안정화 모델 다중 Fallback 체인 적용)
      */
     private String callGeminiApi(String prompt) {
         if (geminiApiKey == null || geminiApiKey.isBlank() || "YOUR_GEMINI_API_KEY_HERE".equals(geminiApiKey)) {
@@ -876,7 +890,15 @@ public class LLMAnalysisService {
                     """;
         }
 
-        log.info("[LLMAnalysis] Google Gemini API 호출 시작 (Model: {})", geminiModel);
+        List<String> modelsToTry = new ArrayList<>();
+        if (geminiModel != null && !geminiModel.isBlank()) {
+            modelsToTry.add(geminiModel.trim());
+        }
+        for (String m : STABLE_GEMINI_MODELS) {
+            if (!modelsToTry.contains(m)) {
+                modelsToTry.add(m);
+            }
+        }
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
@@ -890,31 +912,56 @@ public class LLMAnalysisService {
         );
 
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestPayload, headers);
+        Exception lastException = null;
 
-        // 1차 시도: 설정된 모델 (gemini-3.5-flash-lite)
-        String primaryUrl = "https://generativelanguage.googleapis.com/v1beta/models/" + geminiModel + ":generateContent?key=" +
-                    geminiApiKey;
+        for (String currentModel : modelsToTry) {
+            String url = "https://generativelanguage.googleapis.com/v1beta/models/" + currentModel + ":generateContent?key=" + geminiApiKey;
 
-        try {
-            return requestAndParseGemini(primaryUrl, entity);
-        } catch (HttpClientErrorException e) {
-            log.warn("[LLMAnalysis] {} 호출 실패 ({}), gemini-3.8-flash 로 재시도합니다.", geminiModel, e.getStatusCode());
-            String fallbackUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=" + geminiApiKey;
-            return requestAndParseGemini(fallbackUrl, entity);
-        } catch (Exception e) {
-            log.error("[LLMAnalysis] Gemini API 통신 중 오류 발생: {}", e.getMessage(), e);
-            throw new RuntimeException("Gemini API 연동 실패: " + e.getMessage(), e);
+            // 모델당 최대 2회 시도 (503 High demand, 429 Rate limit 시 지수 백오프)
+            for (int attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    log.info("[LLMAnalysis] Google Gemini API 호출 (모델: {}, 시도: {}/2)", currentModel, attempt);
+                    return requestAndParseGemini(url, entity);
+                } catch (HttpStatusCodeException e) {
+                    lastException = e;
+                    int statusCode = e.getStatusCode().value();
+
+                    // 503 (High demand) 또는 429 (Rate limit) 또는 500/502/504 서버 오류 시 대기 후 재시도
+                    if (statusCode == 503 || statusCode == 429 || statusCode >= 500) {
+                        log.warn("[LLMAnalysis] 모델 {} 일시적 장애(HTTP {}): {}. 지수 백오프 대기 후 재시도합니다.",
+                                currentModel, statusCode, e.getStatusText());
+                        try {
+                            Thread.sleep(attempt * 1200L); // 1.2초, 2.4초 대기
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    } else if (statusCode == 404) {
+                        log.warn("[LLMAnalysis] 모델 {}이(가) 현재 엔드포인트에 존재하지 않습니다(404). 다음 대체 모델로 즉시 전환합니다.", currentModel);
+                        break;
+                    } else {
+                        log.warn("[LLMAnalysis] 모델 {} 호출 중 클라이언트 오류 발생(HTTP {}): {}", currentModel, statusCode, e.getMessage());
+                        break;
+                    }
+                } catch (Exception e) {
+                    lastException = e;
+                    log.warn("[LLMAnalysis] 모델 {} 호출 중 네트워크/파싱 예외 발생: {}", currentModel, e.getMessage());
+                    break;
+                }
+            }
         }
+
+        throw new RuntimeException("모든 Gemini 모델(" + modelsToTry + ") 호출 실패: " +
+                (lastException != null ? lastException.getMessage() : "상세 사유 미확인"), lastException);
     }
 
     private String requestAndParseGemini(String url, HttpEntity<Map<String, Object>> entity) {
+        ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+
+        if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
+            throw new RuntimeException("Gemini API 호출 실패 (HTTP " + response.getStatusCode() + ")");
+        }
+
         try {
-            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
-
-            if (!response.getStatusCode().is2xxSuccessful() || response.getBody() == null) {
-                throw new RuntimeException("Gemini API 호출 실패 (HTTP " + response.getStatusCode() + ")");
-            }
-
             JsonNode rootNode = objectMapper.readTree(response.getBody());
             JsonNode textNode = rootNode.path("candidates")
                     .path(0)
@@ -929,11 +976,60 @@ public class LLMAnalysisService {
             }
 
             return textNode.asText();
-
-        } catch (HttpClientErrorException e) {
-            throw e;
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            throw new RuntimeException("Gemini 응답 파싱 실패", e);
         }
+    }
+
+    /**
+     * Gemini API 일시 장애(503 High demand 등) 시 Trivy 정적 전수 검사 데이터를 기반으로
+     * 파이프라인 중단 없이 안전하게 자동 판정하는 자가 복구 리포트 생성기.
+     */
+    public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config) {
+        StringBuilder sb = new StringBuilder();
+
+        if (hasBlockingVulnerabilities(payload, config)) {
+            sb.append("> [!CAUTION]\n");
+            sb.append("> ### 차단 권고 (BLOCK)\n");
+            sb.append("> 심각한 보안 취약점(CRITICAL/HIGH)이 검출되어 병합이 차단되었습니다.\n>\n");
+        } else if (payload.hasSecurityFindings()) {
+            sb.append("> [!WARNING]\n");
+            sb.append("> ### 주의 (WARN)\n");
+            sb.append("> 보안 취약점 또는 주의 사항이 검출되었습니다. 내용을 검토 후 병합을 결정하세요.\n>\n");
+        } else {
+            sb.append("> [!TIP]\n");
+            sb.append("> ### 승인 (PASS)\n");
+            sb.append("> 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.\n>\n");
+        }
+
+        sb.append("> - **오픈소스 취약점 (CVE):** 총 ").append(payload.totalVulnerabilitiesCount()).append("건");
+        if (payload.totalVulnerabilitiesCount() == 0) {
+            sb.append(" (안전)\n");
+        } else {
+            sb.append(" (CRITICAL ").append(payload.vulnStats().criticalCount())
+              .append("건, HIGH ").append(payload.vulnStats().highCount()).append("건)\n");
+        }
+        sb.append("> - **코드 로직 및 설정 결함:** 총 ").append(payload.totalMisconfigCount() + payload.totalSecretCount()).append("건");
+        if ((payload.totalMisconfigCount() + payload.totalSecretCount()) == 0) {
+            sb.append(" (안전)\n");
+        } else {
+            sb.append("\n");
+        }
+
+        sb.append("\n> [!NOTE]\n");
+        sb.append("> AI 심층 분석 서비스(Gemini)가 일시적 트래픽 폭주(Google 503) 상태이므로, Trivy 정적 보안 엔진의 전수 분석 결과를 기반으로 안전하게 자동 판정되었습니다.\n");
+
+        if (payload.totalVulnerabilitiesCount() > 0) {
+            sb.append("\n---\n\n### 1. 오픈소스 취약점 (CVE) — 총 ").append(payload.totalVulnerabilitiesCount()).append("건\n\n");
+            sb.append("<details open>\n<summary><b>상세 취약점 내역 보기</b></summary>\n\n");
+            for (VulnerabilityDetail vuln : payload.topVulnerabilities()) {
+                sb.append("- **[").append(vuln.severity()).append("] `").append(vuln.pkgName()).append("` (").append(vuln.vulnerabilityId()).append(")**\n");
+                sb.append("  - **설치 버전:** `").append(vuln.installedVersion()).append("` -> **수정 버전:** `").append(vuln.fixedVersion().isBlank() ? "패치 대기" : vuln.fixedVersion()).append("`\n");
+                sb.append("  - **위협 요약:** ").append(vuln.title().isBlank() ? "알려진 보안 취약점" : vuln.title()).append("\n");
+            }
+            sb.append("\n</details>\n");
+        }
+
+        return sb.toString();
     }
 }

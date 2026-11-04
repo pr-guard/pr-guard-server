@@ -314,5 +314,28 @@ class LLMAnalysisServiceTest {
         assertEquals(1, summary.sbomStats().directCount(), "직접 의존성은 1개여야 함");
         assertEquals(1, summary.sbomStats().transitiveCount(), "간접 의존성은 1개로 정확히 갱신되어야 함");
     }
+
+    @Test
+    @DisplayName("Gemini API가 503 등으로 일시 불능일 때도 Trivy 전수 검사 데이터를 기반으로 파이프라인 중단 없이 자가 복구 리포트를 생성해야 한다")
+    void shouldGenerateFallbackDeterministicReportWhenLlmUnavailable() {
+        LLMAnalysisService.ScanSummaryPayload payload = new LLMAnalysisService.ScanSummaryPayload(
+                new LLMAnalysisService.SbomStats(1, 1, 0),
+                List.of(new LLMAnalysisService.SbomPackageDetail("lodash", "4.17.21", false, "MIT")),
+                new LLMAnalysisService.VulnStats(0, 0, 0, 0, 0),
+                List.of(),
+                0,
+                List.of(),
+                0,
+                List.of(),
+                0
+        );
+
+        String report = service.buildFallbackDeterministicReport(payload, io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig());
+
+        assertNotNull(report);
+        assertTrue(report.contains("승인 (PASS)"));
+        assertTrue(report.contains("오픈소스 취약점 (CVE):** 총 0건 (안전)"));
+        assertTrue(report.contains("Google 503"));
+    }
 }
 
