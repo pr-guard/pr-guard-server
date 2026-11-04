@@ -22,14 +22,17 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * 프로젝트 내 모든 프로그래밍 언어, 모바일, 게임 엔진 및 프레임워크의 의존성 매니페스트를 직접 탐색하고 파싱하는 범용 SBOM 추출기.
@@ -44,7 +47,9 @@ public class UniversalDependencyScanner {
 
     private static final Set<String> IGNORED_DIRS = Set.of(
             ".git", ".gradle", ".idea", "node_modules", "target", "build", "bin", "obj",
-            ".vs", ".vscode", "vendor", "dist", "out", ".next", ".nuxt"
+            ".vs", ".vscode", "vendor", "dist", "out", ".next", ".nuxt",
+            "venv", ".venv", "env", ".env", "__pycache__", ".pytest_cache", ".mypy_cache",
+            ".tox", "Pods", "packages"
     );
 
     // Gradle Regex
@@ -102,6 +107,148 @@ public class UniversalDependencyScanner {
             "^\\s*([a-zA-Z0-9_\\-\\./]+)\\s+v([0-9a-zA-Z.\\-]+)", Pattern.MULTILINE
     );
 
+    // =========================================================================
+    // [Manifest-less 엔진] 소스코드 정밀 타격 의존성 추론 패턴 및 표준 라이브러리 카탈로그
+    // =========================================================================
+    // 1. Python 소스코드 패턴 & 표준 라이브러리
+    private static final Pattern PY_IMPORT_PATTERN = Pattern.compile("^\\s*import\\s+([a-zA-Z0-9_]+)");
+    private static final Pattern PY_FROM_PATTERN = Pattern.compile("^\\s*from\\s+([a-zA-Z0-9_]+)\\s+import");
+    private static final Set<String> PYTHON_STDLIB = Set.of(
+            "abc", "argparse", "array", "ast", "asynchat", "asyncio", "asyncore", "atexit",
+            "audioop", "base64", "bdb", "binascii", "binhex", "bisect", "builtins", "bz2",
+            "cprofile", "calendar", "cgi", "cgitb", "chunk", "cmath", "cmd", "code", "codecs",
+            "codeop", "collections", "colorsys", "compileall", "concurrent", "configparser",
+            "contextlib", "contextvars", "copy", "copyreg", "crypt", "csv", "ctypes", "curses",
+            "dataclasses", "datetime", "dbm", "decimal", "difflib", "dis", "distutils", "doctest",
+            "email", "encodings", "ensurepip", "enum", "errno", "faulthandler", "fcntl", "filecmp",
+            "fileinput", "fnmatch", "formatter", "fractions", "ftplib", "functools", "gc", "getopt",
+            "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib", "heapq", "hmac",
+            "html", "http", "imaplib", "imghdr", "imp", "importlib", "inspect", "io", "ipaddress",
+            "itertools", "json", "keyword", "lib2to3", "linecache", "locale", "logging", "lzma",
+            "mailbox", "mailcap", "marshal", "math", "mimetypes", "mmap", "modulefinder", "msilib",
+            "msvcrt", "multiprocessing", "netrc", "nis", "nntplib", "numbers", "operator", "optparse",
+            "os", "ossaudiodev", "parser", "pathlib", "pdb", "pickle", "pickletools", "pipes",
+            "pkgutil", "platform", "plistlib", "poplib", "posix", "posixpath", "pprint", "profile",
+            "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue", "quopri", "random",
+            "re", "readline", "reprlib", "resource", "rlcompleter", "runpy", "sched", "secrets",
+            "select", "selectors", "shelve", "shlex", "shutil", "signal", "site", "smtpd", "smtplib",
+            "sndhdr", "socket", "socketserver", "spwd", "sqlite3", "ssl", "stat", "statistics",
+            "string", "stringprep", "struct", "subprocess", "sunau", "symbol", "symtable", "sys",
+            "sysconfig", "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile", "termios",
+            "test", "textwrap", "threading", "time", "timeit", "tkinter", "token", "tokenize",
+            "tomllib", "trace", "traceback", "tracemalloc", "tty", "turtle", "turtledemo", "types",
+            "typing", "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings",
+            "wave", "weakref", "webbrowser", "winreg", "winsound", "wsgiref", "xdrlib", "xml",
+            "xmlrpc", "zipapp", "zipfile", "zipimport", "zlib", "zoneinfo"
+    );
+    private static final Map<String, String> PYTHON_MODULE_TO_PKG = Map.ofEntries(
+            Map.entry("cv2", "opencv-python"),
+            Map.entry("PIL", "Pillow"),
+            Map.entry("sklearn", "scikit-learn"),
+            Map.entry("bs4", "beautifulsoup4"),
+            Map.entry("yaml", "PyYAML"),
+            Map.entry("dotenv", "python-dotenv"),
+            Map.entry("dateutil", "python-dateutil"),
+            Map.entry("jwt", "PyJWT"),
+            Map.entry("Crypto", "pycryptodome"),
+            Map.entry("crypto", "pycryptodome"),
+            Map.entry("psycopg2", "psycopg2-binary"),
+            Map.entry("jose", "python-jose"),
+            Map.entry("multipart", "python-multipart"),
+            Map.entry("magic", "python-magic"),
+            Map.entry("git", "GitPython"),
+            Map.entry("serial", "pyserial")
+    );
+
+    // 2. Node.js 소스코드 패턴 & 내장 모듈
+    private static final Pattern NODE_REQUIRE_PATTERN = Pattern.compile("require\\s*\\(\\s*['\"]([^'\"\\r\\n]+)['\"]\\s*\\)");
+    private static final Pattern NODE_IMPORT_PATTERN = Pattern.compile("(?:import|export)\\s+.*?from\\s+['\"]([^'\"\\r\\n]+)['\"]");
+    private static final Pattern NODE_BARE_IMPORT_PATTERN = Pattern.compile("import\\s+['\"]([^'\"\\r\\n]+)['\"]");
+    private static final Set<String> NODE_BUILTINS = Set.of(
+            "assert", "async_hooks", "buffer", "child_process", "cluster", "console", "constants",
+            "crypto", "dgram", "diagnostics_channel", "dns", "domain", "events", "fs", "fs/promises",
+            "http", "http2", "https", "inspector", "module", "net", "os", "path", "path/posix",
+            "path/win32", "perf_hooks", "process", "punycode", "querystring", "readline", "repl",
+            "stream", "stream/promises", "stream/web", "string_decoder", "sys", "timers",
+            "timers/promises", "tls", "trace_events", "tty", "url", "util", "util/types", "v8",
+            "vm", "wasi", "worker_threads", "zlib"
+    );
+
+    // 3. C# / .NET / Unity
+    private static final Pattern CS_USING_PATTERN = Pattern.compile("^\\s*using\\s+(?:static\\s+)?([a-zA-Z0-9_.]+)\\s*;");
+    private static final Set<String> CS_SYSTEM_NAMESPACES = Set.of(
+            "System", "Microsoft", "Windows", "UnityEditor", "UnityEngine"
+    );
+    private static final Map<String, String> CS_NAMESPACE_TO_NUGET = Map.ofEntries(
+            Map.entry("Newtonsoft.Json", "Newtonsoft.Json"),
+            Map.entry("RestSharp", "RestSharp"),
+            Map.entry("Dapper", "Dapper"),
+            Map.entry("Serilog", "Serilog"),
+            Map.entry("NLog", "NLog"),
+            Map.entry("AutoMapper", "AutoMapper"),
+            Map.entry("NUnit", "NUnit"),
+            Map.entry("Moq", "Moq"),
+            Map.entry("FluentValidation", "FluentValidation"),
+            Map.entry("Polly", "Polly"),
+            Map.entry("MediatR", "MediatR"),
+            Map.entry("Swashbuckle", "Swashbuckle.AspNetCore"),
+            Map.entry("StackExchange.Redis", "StackExchange.Redis"),
+            Map.entry("CsvHelper", "CsvHelper"),
+            Map.entry("YamlDotNet", "YamlDotNet"),
+            Map.entry("Autofac", "Autofac"),
+            Map.entry("RabbitMQ.Client", "RabbitMQ.Client"),
+            Map.entry("Grpc.Core", "Grpc.Core"),
+            Map.entry("Quartz", "Quartz")
+    );
+
+    // 4. Go 소스코드 패턴
+    private static final Pattern GO_IMPORT_LINE_PATTERN = Pattern.compile("^\\s*(?:[a-zA-Z0-9_]+\\s+)?[\"']([^\"']+)[\"']");
+
+    // 5. Rust 소스코드 패턴
+    private static final Pattern RUST_USE_PATTERN = Pattern.compile("^\\s*(?:pub\\s+)?use\\s+([a-zA-Z0-9_]+)::");
+    private static final Pattern RUST_EXTERN_PATTERN = Pattern.compile("^\\s*extern\\s+crate\\s+([a-zA-Z0-9_]+)\\s*;");
+
+    // 6. C / C++ 소스코드 패턴 & 주요 라이브러리 매핑
+    private static final Pattern CPP_INCLUDE_PATTERN = Pattern.compile("^\\s*#include\\s+<([a-zA-Z0-9_/\\-\\.]+(?:\\.h|\\.hpp)?)>");
+    private static final Map<String, String> CPP_HEADER_TO_PKG = Map.ofEntries(
+            Map.entry("boost", "boost"),
+            Map.entry("fmt", "fmt"),
+            Map.entry("spdlog", "spdlog"),
+            Map.entry("nlohmann", "nlohmann-json"),
+            Map.entry("opencv2", "opencv"),
+            Map.entry("openssl", "openssl"),
+            Map.entry("curl", "curl"),
+            Map.entry("gtest", "gtest"),
+            Map.entry("gmock", "gmock"),
+            Map.entry("zlib.h", "zlib"),
+            Map.entry("sqlite3.h", "sqlite3"),
+            Map.entry("yaml-cpp", "yaml-cpp"),
+            Map.entry("eigen3", "eigen3"),
+            Map.entry("Eigen", "eigen3"),
+            Map.entry("google/protobuf", "protobuf")
+    );
+
+    // 7. Java / Kotlin 소스코드 패턴 & 외부 라이브러리 매핑
+    private static final Pattern JAVA_IMPORT_PATTERN = Pattern.compile("^\\s*import\\s+([a-zA-Z0-9_.]+);?");
+    private static final Map<String, String> JAVA_PREFIX_TO_PKG = Map.ofEntries(
+            Map.entry("org.springframework.boot", "org.springframework.boot:spring-boot-starter"),
+            Map.entry("org.springframework.web", "org.springframework.boot:spring-boot-starter-web"),
+            Map.entry("com.fasterxml.jackson", "com.fasterxml.jackson.core:jackson-databind"),
+            Map.entry("com.google.gson", "com.google.code.gson:gson"),
+            Map.entry("io.jsonwebtoken", "io.jsonwebtoken:jjwt-api"),
+            Map.entry("okhttp3", "com.squareup.okhttp3:okhttp"),
+            Map.entry("retrofit2", "com.squareup.retrofit2:retrofit"),
+            Map.entry("org.apache.commons.lang3", "org.apache.commons:commons-lang3"),
+            Map.entry("org.apache.commons.io", "commons-io:commons-io"),
+            Map.entry("org.slf4j", "org.slf4j:slf4j-api"),
+            Map.entry("ch.qos.logback", "ch.qos.logback:logback-classic"),
+            Map.entry("org.bouncycastle", "org.bouncycastle:bcpkix-jdk18on"),
+            Map.entry("org.junit.jupiter", "org.junit.jupiter:junit-jupiter")
+    );
+
+    // Public Registry API 캐시 (동일 패키지 중복 네트워크 호출 0건 방어)
+    private static final Map<String, String> REGISTRY_VERSION_CACHE = new ConcurrentHashMap<>();
+
     // 공통 Spring Boot Starter 하위 전이(간접) 의존성 카탈로그 (오프라인/Wrapper 실패 시 고속 Fallback)
     private static final Map<String, List<String>> COMMON_STARTER_CHILDREN = Map.of(
             "org.springframework.boot:spring-boot-starter-web", List.of(
@@ -155,8 +302,25 @@ public class UniversalDependencyScanner {
         }
 
         Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap = new LinkedHashMap<>();
+
+        // 매니페스트 존재 여부 플래그
         boolean[] hasGradle = new boolean[1];
         boolean[] hasMaven = new boolean[1];
+        boolean[] hasPythonManifest = new boolean[1];
+        boolean[] hasNodeManifest = new boolean[1];
+        boolean[] hasGoManifest = new boolean[1];
+        boolean[] hasRustManifest = new boolean[1];
+        boolean[] hasDotNetManifest = new boolean[1];
+        boolean[] hasCppManifest = new boolean[1];
+
+        // 매니페스트 부재(Manifest-less) 시 소스코드 정밀 타격을 위한 언어별 파일 수집 (OOM 방지: 언어별 최대 50개)
+        List<Path> pythonFiles = new ArrayList<>();
+        List<Path> nodeFiles = new ArrayList<>();
+        List<Path> goFiles = new ArrayList<>();
+        List<Path> rustFiles = new ArrayList<>();
+        List<Path> dotNetFiles = new ArrayList<>();
+        List<Path> cppFiles = new ArrayList<>();
+        List<Path> javaFiles = new ArrayList<>();
 
         try {
             Files.walkFileTree(rootDir, new SimpleFileVisitor<>() {
@@ -171,12 +335,45 @@ public class UniversalDependencyScanner {
 
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                    String lower = file.getFileName().toString().toLowerCase();
+                    String fileName = file.getFileName().toString();
+                    String lower = fileName.toLowerCase();
+
+                    // 1. 매니페스트 감지
                     if (lower.equals("build.gradle") || lower.equals("build.gradle.kts")) {
                         hasGradle[0] = true;
                     } else if (lower.equals("pom.xml")) {
                         hasMaven[0] = true;
+                    } else if (lower.equals("requirements.txt") || lower.endsWith("-requirements.txt") || lower.equals("pyproject.toml") || lower.equals("setup.py")) {
+                        hasPythonManifest[0] = true;
+                    } else if (lower.equals("package.json") && !file.toString().contains("node_modules")) {
+                        hasNodeManifest[0] = true;
+                    } else if (lower.equals("go.mod")) {
+                        hasGoManifest[0] = true;
+                    } else if (lower.equals("cargo.toml")) {
+                        hasRustManifest[0] = true;
+                    } else if (lower.endsWith(".csproj") || lower.endsWith(".fsproj") || lower.equals("packages.config") || lower.equals("directory.build.props")) {
+                        hasDotNetManifest[0] = true;
+                    } else if (lower.equals("cmakelists.txt") || lower.equals("vcpkg.json") || lower.equals("conanfile.txt")) {
+                        hasCppManifest[0] = true;
                     }
+
+                    // 2. 소스코드 파일 수집 (I/O 및 메모리 보호: 언어별 최대 50개 샘플링)
+                    if (lower.endsWith(".py") && pythonFiles.size() < 50) {
+                        pythonFiles.add(file);
+                    } else if ((lower.endsWith(".js") || lower.endsWith(".ts") || lower.endsWith(".jsx") || lower.endsWith(".tsx") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) && nodeFiles.size() < 50) {
+                        nodeFiles.add(file);
+                    } else if (lower.endsWith(".go") && goFiles.size() < 50) {
+                        goFiles.add(file);
+                    } else if (lower.endsWith(".rs") && rustFiles.size() < 50) {
+                        rustFiles.add(file);
+                    } else if (lower.endsWith(".cs") && dotNetFiles.size() < 50) {
+                        dotNetFiles.add(file);
+                    } else if ((lower.endsWith(".cpp") || lower.endsWith(".cc") || lower.endsWith(".cxx") || lower.endsWith(".c") || lower.endsWith(".hpp") || lower.endsWith(".h")) && cppFiles.size() < 50) {
+                        cppFiles.add(file);
+                    } else if ((lower.endsWith(".java") || lower.endsWith(".kt")) && javaFiles.size() < 50) {
+                        javaFiles.add(file);
+                    }
+
                     parseManifestFile(file, packagesMap);
                     return FileVisitResult.CONTINUE;
                 }
@@ -204,6 +401,29 @@ public class UniversalDependencyScanner {
             }
         }
 
+        // 3. [Manifest-less 엔진] 명세서가 아예 없는 프로젝트 소스코드 정밀 타격 의존성 추론 & 매니페스트 자동 합성
+        if (!hasPythonManifest[0] && !pythonFiles.isEmpty()) {
+            inferAndSynthesizePython(rootDir, pythonFiles, packagesMap);
+        }
+        if (!hasNodeManifest[0] && !nodeFiles.isEmpty()) {
+            inferAndSynthesizeNode(rootDir, nodeFiles, packagesMap);
+        }
+        if (!hasGoManifest[0] && !goFiles.isEmpty()) {
+            inferAndSynthesizeGo(rootDir, goFiles, packagesMap);
+        }
+        if (!hasRustManifest[0] && !rustFiles.isEmpty()) {
+            inferAndSynthesizeRust(rootDir, rustFiles, packagesMap);
+        }
+        if (!hasDotNetManifest[0] && !dotNetFiles.isEmpty()) {
+            inferAndSynthesizeDotNet(rootDir, dotNetFiles, packagesMap);
+        }
+        if (!hasCppManifest[0] && !cppFiles.isEmpty()) {
+            inferAndSynthesizeCpp(rootDir, cppFiles, packagesMap);
+        }
+        if (!hasGradle[0] && !hasMaven[0] && !javaFiles.isEmpty()) {
+            inferAndSynthesizeJava(rootDir, javaFiles, packagesMap);
+        }
+
         List<LLMAnalysisService.SbomPackageDetail> result = new ArrayList<>(packagesMap.values());
         int direct = 0;
         int indirect = 0;
@@ -211,7 +431,7 @@ public class UniversalDependencyScanner {
             if (p.indirect()) indirect++;
             else direct++;
         }
-        log.info("[UniversalScanner] 범용 매니페스트 및 간접 의존성 스캔 완료: 직접 {}개, 간접 {}개, 총 {}개 패키지 검출",
+        log.info("[UniversalScanner] 범용 매니페스트 및 간접/추론 의존성 스캔 완료: 직접 {}개, 간접 {}개, 총 {}개 패키지 검출",
                 direct, indirect, result.size());
         return result;
     }
@@ -802,6 +1022,519 @@ public class UniversalDependencyScanner {
             log.warn("[UniversalScanner] {} 실행 중 오류 발생: {}", processName, e.getMessage());
             return null;
         }
+    }
+
+    // =========================================================================
+    // [Manifest-less 엔진] 소스코드 정밀 타격 의존성 추론 & 매니페스트 합성 구현체
+    // =========================================================================
+
+    private void inferAndSynthesizePython(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidatePackages = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> !l.isBlank() && l.length() <= 500)
+                     .forEach(line -> {
+                         String trimmed = line.trim();
+                         if (trimmed.startsWith("import ") || trimmed.startsWith("from ")) {
+                             Matcher m = PY_IMPORT_PATTERN.matcher(trimmed);
+                             if (m.find()) {
+                                 addPythonPackageCandidate(m.group(1), candidatePackages);
+                             } else {
+                                 m = PY_FROM_PATTERN.matcher(trimmed);
+                                 if (m.find()) {
+                                     addPythonPackageCandidate(m.group(1), candidatePackages);
+                                 }
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidatePackages.isEmpty()) {
+            return;
+        }
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less Python] 소스코드에서 {}개 서드파티 패키지 추출: {}",
+                candidatePackages.size(), candidatePackages);
+        Map<String, String> resolved = resolveVersionsAsync("pypi", candidatePackages);
+        synthesizePythonRequirements(rootDir, resolved, packagesMap);
+    }
+
+    private void addPythonPackageCandidate(String mod, Set<String> candidates) {
+        if (mod == null || mod.isBlank() || mod.startsWith(".")) {
+            return;
+        }
+        String clean = mod.trim();
+        if (clean.contains(".")) {
+            clean = clean.split("\\.")[0].trim();
+        }
+        if (PYTHON_STDLIB.contains(clean.toLowerCase())) {
+            return;
+        }
+        String pypiName = PYTHON_MODULE_TO_PKG.getOrDefault(clean, clean);
+        candidates.add(pypiName);
+    }
+
+    private void synthesizePythonRequirements(Path rootDir, Map<String, String> resolvedPackages,
+                                             Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Path reqFile = rootDir.resolve("requirements.txt");
+        if (Files.exists(reqFile)) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("# Auto-generated by PR Guard for Manifest-less Python project\n");
+        for (Map.Entry<String, String> entry : resolvedPackages.entrySet()) {
+            String pkg = entry.getKey();
+            String ver = entry.getValue();
+            if (!"latest".equalsIgnoreCase(ver)) {
+                sb.append(pkg).append("==").append(ver).append("\n");
+            } else {
+                sb.append(pkg).append("\n");
+            }
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, ver, false, "PyPI(Python)"));
+        }
+        try {
+            Files.writeString(reqFile, sb.toString(), StandardCharsets.UTF_8);
+            log.info("[UniversalScanner] 🛡️ [Manifest-less] requirements.txt 자동 합성 생성 완료 (총 {}개 패키지)", resolvedPackages.size());
+        } catch (IOException e) {
+            log.warn("[UniversalScanner] requirements.txt 생성 실패: {}", e.getMessage());
+        }
+    }
+
+    private void inferAndSynthesizeNode(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidatePackages = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> !l.isBlank() && l.length() <= 500)
+                     .forEach(line -> {
+                         if (line.contains("require(") || line.contains("import") || line.contains("export")) {
+                             Matcher m = NODE_REQUIRE_PATTERN.matcher(line);
+                             while (m.find()) {
+                                 addNodePackageCandidate(m.group(1), candidatePackages);
+                             }
+                             m = NODE_IMPORT_PATTERN.matcher(line);
+                             while (m.find()) {
+                                 addNodePackageCandidate(m.group(1), candidatePackages);
+                             }
+                             m = NODE_BARE_IMPORT_PATTERN.matcher(line);
+                             while (m.find()) {
+                                 addNodePackageCandidate(m.group(1), candidatePackages);
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidatePackages.isEmpty()) {
+            return;
+        }
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less Node.js] 소스코드에서 {}개 서드파티 패키지 추출: {}",
+                candidatePackages.size(), candidatePackages);
+        Map<String, String> resolved = resolveVersionsAsync("npm", candidatePackages);
+        synthesizeNodePackageJson(rootDir, resolved, packagesMap);
+    }
+
+    private void addNodePackageCandidate(String specifier, Set<String> candidates) {
+        String pkg = normalizeNpmPackageName(specifier);
+        if (pkg != null && !pkg.isBlank()) {
+            candidates.add(pkg);
+        }
+    }
+
+    private String normalizeNpmPackageName(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String trimmed = raw.trim();
+        if (trimmed.startsWith(".") || trimmed.startsWith("/") || trimmed.startsWith("~") || trimmed.startsWith("@/")) {
+            return null;
+        }
+        if (trimmed.startsWith("node:")) {
+            return null;
+        }
+        if (NODE_BUILTINS.contains(trimmed)) {
+            return null;
+        }
+        if (trimmed.startsWith("@")) {
+            String[] parts = trimmed.split("/");
+            if (parts.length >= 2) {
+                return parts[0] + "/" + parts[1];
+            }
+            return trimmed;
+        } else {
+            int slash = trimmed.indexOf('/');
+            if (slash > 0) {
+                return trimmed.substring(0, slash);
+            }
+            return trimmed;
+        }
+    }
+
+    private void synthesizeNodePackageJson(Path rootDir, Map<String, String> resolvedPackages,
+                                          Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Path pkgJson = rootDir.resolve("package.json");
+        if (Files.exists(pkgJson)) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n");
+        sb.append("  \"name\": \"inferred-project\",\n");
+        sb.append("  \"version\": \"1.0.0\",\n");
+        sb.append("  \"description\": \"Auto-generated by PR Guard for Manifest-less project\",\n");
+        sb.append("  \"dependencies\": {\n");
+        int count = 0;
+        int total = resolvedPackages.size();
+        for (Map.Entry<String, String> entry : resolvedPackages.entrySet()) {
+            count++;
+            String pkg = entry.getKey();
+            String ver = entry.getValue();
+            String verStr = "latest".equalsIgnoreCase(ver) ? "*" : ver;
+            sb.append("    \"").append(pkg).append("\": \"").append(verStr).append("\"");
+            if (count < total) {
+                sb.append(",");
+            }
+            sb.append("\n");
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, ver, false, "npm/Node.js"));
+        }
+        sb.append("  }\n");
+        sb.append("}\n");
+        try {
+            Files.writeString(pkgJson, sb.toString(), StandardCharsets.UTF_8);
+            log.info("[UniversalScanner] 🛡️ [Manifest-less] package.json 자동 합성 생성 완료 (총 {}개 패키지)", resolvedPackages.size());
+        } catch (IOException e) {
+            log.warn("[UniversalScanner] package.json 생성 실패: {}", e.getMessage());
+        }
+    }
+
+    private void inferAndSynthesizeGo(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidateModules = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> !l.isBlank() && l.length() <= 500)
+                     .forEach(line -> {
+                         Matcher m = GO_IMPORT_LINE_PATTERN.matcher(line);
+                         if (m.find()) {
+                             String imp = m.group(1).trim();
+                             if (imp.contains("/") && (imp.contains(".") || imp.startsWith("golang.org/") || imp.startsWith("google.golang.org/") || imp.startsWith("gopkg.in/"))) {
+                                 String[] parts = imp.split("/");
+                                 if (parts.length >= 3) {
+                                     candidateModules.add(parts[0] + "/" + parts[1] + "/" + parts[2]);
+                                 } else {
+                                     candidateModules.add(imp);
+                                 }
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidateModules.isEmpty()) return;
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less Go] 소스코드에서 {}개 서드파티 모듈 추출: {}",
+                candidateModules.size(), candidateModules);
+        Map<String, String> resolved = resolveVersionsAsync("go", candidateModules);
+        synthesizeGoMod(rootDir, resolved, packagesMap);
+    }
+
+    private void synthesizeGoMod(Path rootDir, Map<String, String> resolvedPackages,
+                                Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Path goMod = rootDir.resolve("go.mod");
+        if (Files.exists(goMod)) return;
+        StringBuilder sb = new StringBuilder();
+        sb.append("module inferred-project\n\ngo 1.21\n\nrequire (\n");
+        for (Map.Entry<String, String> entry : resolvedPackages.entrySet()) {
+            String pkg = entry.getKey();
+            String ver = entry.getValue();
+            String v = ver.startsWith("v") ? ver : ("v" + ver);
+            if ("vlatest".equals(v)) v = "v1.0.0";
+            sb.append("\t").append(pkg).append(" ").append(v).append("\n");
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, ver, false, "Go-Modules"));
+        }
+        sb.append(")\n");
+        try {
+            Files.writeString(goMod, sb.toString(), StandardCharsets.UTF_8);
+            log.info("[UniversalScanner] 🛡️ [Manifest-less] go.mod 자동 합성 생성 완료 (총 {}개 패키지)", resolvedPackages.size());
+        } catch (IOException e) {
+            log.warn("[UniversalScanner] go.mod 생성 실패: {}", e.getMessage());
+        }
+    }
+
+    private void inferAndSynthesizeRust(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidateCrates = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> !l.isBlank() && l.length() <= 500)
+                     .forEach(line -> {
+                         Matcher m = RUST_USE_PATTERN.matcher(line);
+                         if (m.find()) {
+                             addRustCrateCandidate(m.group(1), candidateCrates);
+                         } else {
+                             m = RUST_EXTERN_PATTERN.matcher(line);
+                             if (m.find()) {
+                                 addRustCrateCandidate(m.group(1), candidateCrates);
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidateCrates.isEmpty()) return;
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less Rust] 소스코드에서 {}개 서드파티 크레이트 추출: {}",
+                candidateCrates.size(), candidateCrates);
+        Map<String, String> resolved = resolveVersionsAsync("cargo", candidateCrates);
+        synthesizeCargoToml(rootDir, resolved, packagesMap);
+    }
+
+    private void addRustCrateCandidate(String name, Set<String> candidates) {
+        if (name == null || name.isBlank()) return;
+        String clean = name.trim();
+        if (Set.of("std", "core", "alloc", "crate", "super", "self").contains(clean)) {
+            return;
+        }
+        candidates.add(clean);
+    }
+
+    private void synthesizeCargoToml(Path rootDir, Map<String, String> resolvedPackages,
+                                    Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Path cargoToml = rootDir.resolve("Cargo.toml");
+        if (Files.exists(cargoToml)) return;
+        StringBuilder sb = new StringBuilder();
+        sb.append("[package]\nname = \"inferred-project\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n");
+        for (Map.Entry<String, String> entry : resolvedPackages.entrySet()) {
+            String pkg = entry.getKey();
+            String ver = entry.getValue();
+            String verStr = "latest".equalsIgnoreCase(ver) ? "1.0" : ver;
+            sb.append(pkg).append(" = \"").append(verStr).append("\"\n");
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, ver, false, "Crates.io(Rust)"));
+        }
+        try {
+            Files.writeString(cargoToml, sb.toString(), StandardCharsets.UTF_8);
+            log.info("[UniversalScanner] 🛡️ [Manifest-less] Cargo.toml 자동 합성 생성 완료 (총 {}개 패키지)", resolvedPackages.size());
+        } catch (IOException e) {
+            log.warn("[UniversalScanner] Cargo.toml 생성 실패: {}", e.getMessage());
+        }
+    }
+
+    private void inferAndSynthesizeDotNet(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidatePackages = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> l.trim().startsWith("using ") && l.length() <= 500)
+                     .forEach(line -> {
+                         Matcher m = CS_USING_PATTERN.matcher(line);
+                         if (m.find()) {
+                             String ns = m.group(1).trim();
+                             for (Map.Entry<String, String> entry : CS_NAMESPACE_TO_NUGET.entrySet()) {
+                                 if (ns.equals(entry.getKey()) || ns.startsWith(entry.getKey() + ".")) {
+                                     candidatePackages.add(entry.getValue());
+                                 }
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidatePackages.isEmpty()) return;
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less .NET/C#] 소스코드에서 {}개 NuGet 패키지 추출: {}",
+                candidatePackages.size(), candidatePackages);
+        Map<String, String> resolved = resolveVersionsAsync("nuget", candidatePackages);
+        synthesizeCsproj(rootDir, resolved, packagesMap);
+    }
+
+    private void synthesizeCsproj(Path rootDir, Map<String, String> resolvedPackages,
+                                 Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Path csproj = rootDir.resolve("InferredProject.csproj");
+        if (Files.exists(csproj)) return;
+        StringBuilder sb = new StringBuilder();
+        sb.append("<Project Sdk=\"Microsoft.NET.Sdk\">\n");
+        sb.append("  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n");
+        sb.append("  <ItemGroup>\n");
+        for (Map.Entry<String, String> entry : resolvedPackages.entrySet()) {
+            String pkg = entry.getKey();
+            String ver = entry.getValue();
+            String verStr = "latest".equalsIgnoreCase(ver) ? "1.0.0" : ver;
+            sb.append("    <PackageReference Include=\"").append(pkg).append("\" Version=\"").append(verStr).append("\" />\n");
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, ver, false, "NuGet"));
+        }
+        sb.append("  </ItemGroup>\n</Project>\n");
+        try {
+            Files.writeString(csproj, sb.toString(), StandardCharsets.UTF_8);
+            log.info("[UniversalScanner] 🛡️ [Manifest-less] InferredProject.csproj 자동 합성 생성 완료 (총 {}개 패키지)", resolvedPackages.size());
+        } catch (IOException e) {
+            log.warn("[UniversalScanner] InferredProject.csproj 생성 실패: {}", e.getMessage());
+        }
+    }
+
+    private void inferAndSynthesizeCpp(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidatePackages = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> l.trim().startsWith("#include") && l.length() <= 500)
+                     .forEach(line -> {
+                         Matcher m = CPP_INCLUDE_PATTERN.matcher(line);
+                         if (m.find()) {
+                             String header = m.group(1).trim();
+                             for (Map.Entry<String, String> entry : CPP_HEADER_TO_PKG.entrySet()) {
+                                 if (header.equals(entry.getKey()) || header.startsWith(entry.getKey() + "/") || header.startsWith(entry.getKey() + "\\")) {
+                                     candidatePackages.add(entry.getValue());
+                                 }
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidatePackages.isEmpty()) return;
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less C/C++] 소스코드에서 {}개 라이브러리 추출: {}",
+                candidatePackages.size(), candidatePackages);
+        synthesizeVcpkgJson(rootDir, candidatePackages, packagesMap);
+    }
+
+    private void synthesizeVcpkgJson(Path rootDir, Set<String> packages,
+                                    Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Path vcpkg = rootDir.resolve("vcpkg.json");
+        if (Files.exists(vcpkg)) return;
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\n  \"name\": \"inferred-project\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": [\n");
+        int count = 0;
+        int total = packages.size();
+        for (String pkg : packages) {
+            count++;
+            sb.append("    \"").append(pkg).append("\"");
+            if (count < total) sb.append(",");
+            sb.append("\n");
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, "system", false, "vcpkg(C/C++)"));
+        }
+        sb.append("  ]\n}\n");
+        try {
+            Files.writeString(vcpkg, sb.toString(), StandardCharsets.UTF_8);
+            log.info("[UniversalScanner] 🛡️ [Manifest-less] vcpkg.json 자동 합성 생성 완료 (총 {}개 패키지)", packages.size());
+        } catch (IOException e) {
+            log.warn("[UniversalScanner] vcpkg.json 생성 실패: {}", e.getMessage());
+        }
+    }
+
+    private void inferAndSynthesizeJava(Path rootDir, List<Path> files, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        Set<String> candidatePackages = new HashSet<>();
+        for (Path file : files) {
+            try (Stream<String> lines = Files.lines(file, StandardCharsets.UTF_8)) {
+                lines.filter(l -> l.trim().startsWith("import ") && l.length() <= 500)
+                     .forEach(line -> {
+                         Matcher m = JAVA_IMPORT_PATTERN.matcher(line);
+                         if (m.find()) {
+                             String imp = m.group(1).trim();
+                             for (Map.Entry<String, String> entry : JAVA_PREFIX_TO_PKG.entrySet()) {
+                                 if (imp.startsWith(entry.getKey())) {
+                                     candidatePackages.add(entry.getValue());
+                                 }
+                             }
+                         }
+                     });
+            } catch (Exception ignored) {}
+        }
+
+        if (candidatePackages.isEmpty()) return;
+
+        log.info("[UniversalScanner] 🔍 [Manifest-less Java/Kotlin] 소스코드에서 {}개 외부 라이브러리 추출: {}",
+                candidatePackages.size(), candidatePackages);
+        for (String pkg : candidatePackages) {
+            packagesMap.putIfAbsent(pkg, new LLMAnalysisService.SbomPackageDetail(pkg, "latest", false, "Maven/Gradle"));
+        }
+        generateGradleLockfile(rootDir, packagesMap);
+    }
+
+    private Map<String, String> resolveVersionsAsync(String ecosystem, Set<String> packages) {
+        Map<String, String> resultMap = new ConcurrentHashMap<>();
+        if (packages == null || packages.isEmpty()) {
+            return resultMap;
+        }
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (String pkg : packages) {
+            futures.add(CompletableFuture.runAsync(() -> {
+                String ver = fetchRegistryVersion(ecosystem, pkg);
+                resultMap.put(pkg, ver);
+            }));
+        }
+
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(3, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("[UniversalScanner] {} 레지스트리 비동기 조회 타임아웃/경고: {}", ecosystem, e.getMessage());
+        }
+
+        for (String pkg : packages) {
+            resultMap.putIfAbsent(pkg, "latest");
+        }
+
+        return resultMap;
+    }
+
+    private String fetchRegistryVersion(String ecosystem, String pkgName) {
+        String cacheKey = ecosystem + ":" + pkgName;
+        String cached = REGISTRY_VERSION_CACHE.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+
+        String version = "latest";
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofMillis(1200))
+                    .build();
+
+            String urlStr = switch (ecosystem) {
+                case "pypi" -> "https://pypi.org/pypi/" + pkgName + "/json";
+                case "npm" -> "https://registry.npmjs.org/" + pkgName + "/latest";
+                case "cargo" -> "https://crates.io/api/v1/crates/" + pkgName;
+                case "go" -> "https://proxy.golang.org/" + pkgName.toLowerCase() + "/@latest";
+                case "nuget" -> "https://azuresearch-usnc.nuget.org/query?q=packageid:" + pkgName + "&take=1";
+                default -> null;
+            };
+
+            if (urlStr != null) {
+                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
+                        .uri(URI.create(urlStr))
+                        .timeout(Duration.ofMillis(1500))
+                        .GET();
+                if ("cargo".equals(ecosystem)) {
+                    reqBuilder.header("User-Agent", "PRGuard/1.0 (security-scanner)");
+                }
+
+                HttpResponse<String> resp = client.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200) {
+                    JsonNode root = objectMapper.readTree(resp.body());
+                    version = switch (ecosystem) {
+                        case "pypi" -> root.path("info").path("version").asText("latest");
+                        case "npm" -> root.path("version").asText("latest");
+                        case "cargo" -> root.path("crate").path("max_version").asText("latest");
+                        case "go" -> {
+                            String v = root.path("Version").asText("latest");
+                            yield v.startsWith("v") ? v.substring(1) : v;
+                        }
+                        case "nuget" -> {
+                            JsonNode data = root.path("data");
+                            if (data.isArray() && !data.isEmpty()) {
+                                yield data.get(0).path("version").asText("latest");
+                            }
+                            yield "latest";
+                        }
+                        default -> "latest";
+                    };
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] Public Registry 버전 조회 스킵 ({}:{}): {}", ecosystem, pkgName, e.getMessage());
+        }
+
+        if (version.isBlank()) {
+            version = "latest";
+        }
+        REGISTRY_VERSION_CACHE.put(cacheKey, version);
+        return version;
     }
 }
 

@@ -234,5 +234,165 @@ class UniversalDependencyScannerTest {
         assertTrue(lockfileContent.contains("=runtimeClasspath"), "Gradle lockfile 표준 형식을 따라야 함");
         assertTrue(lockfileContent.contains("io.jsonwebtoken:jjwt-api:0.12.3=runtimeClasspath"));
     }
+
+    @Test
+    @DisplayName("[Manifest-less] requirements.txt가 없는 Python 프로젝트의 소스코드를 스캔해 서드파티 패키지를 추론하고 requirements.txt를 자동 합성해야 한다")
+    void shouldInferAndSynthesizePythonManifest(@TempDir Path tempDir) throws IOException {
+        String pyCode = """
+                import os
+                import sys
+                import requests
+                from fastapi import FastAPI
+                import cv2
+                """;
+        Files.writeString(tempDir.resolve("main.py"), pyCode);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        // os, sys 등 표준 라이브러리는 제외되고 requests, fastapi, opencv-python(cv2 매핑)이 추출되어야 함
+        assertTrue(packages.stream().noneMatch(p -> p.name().equals("os") || p.name().equals("sys")), "표준 라이브러리는 제외되어야 함");
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("requests")), "requests가 검출되어야 함");
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("fastapi")), "fastapi가 검출되어야 함");
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("opencv-python")), "cv2는 opencv-python으로 매핑 검출되어야 함");
+
+        // requirements.txt 합성 확인
+        Path reqFile = tempDir.resolve("requirements.txt");
+        assertTrue(Files.exists(reqFile), "requirements.txt가 자동 합성되어야 함");
+        String content = Files.readString(reqFile);
+        assertTrue(content.contains("requests"));
+        assertTrue(content.contains("fastapi"));
+        assertTrue(content.contains("opencv-python"));
+    }
+
+    @Test
+    @DisplayName("[Manifest-less] package.json이 없는 Node.js/TS 프로젝트의 소스코드를 스캔해 의존성을 추론하고 package.json을 자동 합성해야 한다")
+    void shouldInferAndSynthesizeNodeManifest(@TempDir Path tempDir) throws IOException {
+        String jsCode = """
+                const fs = require('fs');
+                const path = require('path');
+                const express = require('express');
+                import { cloneDeep } from 'lodash/cloneDeep';
+                import * as core from '@angular/core';
+                import localUtil from './localUtil';
+                """;
+        Files.writeString(tempDir.resolve("index.ts"), jsCode);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        // fs, path 등 내장 모듈 및 ./localUtil 상대 경로는 제외되어야 함
+        assertTrue(packages.stream().noneMatch(p -> p.name().equals("fs") || p.name().equals("path") || p.name().contains("localUtil")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("express")), "express가 검출되어야 함");
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("lodash")), "lodash/cloneDeep에서 루트 패키지 lodash가 추출되어야 함");
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("@angular/core")), "스코프 패키지 @angular/core가 추출되어야 함");
+
+        // package.json 합성 확인
+        Path pkgJson = tempDir.resolve("package.json");
+        assertTrue(Files.exists(pkgJson), "package.json이 자동 합성되어야 함");
+        String content = Files.readString(pkgJson);
+        assertTrue(content.contains("\"express\""));
+        assertTrue(content.contains("\"lodash\""));
+        assertTrue(content.contains("\"@angular/core\""));
+    }
+
+    @Test
+    @DisplayName("[Manifest-less] C# / .NET 프로젝트에서 *.csproj가 없을 때 소스코드의 using 문에서 패키지를 추론하고 .csproj를 자동 합성해야 한다")
+    void shouldInferAndSynthesizeDotNetManifest(@TempDir Path tempDir) throws IOException {
+        String csCode = """
+                using System;
+                using System.Collections.Generic;
+                using Newtonsoft.Json;
+                using RestSharp;
+                """;
+        Files.writeString(tempDir.resolve("Program.cs"), csCode);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertTrue(packages.stream().noneMatch(p -> p.name().startsWith("System")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("Newtonsoft.Json")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("RestSharp")));
+
+        Path csproj = tempDir.resolve("InferredProject.csproj");
+        assertTrue(Files.exists(csproj), "InferredProject.csproj가 자동 합성되어야 함");
+        String content = Files.readString(csproj);
+        assertTrue(content.contains("Newtonsoft.Json"));
+        assertTrue(content.contains("RestSharp"));
+    }
+
+    @Test
+    @DisplayName("[Manifest-less] Go 프로젝트에서 go.mod가 없을 때 import 문에서 서드파티 모듈을 추론하고 go.mod를 자동 합성해야 한다")
+    void shouldInferAndSynthesizeGoManifest(@TempDir Path tempDir) throws IOException {
+        String goCode = """
+                package main
+                import (
+                    "fmt"
+                    "net/http"
+                    "github.com/gin-gonic/gin"
+                )
+                """;
+        Files.writeString(tempDir.resolve("main.go"), goCode);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertTrue(packages.stream().noneMatch(p -> p.name().equals("fmt") || p.name().equals("net/http")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("github.com/gin-gonic/gin")));
+
+        Path goMod = tempDir.resolve("go.mod");
+        assertTrue(Files.exists(goMod), "go.mod가 자동 합성되어야 함");
+        String content = Files.readString(goMod);
+        assertTrue(content.contains("github.com/gin-gonic/gin"));
+    }
+
+    @Test
+    @DisplayName("[Manifest-less] Rust 프로젝트에서 Cargo.toml이 없을 때 use 문에서 크레이트를 추론하고 Cargo.toml을 자동 합성해야 한다")
+    void shouldInferAndSynthesizeRustManifest(@TempDir Path tempDir) throws IOException {
+        String rsCode = """
+                use std::collections::HashMap;
+                use serde::{Serialize, Deserialize};
+                use tokio::runtime;
+                """;
+        Files.writeString(tempDir.resolve("main.rs"), rsCode);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertTrue(packages.stream().noneMatch(p -> p.name().equals("std")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("serde")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("tokio")));
+
+        Path cargoToml = tempDir.resolve("Cargo.toml");
+        assertTrue(Files.exists(cargoToml), "Cargo.toml이 자동 합성되어야 함");
+        String content = Files.readString(cargoToml);
+        assertTrue(content.contains("serde"));
+        assertTrue(content.contains("tokio"));
+    }
+
+    @Test
+    @DisplayName("[Manifest-less] C/C++ 프로젝트에서 CMakeLists.txt 등이 없을 때 #include 문에서 라이브러리를 추론하고 vcpkg.json을 자동 합성해야 한다")
+    void shouldInferAndSynthesizeCppManifest(@TempDir Path tempDir) throws IOException {
+        String cppCode = """
+                #include <iostream>
+                #include <vector>
+                #include <boost/algorithm/string.hpp>
+                #include <fmt/core.h>
+                """;
+        Files.writeString(tempDir.resolve("main.cpp"), cppCode);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertTrue(packages.stream().noneMatch(p -> p.name().equals("iostream") || p.name().equals("vector")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("boost")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("fmt")));
+
+        Path vcpkg = tempDir.resolve("vcpkg.json");
+        assertTrue(Files.exists(vcpkg), "vcpkg.json이 자동 합성되어야 함");
+        String content = Files.readString(vcpkg);
+        assertTrue(content.contains("\"boost\""));
+        assertTrue(content.contains("\"fmt\""));
+    }
 }
 
