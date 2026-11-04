@@ -135,10 +135,11 @@ public class SecurityScanPipeline {
             log.info("[Pipeline] Trivy 스캔 완료 (수집 데이터: {} KB, 런타임: {}자, 커스텀 정책: {})",
                     scanResultJson.length() / 1024, runtimeContext.length(), prguardConfig.toSummaryString());
 
-            // 5. 커스텀 정책 기반 필터링 및 Gemini AI 종합 보안/런타임 영향도 분석 (캐시 & Short-Circuit 적용)
-            log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중...");
+            // 5. 커스텀 정책 기반 필터링 및 Gemini AI 종합 보안/런타임 영향도 분석 (캐시 & Short-Circuit 및 범용 매니페스트 통합)
+            log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개)",
+                    scanResult.manifestPackages() != null ? scanResult.manifestPackages().size() : 0);
             LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
-                    scanResultJson, prDiff, runtimeContext, prguardConfig);
+                    scanResultJson, prDiff, runtimeContext, prguardConfig, scanResult.manifestPackages());
 
             String aiAnalysisReport = outcome.reportMarkdown();
             LLMAnalysisService.SecurityVerdict verdict = outcome.verdict();

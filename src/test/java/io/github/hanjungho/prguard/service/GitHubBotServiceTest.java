@@ -88,3 +88,4 @@ class GitHubBotServiceTest {
         assertEquals("", filteredDiff, "보안 무관 파일만 수정된 경우 빈 문자열 반환");
     }
 }
+
