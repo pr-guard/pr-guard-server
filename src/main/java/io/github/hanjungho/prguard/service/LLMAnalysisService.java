@@ -15,12 +15,17 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 @Slf4j
@@ -30,6 +35,21 @@ public class LLMAnalysisService {
 
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
+
+    private static final int MAX_CACHE_SIZE = 500;
+
+    /**
+     * SHA-256 컨텍스트 해시 기반 AI 리포트 LRU 메모이제이션 캐시.
+     * 동일 커밋 재스캔, 브랜치 단순 리베이스, PR 닫았다 열기 시 Gemini API 비용 0원 & 응답 0.001초 달성.
+     */
+    private final Map<String, AnalysisOutcome> reportCache = Collections.synchronizedMap(
+            new LinkedHashMap<>(128, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, AnalysisOutcome> eldest) {
+                    return size() > MAX_CACHE_SIZE;
+                }
+            }
+    );
 
     @Value("${gemini.api.key:YOUR_GEMINI_API_KEY_HERE}")
     private String geminiApiKey;
@@ -196,12 +216,27 @@ public class LLMAnalysisService {
         // 2. Java 단에서 직접 전체 SBOM 패키지 토글 마크다운 생성 (LLM 토큰 0 소모)
         String sbomMarkdownTable = generateSbomMarkdownTable(summaryPayload.sbomPackages());
 
+        // ⚡ 입력 컨텍스트(요약 JSON + Diff + 런타임 + 설정) SHA-256 메모이제이션 캐시 조회
+        String cacheKey = computeSha256(
+                summaryPayload.toString(),
+                prDiff != null ? prDiff : "",
+                runtimeContext != null ? runtimeContext : "",
+                config != null ? config.toSummaryString() : ""
+        );
+
+        AnalysisOutcome cached = reportCache.get(cacheKey);
+        if (cached != null) {
+            log.info("[LLMAnalysis] ⚡ SHA-256 컨텍스트 캐시 적중! (Key: {}...): 동일 분석 상태이므로 중복 연산 및 Gemini 호출 생략 (비용 0원 / 즉시 반환)",
+                    cacheKey.substring(0, 12));
+            return cached;
+        }
+
         String reportText;
         SecurityVerdict verdict;
 
-        // 3. 취약점, 설정 오류, 시크릿이 전혀 없고 PR Diff도 없는 경우 조기 반환 (PASS)
+        // 3. 취약점, 설정 오류, 시크릿이 전혀 없고 PR Diff도 없는 경우 조기 반환 (Short-Circuit PASS)
         if (!summaryPayload.hasSecurityFindings() && !hasCodeDiff) {
-            log.info("[LLMAnalysis] 보안 위험 요소 및 코드 변경이 없어 승인 템플릿 반환 (PASS)");
+            log.info("[LLMAnalysis] ⚡ 보안 위험 요소가 없고 코드 변경(Diff)이 없거나 보안 무관 파일만 수정되어 즉시 승인 (Short-Circuit PASS)");
             verdict = SecurityVerdict.PASS;
             reportText = """
                     > [!TIP]
@@ -211,6 +246,13 @@ public class LLMAnalysisService {
                     > - **오픈소스 취약점 (CVE):** 0건 (안전)
                     > - **코드 로직 및 설정 결함:** 0건 (안전)
                     """;
+            String finalReport = (sbomMarkdownTable != null && !sbomMarkdownTable.isBlank())
+                    ? reportText.trim() + "\n\n---\n\n" + sbomMarkdownTable.trim()
+                    : reportText.trim();
+
+            AnalysisOutcome outcome = new AnalysisOutcome(finalReport, verdict, summaryPayload);
+            reportCache.put(cacheKey, outcome);
+            return outcome;
         } else {
             try {
                 // 4. 경량화된 요약 JSON 직렬화 (@JsonIgnore로 인해 sbomPackages는 LLM에 미전송되어 비용 절감)
@@ -230,19 +272,22 @@ public class LLMAnalysisService {
                 } else {
                     verdict = SecurityVerdict.PASS;
                 }
+
+                // 8. AI 리포트 하단에 전체 SBOM 패키지 토글 표 Append
+                String finalReport = (sbomMarkdownTable != null && !sbomMarkdownTable.isBlank())
+                        ? reportText.trim() + "\n\n---\n\n" + sbomMarkdownTable.trim()
+                        : reportText.trim();
+
+                AnalysisOutcome outcome = new AnalysisOutcome(finalReport, verdict, summaryPayload);
+                reportCache.put(cacheKey, outcome);
+                log.info("[LLMAnalysis] 종합 판정 완료 및 신규 캐시 등록 (Key: {}...): {}", cacheKey.substring(0, 12), verdict);
+                return outcome;
+
             } catch (Exception e) {
                 log.error("[LLMAnalysis] AI 분석 파이프라인 수행 실패: {}", e.getMessage(), e);
                 throw new RuntimeException("LLM 분석 실패: " + e.getMessage(), e);
             }
         }
-
-        // 8. AI 리포트 하단에 전체 SBOM 패키지 토글 표 Append
-        String finalReport = (sbomMarkdownTable != null && !sbomMarkdownTable.isBlank())
-                ? reportText.trim() + "\n\n---\n\n" + sbomMarkdownTable.trim()
-                : reportText.trim();
-
-        log.info("[LLMAnalysis] 종합 판정 완료: {}", verdict);
-        return new AnalysisOutcome(finalReport, verdict, summaryPayload);
     }
 
     private boolean hasBlockingVulnerabilities(ScanSummaryPayload payload, PrguardConfig config) {
@@ -255,6 +300,32 @@ public class LLMAnalysisService {
             }
         }
         return false;
+    }
+
+    /**
+     * 입력 문자열들의 SHA-256 해시를 계산하여 고유한 캐시 키를 생성합니다.
+     */
+    private String computeSha256(String... inputs) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (String input : inputs) {
+                if (input != null) {
+                    digest.update(input.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+            byte[] hash = digest.digest();
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) {
+                    hexString.append('0');
+                }
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return String.valueOf(Objects.hash((Object[]) inputs));
+        }
     }
 
     /**
