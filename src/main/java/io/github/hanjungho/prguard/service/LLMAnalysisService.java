@@ -197,11 +197,54 @@ public class LLMAnalysisService {
      * 리포트 마크다운과 SecurityVerdict(PASS, WARN, BLOCK)를 생성하여 반환합니다.
      */
     public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext, PrguardConfig config) {
-        log.info("[LLMAnalysis] Trivy 원본 JSON 분석 및 경량화 시작 (커스텀 정책 적용 여부: {})",
-                config != null && !config.toSummaryString().contains("예외 룰 없음"));
+        return analyzeVulnerabilities(rawTrivyJson, prDiff, runtimeContext, config, Collections.emptyList());
+    }
+
+    /**
+     * 범용 매니페스트 추출 패키지(manifestPackages: C++, C#, Mobile, Game, Gradle 등)를 결합하여
+     * Lock 파일 유무와 관계없이 모든 생태계의 SBOM 인벤토리를 완벽하게 복원 및 분석합니다.
+     */
+    public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
+                                                 PrguardConfig config, List<SbomPackageDetail> manifestPackages) {
+        log.info("[LLMAnalysis] 종합 보안 분석 시작 (커스텀 정책 적용 여부: {}, 범용 매니페스트 패키지: {}개)",
+                config != null && !config.toSummaryString().contains("예외 룰 없음"),
+                manifestPackages != null ? manifestPackages.size() : 0);
 
         // 1. .prguard.yml 예외 정책을 적용하여 취약점 및 통계 필터링 추출
         ScanSummaryPayload summaryPayload = extractScanSummary(rawTrivyJson, config);
+
+        // 1-1. Trivy Lockfile 스캐너와 범용 매니페스트 스캐너 결과 통합 (C++, C#, Unity, Gradle 등 지원)
+        if (manifestPackages != null && !manifestPackages.isEmpty()) {
+            Map<String, SbomPackageDetail> mergedMap = new LinkedHashMap<>();
+            if (summaryPayload.sbomPackages() != null) {
+                for (SbomPackageDetail pkg : summaryPayload.sbomPackages()) {
+                    mergedMap.put(pkg.name(), pkg);
+                }
+            }
+            for (SbomPackageDetail pkg : manifestPackages) {
+                mergedMap.putIfAbsent(pkg.name(), pkg);
+            }
+            List<SbomPackageDetail> combinedList = new ArrayList<>(mergedMap.values());
+            int direct = 0;
+            int indirect = 0;
+            for (SbomPackageDetail p : combinedList) {
+                if (p.indirect()) indirect++;
+                else direct++;
+            }
+            SbomStats mergedStats = new SbomStats(combinedList.size(), direct, indirect);
+            summaryPayload = new ScanSummaryPayload(
+                    mergedStats,
+                    combinedList,
+                    summaryPayload.vulnStats(),
+                    summaryPayload.topVulnerabilities(),
+                    summaryPayload.totalVulnerabilitiesCount(),
+                    summaryPayload.misconfigurations(),
+                    summaryPayload.totalMisconfigCount(),
+                    summaryPayload.secrets(),
+                    summaryPayload.totalSecretCount()
+            );
+        }
+
         log.info("[LLMAnalysis] 스캔 집계 결과: SBOM 총 {}개(직접 {}, 간접 {}), CVE 총 {}건(상위 {}건 선별), Misconfig {}건, Secret {}건",
                 summaryPayload.sbomStats().totalCount(),
                 summaryPayload.sbomStats().directCount(),
@@ -337,9 +380,9 @@ public class LLMAnalysisService {
         if (packages == null || packages.isEmpty()) {
             return """
                     <details>
-                    <summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (Lock 파일 미탐지)</b></summary>
+                    <summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (등록된 외부 의존성 없음)</b></summary>
 
-                    > **구성 요소 정보 없음:** 대상 레포지토리에 Lock 파일이 존재하지 않아 소프트웨어 자재 명세서(SBOM) 인벤토리를 탐지할 수 없습니다.
+                    > **구성 요소 정보 없음:** 대상 레포지토리에 외부 의존성 매니페스트 파일(build.gradle, .csproj, CMakeLists.txt, Podfile, pubspec.yaml, package.json 등) 또는 패키지가 존재하지 않습니다.
 
                     </details>""";
         }
