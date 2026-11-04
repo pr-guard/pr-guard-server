@@ -20,10 +20,11 @@ RUN ./gradlew bootJar -x test --no-daemon
 FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 
-# 필수 유틸리티 및 Git 설치
+# 필수 유틸리티, Git 및 헬스체크용 curl 설치
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         git \
+        curl \
         ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
@@ -35,6 +36,15 @@ RUN git --version && trivy --version
 
 # 빌드된 Spring Boot JAR 복사
 COPY --from=builder /app/build/libs/*.jar app.jar
+
+# 비루트(Non-root) 실행 계정 생성 및 권한 설정
+RUN useradd -u 1000 -m -s /bin/bash appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 컨테이너 헬스체크 설정 (/api/ping)
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/api/ping || exit 1
 
 # 기본 포트 노출
 EXPOSE 8080

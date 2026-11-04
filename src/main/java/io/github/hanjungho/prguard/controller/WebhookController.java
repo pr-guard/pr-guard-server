@@ -5,6 +5,7 @@ import io.github.hanjungho.prguard.service.SecurityScanPipeline;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -13,12 +14,23 @@ import org.springframework.web.bind.annotation.RestController;
 @Slf4j
 @RestController
 @RequiredArgsConstructor
-@RequestMapping("/api/webhook")
+@RequestMapping("/api")
 public class WebhookController {
 
     private final SecurityScanPipeline securityScanPipeline;
 
-    @PostMapping
+    /**
+     * Render 무료 티어 절전 모드(Sleep) 방지용 초경량 Health Check 엔드포인트
+     */
+    @GetMapping("/ping")
+    public ResponseEntity<String> ping() {
+        return ResponseEntity.ok("pong");
+    }
+
+    /**
+     * GitHub Webhook 이벤트 수신 엔드포인트 (POST /api/webhook)
+     */
+    @PostMapping("/webhook")
     public ResponseEntity<String> receiveWebhook(@RequestBody GithubWebhookPayload payload) {
         String action = payload.getAction();
         Integer prNumber = payload.getNumber();
