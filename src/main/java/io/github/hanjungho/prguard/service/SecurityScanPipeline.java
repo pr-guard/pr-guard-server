@@ -129,9 +129,11 @@ public class SecurityScanPipeline {
             // 2. Private 저장소 복제 및 인증을 위한 Installation Access Token 획득 (캐시 적용)
             String accessToken = gitHubBotService.getInstallationAccessToken(fullName, installationId);
 
-            // 3. PR 코드 변경 사항(Diff) 수집 (보안 무관 파일 필터링 적용)
-            log.info("[Pipeline] Step 1: PR #{} 코드 Diff 수집", prNumber);
-            String prDiff = gitHubBotService.getPullRequestDiff(fullName, prNumber, installationId);
+            // 3. PR 코드 Diff 수집을 비동기 병렬로 시작 (소스코드 Clone 및 Trivy 스캔과 동시 수행하여 지연 최소화)
+            log.info("[Pipeline] Step 1: PR #{} 코드 Diff 수집 및 Trivy 스캔 비동기 병렬 시작", prNumber);
+            java.util.concurrent.CompletableFuture<String> prDiffFuture = java.util.concurrent.CompletableFuture.supplyAsync(
+                    () -> gitHubBotService.getPullRequestDiff(fullName, prNumber, installationId)
+            );
 
             // 4. PR 대상 소스코드 Clone, .prguard.yml 커스텀 정책 로드, 런타임 환경 설정 수집 및 Trivy 스캔
             log.info("[Pipeline] Step 2: Trivy 종합 보안 스캔 및 커스텀 정책 로드 실행");
@@ -141,6 +143,9 @@ public class SecurityScanPipeline {
             PrguardConfig prguardConfig = scanResult.config();
             log.info("[Pipeline] Trivy 스캔 완료 (수집 데이터: {} KB, 런타임: {}자, 커스텀 정책: {})",
                     scanResultJson.length() / 1024, runtimeContext.length(), prguardConfig.toSummaryString());
+
+            // 5. 비동기로 동시 수집 중이던 PR Diff 결과 회수
+            String prDiff = prDiffFuture.join();
 
             // 5. 커스텀 정책 기반 필터링 및 Gemini AI 종합 보안/런타임 영향도 분석 (캐시 & Short-Circuit 및 범용 매니페스트 통합)
             log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개)",

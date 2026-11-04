@@ -42,6 +42,10 @@ RUN useradd -u 1000 -m -s /bin/bash appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
+# Trivy 취약점 DB 및 Java 인덱스 DB 사전 다운로드 (이미지 빌드 시점에 내장하여 런타임 15~30초 지연 제거)
+RUN trivy image --download-db-only || true
+RUN trivy image --download-java-db-only || true
+
 # 컨테이너 헬스체크 설정 (/api/ping)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8080/api/ping || exit 1

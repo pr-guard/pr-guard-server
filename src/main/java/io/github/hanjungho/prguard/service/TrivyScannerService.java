@@ -314,6 +314,8 @@ public class TrivyScannerService {
         command.add("clone");
         command.add("--depth");
         command.add("1");
+        command.add("--no-tags");
+        command.add("--single-branch");
         if (branch != null && !branch.isBlank()) {
             command.add("-b");
             command.add(branch);
@@ -345,6 +347,8 @@ public class TrivyScannerService {
         command.add("vuln,misconfig,secret");
         command.add("--list-all-pkgs");
         command.add("-q");
+        command.add("--skip-dirs");
+        command.add(".git");
 
         // 12시간 이내에 이미 최신 DB를 동기화했다면 네트워크 I/O 스킵하여 스캔 속도 3~5초 단축
         long now = System.currentTimeMillis();
