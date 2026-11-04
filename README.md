@@ -62,13 +62,68 @@ sequenceDiagram
 
 ## 빠른 시작 가이드 (Quickstart)
 
-### 요구사항 (Prerequisites)
+### 1. 일반 사용자: 내 저장소에 30초 만에 적용하기 (Installation)
+
+별도의 서버 설치 없이 공식 GitHub App을 등록하는 것만으로 개인 또는 조직(Org)의 저장소에 즉시 적용할 수 있습니다.
+
+1. **GitHub App 설치 링크 접속**: 👉 **[PR Guard GitHub App 설치하기](https://github.com/apps/pr-guard-pg)**
+2. **대상 저장소 선택**:
+   - `All repositories` (모든 저장소) 또는 `Only select repositories` (지정한 저장소)를 선택하고 **Install**을 클릭합니다.
+3. **설치 완료**:
+   - 이제 새로운 PR이 생성되거나 기존 PR에 커밋이 푸시될 때마다 PR Guard가 자동으로 취약점을 분석하고 리포트를 작성합니다.
+   - PR 코멘트에 `@prguard rescan`을 입력하면 언제든지 수동으로 즉시 재스캔할 수 있습니다.
+
+---
+
+### 2. 저장소별 커스텀 보안 정책 설정 (`.prguard.yml`)
+
+조직이나 프로젝트마다 보안 기준이 다를 수 있습니다. 검사 대상 저장소의 **루트(최상단) 디렉토리**에 `.prguard.yml` (또는 `.prguard.yaml`) 파일을 추가하면, PR Guard가 이를 자동으로 읽어 맞춤형 보안 정책을 적용합니다.
+
+*(설정 파일이 없으면 기본 엔터프라이즈 정책: `CRITICAL`, `HIGH` 심각도 차단 / 예외 없음 으로 동작합니다)*
+
+```yaml
+# .prguard.yml 예시
+version: 1
+
+# 1. 스캔 및 리포트에서 완전히 무시할 취약점 심각도 (예: LOW, MEDIUM)
+ignore_severities:
+  - LOW
+  - MEDIUM
+
+# 2. 알려진 안전한 내부 패키지 또는 테스트 라이브러리 예외 처리
+ignore_packages:
+  - "my-company-internal-core"
+  - "debug"
+
+# 3. 조치가 불필요하거나 오탐(False Positive)으로 확인된 특정 CVE 예외 처리
+ignore_cves:
+  - "CVE-2023-9999"
+
+# 4. PR Merge를 강제로 차단(Checks Failure & security-risk 라벨)할 심각도 기준
+# 기본값: [CRITICAL, HIGH]
+block_severities:
+  - CRITICAL
+  - HIGH
+```
+
+#### 💡 커스텀 설정이 작동하는 방식:
+- **Trivy 엔진 필터링:** `ignore_severities`, `ignore_packages`, `ignore_cves`에 해당하는 취약점은 리포트 및 카운트에서 사전에 제외됩니다.
+- **AI 시스템 프롬프트 반영:** 사용자가 정의한 정책이 Google Gemini AI의 시스템 프롬프트에 **[저장소 커스텀 예외 룰]**로 실시간 주입되어, 봇이 해당 정책을 인지하고 맥락에 맞게 리뷰 코멘트를 작성합니다.
+- **GitHub Checks 통제:** `block_severities`에 지정된 레벨의 취약점이 diff 상에서 실제 호출(Reachability)되는 경우에만 PR 병합을 Block(Checks failure)합니다.
+
+---
+
+### 3. 서버 자체 호스팅 및 개발자 가이드 (Self-Hosting & Development)
+
+직접 백엔드 서버를 구동하거나 커스터마이징하려는 개발자를 위한 가이드입니다.
+
+#### 요구사항 (Prerequisites)
 - Java 17 이상
 - [Aqua Security Trivy CLI](https://aquasecurity.github.io/trivy/)
 - [Google Gemini API Key](https://aistudio.google.com/)
 - GitHub App (Private Key `.pem` 파일 발급)
 
-### 환경 설정
+#### 환경 설정
 `src/main/resources/application.properties.example` 파일을 복사하여 환경 변수 또는 `src/main/resources/application-local.properties`를 생성합니다 (로컬 설정 파일은 `.gitignore`에 의해 안전하게 제외됩니다):
 
 ```properties
@@ -81,9 +136,10 @@ github.app.private-key-path=YOUR_GITHUB_APP_PRIVATE_KEY.pem
 환경 변수로 직접 주입할 수도 있습니다:
 - `GEMINI_API_KEY`: Google Gemini API 키
 - `GITHUB_APP_ID`: GitHub App ID
-- `GITHUB_APP_PRIVATE_KEY_PATH`: GitHub App RSA 개인키(`.pem`) 파일 경로
+- `GITHUB_APP_PRIVATE_KEY` 또는 `GITHUB_APP_PRIVATE_KEY_PATH`: GitHub App RSA 개인키
+- `GITHUB_WEBHOOK_SECRET`: GitHub Webhook Secret (선택)
 
-### 빌드 및 실행
+#### 빌드 및 실행
 ```bash
 # 빌드 및 테스트
 ./gradlew clean test
@@ -92,32 +148,14 @@ github.app.private-key-path=YOUR_GITHUB_APP_PRIVATE_KEY.pem
 ./gradlew bootRun
 ```
 
----
-
-## 커스텀 설정 (`.prguard.yml`) 가이드
-
-검사 대상 저장소의 루트 디렉토리에 `.prguard.yml` 파일을 추가하여 조직별 보안 정책을 적용할 수 있습니다:
-
-```yaml
-version: 1
-
-# 무시할 취약점 심각도 (예: LOW, MEDIUM)
-ignore_severities:
-  - LOW
-
-# 무시할 패키지명 목록
-ignore_packages:
-  - "my-internal-core"
-  - "debug"
-
-# 무시할 CVE ID 목록
-ignore_cves:
-  - "CVE-2023-9999"
-
-# PR Merge 차단(BLOCK) 기준 심각도 (기본값: CRITICAL, HIGH)
-block_severities:
-  - CRITICAL
-  - HIGH
+#### Docker 배포
+```bash
+docker build -t pr-guard-server .
+docker run -p 8080:8080 \
+  -e GEMINI_API_KEY=your_key \
+  -e GITHUB_APP_ID=your_id \
+  -e GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..." \
+  pr-guard-server
 ```
 
 ---
