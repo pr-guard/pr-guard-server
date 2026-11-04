@@ -23,13 +23,12 @@ WORKDIR /app
 # 필수 유틸리티 및 Git 설치
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        curl \
         git \
         ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Aqua Security 공식 Trivy CLI 설치
-RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+# Aqua Security 공식 Docker 이미지에서 Trivy 정적 바이너리 직접 복사 (스크립트 다운로드 오류 방지)
+COPY --from=aquasec/trivy:latest /usr/local/bin/trivy /usr/local/bin/trivy
 
 # Trivy 및 Git 설치 정상 확인
 RUN git --version && trivy --version
