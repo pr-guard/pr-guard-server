@@ -141,3 +141,4 @@ class UniversalDependencyScannerTest {
         assertTrue(packages.stream().anyMatch(p -> p.name().equals("com.unity.ugui") && p.version().equals("1.0.0")));
     }
 }
+

@@ -116,8 +116,11 @@ public class GitHubBotService {
         }
     }
 
+    public static final String BOT_COMMENT_MARKER = "<!-- pr-guard-report-marker -->";
+
     /**
-     * PR에 AI 분석 리포트를 코멘트로 작성합니다.
+     * PR에 AI 분석 리포트를 코멘트로 작성하거나, 기존 리포트 코멘트가 존재할 경우 갱신(Upsert)합니다.
+     * PR 댓글창이 수많은 봇 코멘트로 도배되는 현상(Spam)을 방지합니다.
      *
      * @param repoFullName   저장소 전체 이름 (예: "junghohans/test")
      * @param prNumber       PR 번호
@@ -125,19 +128,30 @@ public class GitHubBotService {
      * @param commentBody    등록할 AI 분석 리포트 마크다운
      */
     public void postComment(String repoFullName, Integer prNumber, Long installationId, String commentBody) {
-        log.info("[GitHubBot] PR 코멘트 등록 파이프라인 시작 (Repo: {}, PR: #{})", repoFullName, prNumber);
+        log.info("[GitHubBot] PR 코멘트 등록/수정(Upsert) 파이프라인 시작 (Repo: {}, PR: #{})", repoFullName, prNumber);
 
         try {
             // 캐시 지원 토큰 획득
             String installationAccessToken = getInstallationAccessToken(repoFullName, installationId);
 
-            // GitHub Issue Comments API 호출하여 PR 코멘트 등록
-            createIssueComment(repoFullName, prNumber, installationAccessToken, commentBody);
+            String finalBody = (commentBody != null && commentBody.contains(BOT_COMMENT_MARKER))
+                    ? commentBody
+                    : BOT_COMMENT_MARKER + "\n\n" + (commentBody != null ? commentBody : "");
 
-            log.info("[GitHubBot] PR #{} 에 코멘트 등록이 성공적으로 완료되었습니다.", prNumber);
+            Long existingCommentId = findExistingBotCommentId(repoFullName, prNumber, installationAccessToken);
+
+            if (existingCommentId != null) {
+                log.info("[GitHubBot] 기존 PR Guard 코멘트(ID: {}) 발견 - 내용을 최신 리포트로 갱신(PATCH)합니다.", existingCommentId);
+                updateIssueComment(repoFullName, existingCommentId, installationAccessToken, finalBody);
+                log.info("[GitHubBot] PR #{} 기존 코멘트(ID: {}) 갱신이 성공적으로 완료되었습니다.", prNumber, existingCommentId);
+            } else {
+                log.info("[GitHubBot] 기존 PR Guard 코멘트 없음 - 신규 코멘트(POST)를 작성합니다.");
+                createIssueComment(repoFullName, prNumber, installationAccessToken, finalBody);
+                log.info("[GitHubBot] PR #{} 에 신규 코멘트 등록이 성공적으로 완료되었습니다.", prNumber);
+            }
         } catch (Exception e) {
-            log.error("[GitHubBot] PR 코멘트 등록 중 오류 발생: {}", e.getMessage(), e);
-            throw new RuntimeException("GitHub PR 코멘트 작성 실패: " + e.getMessage(), e);
+            log.error("[GitHubBot] PR 코멘트 등록/수정 중 오류 발생: {}", e.getMessage(), e);
+            throw new RuntimeException("GitHub PR 코멘트 작성/수정 실패: " + e.getMessage(), e);
         }
     }
 
@@ -311,13 +325,35 @@ public class GitHubBotService {
     /**
      * Installation ID를 다단계로 해결합니다:
      * 1) 웹훅 페이로드에서 전달된 값
-     * 2) application.properties 에 설정된 기본값
-     * 3) GitHub API (/app/installations)를 통한 자동 감지
+     * 2) 특정 저장소 전용 설치 조회 (GET /repos/{owner}/{repo}/installation - 멀티테넌트 환경 정확도 보장)
+     * 3) application.properties 에 설정된 기본값
+     * 4) GitHub API (/app/installations)를 통한 자동 감지 (단일 테넌트 fallback)
      */
     private Long resolveInstallationId(String repoFullName, Long payloadInstallationId, String jwt) {
         if (payloadInstallationId != null) {
             return payloadInstallationId;
         }
+
+        // 1. repoFullName이 유효한 경우, 특정 저장소의 설치 정보를 직접 조회 (다중 테넌트 지원)
+        if (repoFullName != null && !repoFullName.isBlank() && !"N/A".equalsIgnoreCase(repoFullName) && repoFullName.contains("/")) {
+            try {
+                String repoInstallUrl = "https://api.github.com/repos/" + repoFullName + "/installation";
+                HttpHeaders headers = createBaseHeaders();
+                headers.setBearerAuth(jwt);
+
+                HttpEntity<Void> entity = new HttpEntity<>(headers);
+                ResponseEntity<String> response = restTemplate.exchange(repoInstallUrl, HttpMethod.GET, entity, String.class);
+                JsonNode repoInstallNode = objectMapper.readTree(response.getBody());
+                long repoInstallId = repoInstallNode.path("id").asLong();
+                if (repoInstallId > 0) {
+                    log.info("[GitHubBot] 저장소({}) 전용 Installation ID 조회 성공: {}", repoFullName, repoInstallId);
+                    return repoInstallId;
+                }
+            } catch (Exception e) {
+                log.warn("[GitHubBot] 저장소별 Installation ID 조회 실패 (Repo: {}): {}", repoFullName, e.getMessage());
+            }
+        }
+
         if (defaultInstallationId != null && !defaultInstallationId.isBlank()) {
             return Long.parseLong(defaultInstallationId.trim());
         }
@@ -405,6 +441,62 @@ public class GitHubBotService {
         } catch (Exception e) {
             log.error("[GitHubBot] 코멘트 API 호출 실패 (Repo: {}, PR: #{}): {}", repoFullName, prNumber, e.getMessage());
             throw new RuntimeException("GitHub 코멘트 API 호출 실패", e);
+        }
+    }
+
+    /**
+     * PR에 이전에 등록된 PR Guard 봇 코멘트 ID를 검색합니다.
+     */
+    public Long findExistingBotCommentId(String repoFullName, Integer prNumber, String accessToken) {
+        if (prNumber == null || repoFullName == null || repoFullName.isBlank() || "N/A".equals(repoFullName)) {
+            return null;
+        }
+
+        try {
+            String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/comments?per_page=100";
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(accessToken);
+
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            JsonNode comments = objectMapper.readTree(response.getBody());
+
+            if (comments.isArray()) {
+                for (JsonNode comment : comments) {
+                    String body = comment.path("body").asText("");
+                    if (body.contains(BOT_COMMENT_MARKER) || body.contains("PR Guard 보안 분석 리포트") ||
+                            (body.contains("PR Guard") && "Bot".equalsIgnoreCase(comment.path("user").path("type").asText("")))) {
+                        return comment.path("id").asLong();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[GitHubBot] 기존 봇 코멘트 조회 중 예외 발생 (신규 등록 fallback): {}", e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * 기존 PR(Issue) 코멘트 내용을 갱신(PATCH)합니다.
+     */
+    private void updateIssueComment(String repoFullName, Long commentId, String accessToken, String commentBody) {
+        String url = "https://api.github.com/repos/" + repoFullName + "/issues/comments/" + commentId;
+
+        HttpHeaders headers = createBaseHeaders();
+        headers.setBearerAuth(accessToken);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        Map<String, String> requestBody = Map.of("body", commentBody);
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
+
+        try {
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.PATCH, entity, String.class);
+            if (!response.getStatusCode().is2xxSuccessful()) {
+                throw new RuntimeException("코멘트 수정 실패: HTTP " + response.getStatusCode());
+            }
+        } catch (Exception e) {
+            log.error("[GitHubBot] 코멘트 수정 API 호출 실패 (Repo: {}, Comment ID: {}): {}", repoFullName, commentId, e.getMessage());
+            throw new RuntimeException("GitHub 코멘트 수정 API 호출 실패", e);
         }
     }
 

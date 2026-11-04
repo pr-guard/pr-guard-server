@@ -60,6 +60,7 @@ public class GithubWebhookPayload {
         public static class Head {
             private String ref;
             private String sha;
+            private Repository repo;
         }
     }
 

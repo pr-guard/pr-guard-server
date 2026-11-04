@@ -1,15 +1,25 @@
 package io.github.hanjungho.prguard.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hanjungho.prguard.dto.GithubWebhookPayload;
 import io.github.hanjungho.prguard.service.SecurityScanPipeline;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 
 @Slf4j
 @RestController
@@ -18,6 +28,10 @@ import org.springframework.web.bind.annotation.RestController;
 public class WebhookController {
 
     private final SecurityScanPipeline securityScanPipeline;
+    private final ObjectMapper objectMapper;
+
+    @Value("${github.webhook.secret:}")
+    private String webhookSecret;
 
     /**
      * Render 무료 티어 절전 모드(Sleep) 방지용 초경량 Health Check 엔드포인트
@@ -29,13 +43,59 @@ public class WebhookController {
 
     /**
      * GitHub Webhook 이벤트 수신 엔드포인트 (POST /api/webhook)
+     * HMAC SHA-256 (X-Hub-Signature-256) 검증을 거쳐 위조된 요청을 원천 차단합니다.
      */
     @PostMapping("/webhook")
-    public ResponseEntity<String> receiveWebhook(@RequestBody GithubWebhookPayload payload) {
+    public ResponseEntity<String> receiveWebhook(
+            @RequestHeader(value = "X-Hub-Signature-256", required = false) String signatureHeader,
+            @RequestBody byte[] rawPayload
+    ) {
+        // 1. Webhook HMAC SHA-256 서명 검증 (시크릿이 설정되어 있을 경우)
+        if (webhookSecret != null && !webhookSecret.isBlank()) {
+            if (signatureHeader == null || !signatureHeader.startsWith("sha256=")) {
+                log.warn("[Webhook] 서명 헤더 누락 또는 비정상 형식: {}", signatureHeader);
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Missing or invalid X-Hub-Signature-256 header");
+            }
+
+            try {
+                Mac mac = Mac.getInstance("HmacSHA256");
+                SecretKeySpec secretKey = new SecretKeySpec(webhookSecret.trim().getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+                mac.init(secretKey);
+                byte[] computedHash = mac.doFinal(rawPayload);
+                String expectedSignature = "sha256=" + HexFormat.of().formatHex(computedHash);
+
+                if (!MessageDigest.isEqual(expectedSignature.getBytes(StandardCharsets.UTF_8), signatureHeader.getBytes(StandardCharsets.UTF_8))) {
+                    log.warn("[Webhook] HMAC 서명 불일치 (위조되거나 변조된 요청 차단)");
+                    return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid HMAC signature");
+                }
+            } catch (Exception e) {
+                log.error("[Webhook] HMAC 서명 검증 중 오류 발생: {}", e.getMessage());
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("HMAC verification failed");
+            }
+        }
+
+        // 2. JSON 페이로드 역직렬화
+        GithubWebhookPayload payload;
+        try {
+            payload = objectMapper.readValue(rawPayload, GithubWebhookPayload.class);
+        } catch (Exception e) {
+            log.error("[Webhook] 페이로드 역직렬화 실패: {}", e.getMessage());
+            return ResponseEntity.badRequest().body("Invalid JSON payload");
+        }
+
         String action = payload.getAction();
         Integer prNumber = payload.getNumber();
         String fullName = payload.getRepository() != null ? payload.getRepository().getFullName() : "N/A";
-        String cloneUrl = payload.getRepository() != null ? payload.getRepository().getCloneUrl() : null;
+
+        // 오픈소스 Fork PR 지원: head.repo.clone_url 우선 추출 (외부 기여자 PR 지원)
+        String cloneUrl = null;
+        if (payload.getPullRequest() != null && payload.getPullRequest().getHead() != null && payload.getPullRequest().getHead().getRepo() != null) {
+            cloneUrl = payload.getPullRequest().getHead().getRepo().getCloneUrl();
+        }
+        if (cloneUrl == null && payload.getRepository() != null) {
+            cloneUrl = payload.getRepository().getCloneUrl();
+        }
+
         String branch = (payload.getPullRequest() != null && payload.getPullRequest().getHead() != null)
                 ? payload.getPullRequest().getHead().getRef()
                 : null;
@@ -45,14 +105,14 @@ public class WebhookController {
                 action, prNumber, fullName, branch);
         log.info("==================================================");
 
-        // 1. PR 생성 (opened) 또는 수정 커밋 푸시 (synchronize) 이벤트
+        // 3. PR 생성 (opened) 또는 수정 커밋 푸시 (synchronize) 이벤트
         if (isTargetPrAction(action) && cloneUrl != null) {
             log.info("[Webhook] PR 대상 이벤트 감지 (PR #{}, action={}) - 비동기 보안 스캔 파이프라인 시작", prNumber, action);
             securityScanPipeline.executePipelineAsync(payload);
             return ResponseEntity.accepted().body("Security scan scheduled successfully");
         }
 
-        // 2. ChatOps 댓글 재스캔 트리거 감지 (issue_comment: created)
+        // 4. ChatOps 댓글 재스캔 트리거 감지 (issue_comment: created)
         if ("created".equalsIgnoreCase(action) && payload.getIssue() != null && payload.getIssue().isPullRequest()) {
             if (payload.getComment() != null) {
                 // 봇 자신이 남긴 코멘트(무한 루프 방지) 무시
