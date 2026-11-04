@@ -40,6 +40,10 @@ COPY --from=builder /app/build/libs/*.jar app.jar
 # 비루트(Non-root) 실행 계정 생성 및 권한 설정
 RUN useradd -u 1000 -m -s /bin/bash appuser && \
     chown -R appuser:appuser /app
+
+# Gradle 래퍼 배포판 및 의존성 캐시 복사 (런타임에 PR 대상 프로젝트 gradlew 실행 시 재다운로드 150MB 방지)
+COPY --from=builder --chown=appuser:appuser /root/.gradle /home/appuser/.gradle
+
 USER appuser
 
 # Trivy 취약점 DB 및 Java 인덱스 DB 사전 다운로드 (이미지 빌드 시점에 내장하여 런타임 15~30초 지연 제거)

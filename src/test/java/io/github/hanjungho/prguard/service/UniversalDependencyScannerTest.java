@@ -9,7 +9,9 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -139,6 +141,98 @@ class UniversalDependencyScannerTest {
         assertNotNull(packages);
         assertEquals(2, packages.size());
         assertTrue(packages.stream().anyMatch(p -> p.name().equals("com.unity.ugui") && p.version().equals("1.0.0")));
+    }
+
+    @Test
+    @DisplayName("Gradle 의존성 트리 출력에서 직접 의존성과 전이(간접) 의존성을 정확히 구분하여 파싱해야 한다")
+    void shouldParseGradleDependencyTreeOutputWithDirectAndIndirectDependencies() {
+        String treeOutput = """
+                ------------------------------------------------------------
+                Root project 'my-app'
+                ------------------------------------------------------------
+
+                runtimeClasspath - Runtime classpath of source set 'main'.
+                +--- org.springframework.boot:spring-boot-starter-webmvc -> 4.1.2
+                |    +--- org.springframework.boot:spring-boot-starter:4.1.2
+                |    |    +--- ch.qos.logback:logback-classic:1.5.38
+                |    |    |    \\--- org.slf4j:slf4j-api:2.0.17 -> 2.0.20
+                |    |    \\--- org.yaml:snakeyaml:2.6
+                |    +--- org.apache.tomcat.embed:tomcat-embed-core:11.0.27
+                |    \\--- org.springframework:spring-webmvc:7.0.10 (*)
+                +--- com.fasterxml.jackson.core:jackson-databind -> 2.21.7
+                |    +--- com.fasterxml.jackson.core:jackson-annotations:2.21 (c)
+                |    \\--- com.fasterxml.jackson.core:jackson-core:2.21.7
+                \\--- io.jsonwebtoken:jjwt-api:0.12.6
+                """;
+
+        Map<String, LLMAnalysisService.SbomPackageDetail> map = new LinkedHashMap<>();
+        scanner.parseGradleDependencyTreeOutput(treeOutput, map);
+
+        assertFalse(map.isEmpty());
+
+        // 직접 의존성 검증 (indent 없음)
+        LLMAnalysisService.SbomPackageDetail webmvc = map.get("org.springframework.boot:spring-boot-starter-webmvc");
+        assertNotNull(webmvc);
+        assertFalse(webmvc.indirect(), "webmvc는 직접 의존성이어야 함");
+        assertEquals("4.1.2", webmvc.version());
+
+        LLMAnalysisService.SbomPackageDetail jjwt = map.get("io.jsonwebtoken:jjwt-api");
+        assertNotNull(jjwt);
+        assertFalse(jjwt.indirect(), "jjwt-api는 직접 의존성이어야 함");
+        assertEquals("0.12.6", jjwt.version());
+
+        // 간접(전이) 의존성 검증 (indent 있음)
+        LLMAnalysisService.SbomPackageDetail tomcat = map.get("org.apache.tomcat.embed:tomcat-embed-core");
+        assertNotNull(tomcat);
+        assertTrue(tomcat.indirect(), "tomcat-embed-core는 간접 의존성이어야 함");
+        assertEquals("11.0.27", tomcat.version());
+
+        LLMAnalysisService.SbomPackageDetail logback = map.get("ch.qos.logback:logback-classic");
+        assertNotNull(logback);
+        assertTrue(logback.indirect(), "logback-classic은 간접 의존성이어야 함");
+
+        LLMAnalysisService.SbomPackageDetail slf4j = map.get("org.slf4j:slf4j-api");
+        assertNotNull(slf4j);
+        assertTrue(slf4j.indirect());
+        assertEquals("2.0.20", slf4j.version(), "버전 업그레이드(->)가 적용되어 2.0.20이어야 함");
+
+        // (c) 제약조건(BOM)은 제외되어야 함
+        assertNull(map.get("com.fasterxml.jackson.core:jackson-annotations"), "(c) 제약조건은 제외되어야 함");
+
+        // (*) 중복 하위 트리 표시는 정상 제거되고 패키지가 포함되어야 함
+        LLMAnalysisService.SbomPackageDetail webmvcSpring = map.get("org.springframework:spring-webmvc");
+        assertNotNull(webmvcSpring);
+        assertTrue(webmvcSpring.indirect());
+        assertEquals("7.0.10", webmvcSpring.version());
+    }
+
+    @Test
+    @DisplayName("Lock 파일이 없는 Gradle 프로젝트 스캔 시 Trivy가 감지할 수 있도록 gradle.lockfile을 자동 합성 생성해야 한다")
+    void shouldSynthesizeGradleLockfileWhenAbsent(@TempDir Path tempDir) throws IOException {
+        String gradleContent = """
+                plugins {
+                    id 'org.springframework.boot' version '3.2.0'
+                }
+                dependencies {
+                    implementation 'org.springframework.boot:spring-boot-starter-web'
+                    implementation 'io.jsonwebtoken:jjwt-api:0.12.3'
+                }
+                """;
+        Files.writeString(tempDir.resolve("build.gradle"), gradleContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertTrue(packages.size() > 2, "Fallback을 통해 간접 의존성까지 확장 수집되어야 함");
+        assertTrue(packages.stream().anyMatch(LLMAnalysisService.SbomPackageDetail::indirect), "최소 1개 이상의 간접 의존성이 존재해야 함");
+
+        // gradle.lockfile 생성 확인
+        Path lockfile = tempDir.resolve("gradle.lockfile");
+        assertTrue(Files.exists(lockfile), "Trivy 연동을 위한 gradle.lockfile이 자동 생성되어야 함");
+
+        String lockfileContent = Files.readString(lockfile);
+        assertTrue(lockfileContent.contains("=runtimeClasspath"), "Gradle lockfile 표준 형식을 따라야 함");
+        assertTrue(lockfileContent.contains("io.jsonwebtoken:jjwt-api:0.12.3=runtimeClasspath"));
     }
 }
 

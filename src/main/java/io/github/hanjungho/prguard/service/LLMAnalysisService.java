@@ -222,7 +222,19 @@ public class LLMAnalysisService {
                 }
             }
             for (SbomPackageDetail pkg : manifestPackages) {
-                mergedMap.putIfAbsent(pkg.name(), pkg);
+                SbomPackageDetail existing = mergedMap.get(pkg.name());
+                if (existing == null) {
+                    mergedMap.put(pkg.name(), pkg);
+                } else {
+                    String version = (existing.version() != null && !"-".equals(existing.version()) && !"(managed)".equals(existing.version()))
+                            ? existing.version()
+                            : pkg.version();
+                    String license = (existing.license() != null && !"-".equals(existing.license()))
+                            ? existing.license()
+                            : pkg.license();
+                    // manifestPackages의 direct/indirect 분류를 최우선 적용 (트리 기반 정확도 반영)
+                    mergedMap.put(pkg.name(), new SbomPackageDetail(pkg.name(), version, pkg.indirect(), license));
+                }
             }
             List<SbomPackageDetail> combinedList = new ArrayList<>(mergedMap.values());
             int direct = 0;
