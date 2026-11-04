@@ -125,3 +125,4 @@ block_severities:
 ## 라이선스 (License)
 
 This project is licensed under the MIT License.
+

@@ -1,0 +1,11 @@
+.git
+.gradle
+build
+out
+bin
+*.pem
+*.key
+.env
+application-local.properties
+Dockerfile
+README.md
