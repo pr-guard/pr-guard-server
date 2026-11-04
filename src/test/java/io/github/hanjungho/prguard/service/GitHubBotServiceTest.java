@@ -87,5 +87,66 @@ class GitHubBotServiceTest {
 
         assertEquals("", filteredDiff, "보안 무관 파일만 수정된 경우 빈 문자열 반환");
     }
+
+    @Test
+    @DisplayName("findExistingBotCommentId: 마커가 포함된 이전 리포트 코멘트가 있을 경우 ID 반환")
+    void shouldFindExistingBotCommentIdWhenMarkerPresent() {
+        RestTemplate mockRestTemplate = org.mockito.Mockito.mock(RestTemplate.class);
+        GitHubBotService botService = new GitHubBotService(new ObjectMapper(), mockRestTemplate);
+
+        String commentsJson = """
+                [
+                  {
+                    "id": 1001,
+                    "body": "LGTM!",
+                    "user": { "login": "reviewer", "type": "User" }
+                  },
+                  {
+                    "id": 2002,
+                    "body": "<!-- pr-guard-report-marker -->\\n## 🛡️ PR Guard 보안 분석 리포트",
+                    "user": { "login": "pr-guard[bot]", "type": "Bot" }
+                  }
+                ]
+                """;
+
+        org.mockito.Mockito.when(mockRestTemplate.exchange(
+                org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.eq(org.springframework.http.HttpMethod.GET),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.eq(String.class)
+        )).thenReturn(org.springframework.http.ResponseEntity.ok(commentsJson));
+
+        Long commentId = botService.findExistingBotCommentId("octocat/repo", 1, "test-token");
+
+        assertEquals(2002L, commentId);
+    }
+
+    @Test
+    @DisplayName("findExistingBotCommentId: 봇 코멘트가 없을 경우 null 반환")
+    void shouldReturnNullWhenNoBotCommentFound() {
+        RestTemplate mockRestTemplate = org.mockito.Mockito.mock(RestTemplate.class);
+        GitHubBotService botService = new GitHubBotService(new ObjectMapper(), mockRestTemplate);
+
+        String commentsJson = """
+                [
+                  {
+                    "id": 1001,
+                    "body": "Please review this PR",
+                    "user": { "login": "author", "type": "User" }
+                  }
+                ]
+                """;
+
+        org.mockito.Mockito.when(mockRestTemplate.exchange(
+                org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.eq(org.springframework.http.HttpMethod.GET),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.eq(String.class)
+        )).thenReturn(org.springframework.http.ResponseEntity.ok(commentsJson));
+
+        Long commentId = botService.findExistingBotCommentId("octocat/repo", 1, "test-token");
+
+        assertNull(commentId);
+    }
 }
 

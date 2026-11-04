@@ -4,10 +4,12 @@ server.port=${PORT:8080}
 # Google Gemini API Key 설정
 # Google AI Studio에서 발급받은 API 키를 설정하거나 환경 변수(GEMINI_API_KEY)로 주입하세요.
 gemini.api.key=${GEMINI_API_KEY:YOUR_GEMINI_API_KEY_HERE}
-gemini.model=gemini-3.5-flash-lite
+gemini.model=${GEMINI_MODEL:gemini-2.5-flash}
 
 # GitHub App 설정
 github.app.id=${GITHUB_APP_ID:YOUR_GITHUB_APP_ID}
+# GitHub Webhook HMAC 서명 검증 시크릿 (선택 사항 - 비워둘 경우 서명 검증 스킵)
+github.webhook.secret=${GITHUB_WEBHOOK_SECRET:}
 # GitHub App Private Key 경로 (로컬 클래스패스 또는 Render Secret File 경로)
 github.app.private-key-path=${GITHUB_APP_PRIVATE_KEY_PATH:pr-guard-pg.private-key.pem}
 # GitHub App Private Key 텍스트 자체를 환경변수로 직접 주입할 경우 사용

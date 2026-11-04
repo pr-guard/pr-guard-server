@@ -2,7 +2,6 @@ package io.github.hanjungho.prguard.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hanjungho.prguard.dto.PrguardConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -220,6 +220,47 @@ public class TrivyScannerService {
         }
     }
 
+    public record ProcessRunResult(int exitCode, String output) {}
+
+    /**
+     * 외부 프로세스를 실행하고, 비동기 파이프로 출력을 안전하게 수집하며 타임아웃을 엄격히 강제합니다.
+     * 동기식 스트림 읽기로 인한 데드락 및 프로세스 멈춤(Hang)을 원천 차단합니다.
+     */
+    private ProcessRunResult runProcessWithTimeout(ProcessBuilder processBuilder, long timeout, TimeUnit unit, String processName)
+            throws IOException, InterruptedException {
+        Process process = processBuilder.start();
+
+        CompletableFuture<String> outputFuture = CompletableFuture.supplyAsync(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line).append(System.lineSeparator());
+                }
+                return sb.toString();
+            } catch (IOException e) {
+                log.warn("[TrivyScanner] {} 프로세스 출력 스트림 읽기 중 오류: {}", processName, e.getMessage());
+                return "";
+            }
+        });
+
+        boolean finished = process.waitFor(timeout, unit);
+        if (!finished) {
+            process.destroyForcibly();
+            outputFuture.cancel(true);
+            throw new RuntimeException(processName + " 타임아웃 초과 (" + timeout + " " + unit.name().toLowerCase() + ")");
+        }
+
+        String output = "";
+        try {
+            output = outputFuture.get(5, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("[TrivyScanner] {} 프로세스 출력 완료 대기 중 예외: {}", processName, e.getMessage());
+        }
+
+        return new ProcessRunResult(process.exitValue(), output);
+    }
+
     private void executeGitClone(String cloneUrl, String branch, Path targetDir, String accessToken) throws IOException, InterruptedException {
         log.info("[TrivyScanner] Git Clone 시작: {} (Branch: {})", cloneUrl, branch != null ? branch : "default");
 
@@ -229,6 +270,43 @@ public class TrivyScannerService {
             targetCloneUrl = "https://x-access-token:" + accessToken + "@" + targetCloneUrl.substring("https://".length());
         }
 
+        // 1차 시도: 브랜치 지정 + 액세스 토큰 URL Clone
+        ProcessRunResult result = runGitCloneCmd(targetCloneUrl, branch, targetDir);
+
+        // 2차 시도: 인증 토큰 실패 또는 오픈소스 Fork PR 브랜치 권한 오류 시 무인증(Public) 원본 cloneUrl로 재시도
+        if (result.exitCode() != 0 && !targetCloneUrl.equals(cloneUrl)) {
+            log.warn("[TrivyScanner] 인증 토큰 Clone 실패 (Exit code: {}). 오픈소스 퍼블릭 Fork 저장소일 수 있으므로 무인증 Clone으로 재시도합니다.",
+                    result.exitCode());
+            result = runGitCloneCmd(cloneUrl, branch, targetDir);
+        }
+
+        // 3차 시도: 특정 브랜치 미존재 시 기본 브랜치(default branch)로 Fallback Clone
+        if (result.exitCode() != 0 && branch != null && !branch.isBlank()) {
+            log.warn("[TrivyScanner] 브랜치 지정 Clone 실패 (Exit code: {}). 기본 브랜치로 최종 재시도합니다. 로그: {}",
+                    result.exitCode(), result.output().trim());
+            result = runGitCloneCmd(targetCloneUrl.equals(cloneUrl) ? cloneUrl : targetCloneUrl, null, targetDir);
+            if (result.exitCode() != 0 && !targetCloneUrl.equals(cloneUrl)) {
+                result = runGitCloneCmd(cloneUrl, null, targetDir);
+            }
+        }
+
+        if (result.exitCode() != 0) {
+            log.error("[TrivyScanner] Git Clone 최종 실패 (Exit code: {}): {}",
+                    result.exitCode(), result.output().trim());
+            throw new RuntimeException("Git Clone 실패 (저장소 접근 권한 또는 브랜치 확인 필요): " + result.output().trim());
+        }
+
+        // Clone 완료 후 디렉토리가 실제로 채워졌는지 검증
+        try (var stream = Files.list(targetDir)) {
+            long fileCount = stream.count();
+            if (fileCount == 0) {
+                throw new IllegalStateException("Git Clone은 성공했으나 대상 디렉토리가 비어 있습니다: " + targetDir);
+            }
+            log.info("[TrivyScanner] Git Clone 성공 완료 (다운로드 항목 수: {}개)", fileCount);
+        }
+    }
+
+    private ProcessRunResult runGitCloneCmd(String cloneUrl, String branch, Path targetDir) throws IOException, InterruptedException {
         List<String> command = new ArrayList<>();
         command.add("git");
         command.add("-c");
@@ -241,67 +319,15 @@ public class TrivyScannerService {
             command.add(branch);
         }
         command.add("--"); // Git 옵션 인젝션 방어 구분자
-        command.add(targetCloneUrl);
+        command.add(cloneUrl);
         command.add(targetDir.toAbsolutePath().toString());
 
         ProcessBuilder processBuilder = new ProcessBuilder(command);
-        processBuilder.environment().put("GIT_TERMINAL_PROMPT", "0"); // 터미널/GUI 대화형 로그인 비활성화
-        processBuilder.environment().put("GCM_INTERACTIVE", "never");  // Windows Git Credential Manager 팝업 금지
+        processBuilder.environment().put("GIT_TERMINAL_PROMPT", "0");
+        processBuilder.environment().put("GCM_INTERACTIVE", "never");
         processBuilder.redirectErrorStream(true);
 
-        Process process = processBuilder.start();
-        String output = readProcessOutput(process);
-
-        boolean finished = process.waitFor(PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES);
-        if (!finished) {
-            process.destroyForcibly();
-            throw new RuntimeException("Git Clone 타임아웃 초과 (" + PROCESS_TIMEOUT_MINUTES + "분)");
-        }
-
-        if (process.exitValue() != 0) {
-            log.warn("[TrivyScanner] 브랜치 지정 Clone 실패 (Exit code: {}), 기본 브랜치로 재시도합니다. 로그: {}",
-                    process.exitValue(), output.trim());
-
-            List<String> fallbackCmd = new ArrayList<>();
-            fallbackCmd.add("git");
-            fallbackCmd.add("-c");
-            fallbackCmd.add("credential.helper=");
-            fallbackCmd.add("clone");
-            fallbackCmd.add("--depth");
-            fallbackCmd.add("1");
-            fallbackCmd.add("--");
-            fallbackCmd.add(targetCloneUrl);
-            fallbackCmd.add(targetDir.toAbsolutePath().toString());
-
-            ProcessBuilder fallbackPb = new ProcessBuilder(fallbackCmd);
-            fallbackPb.environment().put("GIT_TERMINAL_PROMPT", "0");
-            fallbackPb.environment().put("GCM_INTERACTIVE", "never");
-            fallbackPb.redirectErrorStream(true);
-
-            Process fallbackProcess = fallbackPb.start();
-            String fallbackOutput = readProcessOutput(fallbackProcess);
-            boolean fallbackFinished = fallbackProcess.waitFor(PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES);
-
-            if (!fallbackFinished) {
-                fallbackProcess.destroyForcibly();
-                throw new RuntimeException("기본 브랜치 Git Clone 타임아웃 초과 (" + PROCESS_TIMEOUT_MINUTES + "분)");
-            }
-
-            if (fallbackProcess.exitValue() != 0) {
-                log.error("[TrivyScanner] Git Clone 최종 실패 (Exit code: {}): {}",
-                        fallbackProcess.exitValue(), fallbackOutput.trim());
-                throw new RuntimeException("Git Clone 실패 (저장소 접근 권한 또는 브랜치 확인 필요): " + fallbackOutput.trim());
-            }
-        }
-
-        // Clone 완료 후 디렉토리가 실제로 채워졌는지 검증
-        try (var stream = Files.list(targetDir)) {
-            long fileCount = stream.count();
-            if (fileCount == 0) {
-                throw new IllegalStateException("Git Clone은 성공했으나 대상 디렉토리가 비어 있습니다: " + targetDir);
-            }
-            log.info("[TrivyScanner] Git Clone 성공 완료 (다운로드 항목 수: {}개)", fileCount);
-        }
+        return runProcessWithTimeout(processBuilder, PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES, "Git Clone");
     }
 
     private String executeTrivyScan(Path scanTargetDir) throws IOException, InterruptedException {
@@ -337,19 +363,12 @@ public class TrivyScannerService {
         ProcessBuilder processBuilder = new ProcessBuilder(command);
         processBuilder.redirectErrorStream(true);
 
-        Process process = processBuilder.start();
+        ProcessRunResult result = runProcessWithTimeout(processBuilder, PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES, "Trivy Scan");
+        String output = result.output();
 
-        String output = readProcessOutput(process);
-
-        boolean finished = process.waitFor(PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES);
-        if (!finished) {
-            process.destroyForcibly();
-            throw new RuntimeException("Trivy 분석 타임아웃 초과 (" + PROCESS_TIMEOUT_MINUTES + "분)");
-        }
-
-        if (process.exitValue() != 0) {
-            log.error("[TrivyScanner] Trivy 스캔 실패 (Exit code: {}):\n{}", process.exitValue(), output);
-            throw new RuntimeException("Trivy 스캔 실패 (Exit code: " + process.exitValue() + ", 원인: " + output.trim() + ")");
+        if (result.exitCode() != 0) {
+            log.error("[TrivyScanner] Trivy 스캔 실패 (Exit code: {}):\n{}", result.exitCode(), output);
+            throw new RuntimeException("Trivy 스캔 실패 (Exit code: " + result.exitCode() + ", 원인: " + output.trim() + ")");
         }
 
         // 스캔 성공 및 DB 업데이트 정상 완료 시 타임스탬프 갱신
@@ -397,17 +416,6 @@ public class TrivyScannerService {
         }
 
         return "trivy";
-    }
-
-    private String readProcessOutput(Process process) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line).append(System.lineSeparator());
-            }
-        }
-        return sb.toString();
     }
 
     private void deleteDirectoryRecursively(Path rootPath) {

@@ -38,7 +38,13 @@ public class SecurityScanPipeline {
     public void executePipelineAsync(GithubWebhookPayload payload) {
         Integer prNumber = payload.getNumber();
         String fullName = payload.getRepository() != null ? payload.getRepository().getFullName() : "N/A";
-        String cloneUrl = payload.getRepository() != null ? payload.getRepository().getCloneUrl() : null;
+        String cloneUrl = null;
+        if (payload.getPullRequest() != null && payload.getPullRequest().getHead() != null && payload.getPullRequest().getHead().getRepo() != null) {
+            cloneUrl = payload.getPullRequest().getHead().getRepo().getCloneUrl();
+        }
+        if (cloneUrl == null && payload.getRepository() != null) {
+            cloneUrl = payload.getRepository().getCloneUrl();
+        }
         String branch = (payload.getPullRequest() != null && payload.getPullRequest().getHead() != null)
                 ? payload.getPullRequest().getHead().getRef()
                 : null;
@@ -47,7 +53,8 @@ public class SecurityScanPipeline {
                 : null;
         Long installationId = payload.getInstallation() != null ? payload.getInstallation().getId() : null;
 
-        log.info("[Pipeline] PR 이벤트 수신 - 비동기 보안 분석 시작 (PR #{}, Repo: {}, Branch: {})", prNumber, fullName, branch);
+        log.info("[Pipeline] PR 이벤트 수신 - 비동기 보안 분석 시작 (PR #{}, Repo: {}, Branch: {}, CloneUrl: {})",
+                prNumber, fullName, branch, cloneUrl);
         runScanPipeline(fullName, prNumber, cloneUrl, branch, headSha, installationId);
     }
 
