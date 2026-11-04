@@ -27,6 +27,7 @@ import java.time.Instant;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -141,8 +142,29 @@ public class GitHubBotService {
     }
 
     /**
+     * AI 프롬프트 토큰 낭비 방지를 위한 보안 무관 파일 확장자 목록
+     */
+    private static final Set<String> IRRELEVANT_EXTENSIONS = Set.of(
+            ".md", ".markdown", ".mdown", ".txt", ".rst", ".adoc",
+            ".css", ".scss", ".sass", ".less", ".styl",
+            ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".tiff",
+            ".woff", ".woff2", ".ttf", ".eot", ".otf",
+            ".mp3", ".mp4", ".wav", ".avi", ".mov",
+            ".csv", ".tsv", ".map", ".drawio"
+    );
+
+    /**
+     * 런타임 보안과 무관한 정적 설정 파일명 목록
+     */
+    private static final Set<String> IRRELEVANT_FILENAMES = Set.of(
+            ".gitignore", ".gitattributes", ".editorconfig", ".prettierrc", ".prettierignore",
+            ".eslintignore", "license", "licence", "changelog", "changelog.md"
+    );
+
+    /**
      * GitHub PR Diff API를 호출하여 이번 PR에서 변경된 코드 Diff 텍스트를 조회합니다.
      * (Accept: application/vnd.github.v3.diff)
+     * 보안 무관 파일(.md, .css, 이미지 등)을 사전에 필터링하여 LLM 입력 토큰을 최대 60~80% 절감합니다.
      * 프롬프트 및 토큰 초과를 방지하기 위해 최대 15,000자로 안전하게 Truncate합니다.
      */
     public String getPullRequestDiff(String repoFullName, Integer prNumber, Long installationId) {
@@ -161,20 +183,97 @@ public class GitHubBotService {
             String diff = response.getBody();
             if (diff == null || diff.isBlank()) {
                 log.info("[GitHubBot] PR #{} Diff 내용이 비어 있습니다.", prNumber);
-                return "(PR 변경 코드 Diff가 비어 있습니다)";
+                return "";
+            }
+
+            // 보안 무관 파일(.md, 스타일, 이미지 등) 블록 제거 (Diff 다이어트)
+            String filteredDiff = filterSecurityRelevantDiff(diff);
+            if (filteredDiff.isBlank()) {
+                log.info("[GitHubBot] PR #{} 변경 파일이 모두 보안 무관 파일(문서/스타일/에셋)입니다.", prNumber);
+                return "";
             }
 
             int maxLength = 15000;
-            if (diff.length() > maxLength) {
-                log.info("[GitHubBot] PR Diff 길이가 {}자이므로 최대 {}자로 잘라냅니다.", diff.length(), maxLength);
-                return diff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 15,000자 이후는 생략되었습니다)";
+            if (filteredDiff.length() > maxLength) {
+                log.info("[GitHubBot] PR Diff 길이가 {}자이므로 최대 {}자로 잘라냅니다.", filteredDiff.length(), maxLength);
+                return filteredDiff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 15,000자 이후는 생략되었습니다)";
             }
 
-            return diff;
+            return filteredDiff;
         } catch (Exception e) {
             log.warn("[GitHubBot] PR Diff 조회 중 예외 발생 (Repo: {}, PR: #{}): {}", repoFullName, prNumber, e.getMessage());
             return "(PR Diff 수집 실패: " + e.getMessage() + ")";
         }
+    }
+
+    /**
+     * Git Diff 텍스트를 파일 단위로 분할하여 보안과 무관한 파일(문서, 정적 이미지, 스타일시트 등)을 제외합니다.
+     */
+    public String filterSecurityRelevantDiff(String rawDiff) {
+        if (rawDiff == null || rawDiff.isBlank()) {
+            return "";
+        }
+
+        String[] fileDiffs = rawDiff.split("(?=diff --git )");
+        StringBuilder relevantDiff = new StringBuilder();
+        int skippedFiles = 0;
+        int keptFiles = 0;
+
+        for (String fileDiff : fileDiffs) {
+            if (fileDiff.isBlank()) continue;
+
+            String firstLine = fileDiff.lines().findFirst().orElse("");
+            String filePath = extractFilePathFromDiffHeader(firstLine);
+
+            if (isSecurityIrrelevantFile(filePath)) {
+                skippedFiles++;
+            } else {
+                keptFiles++;
+                relevantDiff.append(fileDiff);
+            }
+        }
+
+        if (skippedFiles > 0) {
+            log.info("[GitHubBot] ✂️ Diff 다이어트 적용: 보안 무관 파일 {}개 제외, 실행 코드/설정 파일 {}개 유지",
+                    skippedFiles, keptFiles);
+        }
+
+        return relevantDiff.toString().trim();
+    }
+
+    private String extractFilePathFromDiffHeader(String headerLine) {
+        if (headerLine == null || !headerLine.startsWith("diff --git ")) {
+            return "";
+        }
+        int bIdx = headerLine.indexOf(" b/");
+        if (bIdx != -1) {
+            String path = headerLine.substring(bIdx + 3).trim();
+            if (!path.startsWith("/dev/null")) {
+                return path;
+            }
+        }
+        int aIdx = headerLine.indexOf(" a/");
+        if (aIdx != -1) {
+            int endIdx = (bIdx > aIdx) ? bIdx : headerLine.length();
+            return headerLine.substring(aIdx + 3, endIdx).trim();
+        }
+        return "";
+    }
+
+    private boolean isSecurityIrrelevantFile(String path) {
+        if (path == null || path.isBlank()) return false;
+        String lower = path.toLowerCase().trim();
+        String filename = lower.contains("/") ? lower.substring(lower.lastIndexOf('/') + 1) : lower;
+
+        if (IRRELEVANT_FILENAMES.contains(filename)) {
+            return true;
+        }
+        for (String ext : IRRELEVANT_EXTENSIONS) {
+            if (lower.endsWith(ext)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

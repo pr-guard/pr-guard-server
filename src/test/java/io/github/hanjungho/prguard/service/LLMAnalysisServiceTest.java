@@ -220,5 +220,56 @@ class LLMAnalysisServiceTest {
         assertEquals("axios", summary.topVulnerabilities().get(0).pkgName());
         assertEquals("CRITICAL", summary.topVulnerabilities().get(0).severity());
     }
+
+    @Test
+    @DisplayName("보안 위험이 0건이고 Diff가 비어있는 경우(문서/스타일만 수정된 PR) Short-Circuit PASS가 즉시 반환되어야 한다")
+    void shouldShortCircuitPassWhenZeroFindingsAndEmptyDiff() {
+        String trivyJson = """
+                {
+                  "SchemaVersion": 2,
+                  "Results": [
+                    {
+                      "Target": "Dockerfile",
+                      "Class": "config",
+                      "Misconfigurations": []
+                    }
+                  ]
+                }
+                """;
+
+        // diff가 비어있음 (문서/스타일 파일 필터링 후 빈 diff)
+        LLMAnalysisService.AnalysisOutcome outcome = service.analyzeVulnerabilities(
+                trivyJson, "", "", io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig());
+
+        assertNotNull(outcome);
+        assertEquals(LLMAnalysisService.SecurityVerdict.PASS, outcome.verdict());
+        assertTrue(outcome.reportMarkdown().contains("승인 (PASS)"));
+    }
+
+    @Test
+    @DisplayName("동일한 컨텍스트로 2회 호출 시 SHA-256 메모이제이션 캐시가 적중하여 동일 객체가 즉시 반환되어야 한다")
+    void shouldReturnCachedOutcomeOnIdenticalInputs() {
+        String trivyJson = """
+                {
+                  "SchemaVersion": 2,
+                  "Results": [
+                    {
+                      "Target": "Dockerfile",
+                      "Class": "config",
+                      "Misconfigurations": []
+                    }
+                  ]
+                }
+                """;
+
+        LLMAnalysisService.AnalysisOutcome outcome1 = service.analyzeVulnerabilities(
+                trivyJson, "", "node: 18", io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig());
+        LLMAnalysisService.AnalysisOutcome outcome2 = service.analyzeVulnerabilities(
+                trivyJson, "", "node: 18", io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig());
+
+        assertNotNull(outcome1);
+        assertNotNull(outcome2);
+        assertSame(outcome1, outcome2, "동일 입력 시 캐시된 결과 객체가 반환되어야 함");
+    }
 }
 

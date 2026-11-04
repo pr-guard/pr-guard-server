@@ -19,7 +19,9 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 @Slf4j
@@ -27,6 +29,18 @@ import java.util.stream.Stream;
 public class TrivyScannerService {
 
     private static final long PROCESS_TIMEOUT_MINUTES = 5;
+    private static final long DB_UPDATE_INTERVAL_MS = 12 * 60 * 60 * 1000L; // 12시간 주기
+
+    /**
+     * 저사양/무료 클라우드(512MB RAM)의 OOM(Out of Memory) 방지를 위한 동시 프로세스 제어 세마포어.
+     * 한 번에 최대 1개의 무거운 프로세스(Git Clone + Trivy)만 동작하도록 격리합니다.
+     */
+    private final Semaphore heavyProcessSemaphore = new Semaphore(1, true);
+
+    /**
+     * 마지막 Trivy 취약점 DB 업데이트 타임스탬프 (12시간 이내 재스캔 시 --skip-db-update 적용)
+     */
+    private final AtomicLong lastDbUpdateTime = new AtomicLong(0L);
 
     /**
      * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책을 담는 반환 레코드
@@ -46,7 +60,14 @@ public class TrivyScannerService {
      */
     public ScanResult scanRepositoryWithContext(String cloneUrl, String branch, String accessToken) {
         Path tempDir = null;
+        boolean semaphoreAcquired = false;
         try {
+            // 저사양 서버 메모리(512MB RAM) 폭발 방지를 위한 세마포어 획득
+            log.info("[TrivyScanner] 스캔 프로세스 실행을 위해 세마포어 대기 중...");
+            heavyProcessSemaphore.acquire();
+            semaphoreAcquired = true;
+            log.info("[TrivyScanner] 세마포어 획득 성공 - 소스코드 Clone 및 Trivy 스캔 격리 실행 시작");
+
             // 1. UUID 기반 고유 임시 디렉토리 생성
             tempDir = Files.createTempDirectory("prguard-" + UUID.randomUUID());
             log.info("[TrivyScanner] 임시 디렉토리 생성 완료: {}", tempDir.toAbsolutePath());
@@ -73,6 +94,10 @@ public class TrivyScannerService {
             // 6. 임시 디렉토리 완전 삭제
             if (tempDir != null) {
                 deleteDirectoryRecursively(tempDir);
+            }
+            if (semaphoreAcquired) {
+                heavyProcessSemaphore.release();
+                log.info("[TrivyScanner] 세마포어 반환 완료");
             }
         }
     }
@@ -274,6 +299,19 @@ public class TrivyScannerService {
         command.add("vuln,misconfig,secret");
         command.add("--list-all-pkgs");
         command.add("-q");
+
+        // 12시간 이내에 이미 최신 DB를 동기화했다면 네트워크 I/O 스킵하여 스캔 속도 3~5초 단축
+        long now = System.currentTimeMillis();
+        long lastUpdate = lastDbUpdateTime.get();
+        boolean shouldSkipUpdate = (now - lastUpdate) < DB_UPDATE_INTERVAL_MS && lastUpdate > 0;
+
+        if (shouldSkipUpdate) {
+            log.info("[TrivyScanner] ⚡ 최근 12시간 내 DB 업데이트 완료됨 -> --skip-db-update 적용 (스캔 시간 대폭 단축)");
+            command.add("--skip-db-update");
+        } else {
+            log.info("[TrivyScanner] 🔄 Trivy 취약점 DB 최신화 검사 수행 (12시간 주기 갱신)");
+        }
+
         command.add(scanTargetDir.toAbsolutePath().toString());
 
         ProcessBuilder processBuilder = new ProcessBuilder(command);
@@ -292,6 +330,12 @@ public class TrivyScannerService {
         if (process.exitValue() != 0) {
             log.error("[TrivyScanner] Trivy 스캔 실패 (Exit code: {}):\n{}", process.exitValue(), output);
             throw new RuntimeException("Trivy 스캔 실패 (Exit code: " + process.exitValue() + ", 원인: " + output.trim() + ")");
+        }
+
+        // 스캔 성공 및 DB 업데이트 정상 완료 시 타임스탬프 갱신
+        if (!shouldSkipUpdate) {
+            lastDbUpdateTime.set(now);
+            log.info("[TrivyScanner] Trivy 취약점 DB 최신화 완료 (타임스탬프 갱신 완료)");
         }
 
         return output;

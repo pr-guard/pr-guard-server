@@ -7,6 +7,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.util.concurrent.ConcurrentHashMap;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -15,6 +17,19 @@ public class SecurityScanPipeline {
     private final TrivyScannerService trivyScannerService;
     private final LLMAnalysisService llmAnalysisService;
     private final GitHubBotService gitHubBotService;
+
+    /**
+     * 현재 스캔이 진행 중인 PR 추적 맵 (연속 푸시로 인한 중복 스캔 방지)
+     * Key: "repoFullName#prNumber", Value: "headSha"
+     */
+    private final ConcurrentHashMap<String, String> activeScans = new ConcurrentHashMap<>();
+
+    /**
+     * 최근 스캔이 완료된 커밋 추적 맵 (네트워크 재전송 등 동일 커밋 중복 웹훅 방지)
+     * Key: "repoFullName#prNumber@headSha", Value: 완료 타임스탬프
+     */
+    private final ConcurrentHashMap<String, Long> recentCompletedScans = new ConcurrentHashMap<>();
+    private static final long DEDUP_WINDOW_MS = 10 * 60 * 1000L; // 10분 이내 중복 스캔 차단
 
     /**
      * PR opened 또는 synchronize(커밋 푸시) 이벤트 수신 시 비동기 스캔 실행
@@ -68,24 +83,46 @@ public class SecurityScanPipeline {
      */
     private void runScanPipeline(String fullName, Integer prNumber, String cloneUrl, String branch, String headSha, Long installationId) {
         Long checkRunId = null;
-        try {
-            // 0. 최신 commit sha가 없으면 PR 상세 조회로 보완
-            if (headSha == null || headSha.isBlank()) {
-                try {
-                    GitHubBotService.PullRequestDetails details = gitHubBotService.getPullRequestDetails(fullName, prNumber, installationId);
-                    headSha = details.headSha();
-                    if (cloneUrl == null) cloneUrl = details.cloneUrl();
-                    if (branch == null) branch = details.branch();
-                } catch (Exception ignored) {}
-            }
 
+        // 0. 최신 commit sha가 없으면 PR 상세 조회로 보완
+        if (headSha == null || headSha.isBlank()) {
+            try {
+                GitHubBotService.PullRequestDetails details = gitHubBotService.getPullRequestDetails(fullName, prNumber, installationId);
+                headSha = details.headSha();
+                if (cloneUrl == null) cloneUrl = details.cloneUrl();
+                if (branch == null) branch = details.branch();
+            } catch (Exception ignored) {}
+        }
+
+        String prKey = fullName + "#" + prNumber;
+        String commitKey = (headSha != null) ? prKey + "@" + headSha : null;
+
+        // 1. 최근 10분 내 동일 커밋 스캔 완료 여부 검사 (중복 웹훅 차단)
+        if (commitKey != null) {
+            Long lastCompletedTime = recentCompletedScans.get(commitKey);
+            if (lastCompletedTime != null && (System.currentTimeMillis() - lastCompletedTime) < DEDUP_WINDOW_MS) {
+                log.info("[Pipeline] ⏭️ 동일 커밋(SHA: {})에 대한 스캔이 최근 이미 완료되었습니다. 중복 스캔 생략 (Repo: {}, PR #{})",
+                        headSha, fullName, prNumber);
+                return;
+            }
+        }
+
+        // 2. 동일 PR에 대한 진행 중인 스캔 중복 제어 (연속 푸시 방어)
+        String runningSha = activeScans.putIfAbsent(prKey, headSha != null ? headSha : "UNKNOWN");
+        if (runningSha != null) {
+            log.warn("[Pipeline] ⚠️ PR #{} 에 대한 스캔이 이미 진행 중입니다 (진행 중 SHA: {}, 신규 요청 SHA: {}). 중복 파이프라인 방지.",
+                    prNumber, runningSha, headSha);
+            return;
+        }
+
+        try {
             // 1. GitHub Checks API를 호출하여 'PR Guard / Security Scan' 진행 중(in_progress) 등록
             checkRunId = gitHubBotService.createCheckRun(fullName, headSha, installationId);
 
             // 2. Private 저장소 복제 및 인증을 위한 Installation Access Token 획득 (캐시 적용)
             String accessToken = gitHubBotService.getInstallationAccessToken(fullName, installationId);
 
-            // 3. PR 코드 변경 사항(Diff) 수집 (Reachability 및 비즈니스 로직 검증용)
+            // 3. PR 코드 변경 사항(Diff) 수집 (보안 무관 파일 필터링 적용)
             log.info("[Pipeline] Step 1: PR #{} 코드 Diff 수집", prNumber);
             String prDiff = gitHubBotService.getPullRequestDiff(fullName, prNumber, installationId);
 
@@ -98,7 +135,7 @@ public class SecurityScanPipeline {
             log.info("[Pipeline] Trivy 스캔 완료 (수집 데이터: {} KB, 런타임: {}자, 커스텀 정책: {})",
                     scanResultJson.length() / 1024, runtimeContext.length(), prguardConfig.toSummaryString());
 
-            // 5. 커스텀 정책 기반 필터링 및 Gemini AI 종합 보안/런타임 영향도 분석
+            // 5. 커스텀 정책 기반 필터링 및 Gemini AI 종합 보안/런타임 영향도 분석 (캐시 & Short-Circuit 적용)
             log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중...");
             LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
                     scanResultJson, prDiff, runtimeContext, prguardConfig);
@@ -132,6 +169,19 @@ public class SecurityScanPipeline {
             if (prNumber != null && !"N/A".equals(fullName)) {
                 sendFailureFeedbackComment(fullName, prNumber, installationId, e);
             }
+        } finally {
+            activeScans.remove(prKey);
+            if (commitKey != null) {
+                recentCompletedScans.put(commitKey, System.currentTimeMillis());
+            }
+            cleanupExpiredCompletedScans();
+        }
+    }
+
+    private void cleanupExpiredCompletedScans() {
+        if (recentCompletedScans.size() > 200) {
+            long threshold = System.currentTimeMillis() - DEDUP_WINDOW_MS;
+            recentCompletedScans.entrySet().removeIf(entry -> entry.getValue() < threshold);
         }
     }
 

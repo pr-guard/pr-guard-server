@@ -14,9 +14,10 @@ public class AsyncConfig {
     @Bean(name = "scanTaskExecutor")
     public Executor scanTaskExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(2);
-        executor.setMaxPoolSize(5);
-        executor.setQueueCapacity(25);
+        // 512MB RAM 무료/저사양 환경을 고려하여 스레드 풀 제한 및 큐 확장
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(2);
+        executor.setQueueCapacity(50);
         executor.setThreadNamePrefix("PRGuard-Scan-");
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(60);
