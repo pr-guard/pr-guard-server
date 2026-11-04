@@ -1,0 +1,478 @@
+package io.github.hanjungho.prguard.service;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.jsonwebtoken.Jwts;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
+import org.bouncycastle.openssl.PEMKeyPair;
+import org.bouncycastle.openssl.PEMParser;
+import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.security.PrivateKey;
+import java.time.Instant;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class GitHubBotService {
+
+    private final ObjectMapper objectMapper;
+    private final RestTemplate restTemplate;
+
+    @Value("${github.app.id}")
+    private String appId;
+
+    @Value("${github.app.private-key-path}")
+    private String privateKeyPath;
+
+    @Value("${github.app.default-installation-id:}")
+    private String defaultInstallationId;
+
+    private PrivateKey privateKey;
+
+    /**
+     * Installation Access Token 캐시용 레코드 (만료 5분 전까지 재사용)
+     */
+    private record CachedToken(String token, Instant expiresAt) {
+        boolean isValid() {
+            return Instant.now().isBefore(expiresAt.minusSeconds(300));
+        }
+    }
+
+    private final Map<Long, CachedToken> tokenCache = new ConcurrentHashMap<>();
+
+    /**
+     * 서버 기동 시 .pem 파일에서 Private Key(PKCS#1 또는 PKCS#8)를 1회 파싱하여 메모리에 캐싱합니다.
+     */
+    @PostConstruct
+    public void initPrivateKey() {
+        try {
+            ClassPathResource resource = new ClassPathResource(privateKeyPath);
+            try (PEMParser pemParser = new PEMParser(new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8))) {
+                Object object = pemParser.readObject();
+                JcaPEMKeyConverter converter = new JcaPEMKeyConverter();
+
+                if (object instanceof PEMKeyPair keyPair) {
+                    this.privateKey = converter.getPrivateKey(keyPair.getPrivateKeyInfo());
+                } else if (object instanceof PrivateKeyInfo keyInfo) {
+                    this.privateKey = converter.getPrivateKey(keyInfo);
+                } else {
+                    throw new IllegalArgumentException("지원하지 않는 PEM 포맷입니다: " + (object != null ? object.getClass().getName() : "null"));
+                }
+            }
+            log.info("[GitHubBot] GitHub App Private Key 로드 완료 (App ID: {})", appId);
+        } catch (Exception e) {
+            log.error("[GitHubBot] Private Key 로드 실패: {}", e.getMessage(), e);
+            throw new IllegalStateException("GitHub App Private Key 로드에 실패했습니다.", e);
+        }
+    }
+
+    /**
+     * PR에 AI 분석 리포트를 코멘트로 작성합니다.
+     *
+     * @param repoFullName   저장소 전체 이름 (예: "junghohans/test")
+     * @param prNumber       PR 번호
+     * @param installationId 웹훅 페이로드의 installation.id (없을 경우 자동 조회 또는 properties 설정값 사용)
+     * @param commentBody    등록할 AI 분석 리포트 마크다운
+     */
+    public void postComment(String repoFullName, Integer prNumber, Long installationId, String commentBody) {
+        log.info("[GitHubBot] PR 코멘트 등록 파이프라인 시작 (Repo: {}, PR: #{})", repoFullName, prNumber);
+
+        try {
+            // 캐시 지원 토큰 획득
+            String installationAccessToken = getInstallationAccessToken(repoFullName, installationId);
+
+            // GitHub Issue Comments API 호출하여 PR 코멘트 등록
+            createIssueComment(repoFullName, prNumber, installationAccessToken, commentBody);
+
+            log.info("[GitHubBot] PR #{} 에 코멘트 등록이 성공적으로 완료되었습니다.", prNumber);
+        } catch (Exception e) {
+            log.error("[GitHubBot] PR 코멘트 등록 중 오류 발생: {}", e.getMessage(), e);
+            throw new RuntimeException("GitHub PR 코멘트 작성 실패: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * GitHub PR Diff API를 호출하여 이번 PR에서 변경된 코드 Diff 텍스트를 조회합니다.
+     * (Accept: application/vnd.github.v3.diff)
+     * 프롬프트 및 토큰 초과를 방지하기 위해 최대 15,000자로 안전하게 Truncate합니다.
+     */
+    public String getPullRequestDiff(String repoFullName, Integer prNumber, Long installationId) {
+        log.info("[GitHubBot] PR #{} Diff 수집 시작 (Repo: {})", prNumber, repoFullName);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber;
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.set("Accept", "application/vnd.github.v3.diff");
+
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+
+            String diff = response.getBody();
+            if (diff == null || diff.isBlank()) {
+                log.info("[GitHubBot] PR #{} Diff 내용이 비어 있습니다.", prNumber);
+                return "(PR 변경 코드 Diff가 비어 있습니다)";
+            }
+
+            int maxLength = 15000;
+            if (diff.length() > maxLength) {
+                log.info("[GitHubBot] PR Diff 길이가 {}자이므로 최대 {}자로 잘라냅니다.", diff.length(), maxLength);
+                return diff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 15,000자 이후는 생략되었습니다)";
+            }
+
+            return diff;
+        } catch (Exception e) {
+            log.warn("[GitHubBot] PR Diff 조회 중 예외 발생 (Repo: {}, PR: #{}): {}", repoFullName, prNumber, e.getMessage());
+            return "(PR Diff 수집 실패: " + e.getMessage() + ")";
+        }
+    }
+
+    /**
+     * Installation Access Token을 조회합니다. 유효한 캐시가 존재하면 재사용하고, 없으면 신규 발급합니다.
+     */
+    public String getInstallationAccessToken(String repoFullName, Long payloadInstallationId) {
+        String jwt = createJwt();
+        Long targetInstallationId = resolveInstallationId(repoFullName, payloadInstallationId, jwt);
+
+        CachedToken cached = tokenCache.get(targetInstallationId);
+        if (cached != null && cached.isValid()) {
+            log.info("[GitHubBot] 캐시된 Installation Access Token 재사용 (Installation ID: {})", targetInstallationId);
+            return cached.token();
+        }
+
+        return fetchAndCacheInstallationAccessToken(targetInstallationId, jwt);
+    }
+
+    /**
+     * GitHub App 인증용 JWT 토큰 생성 (RS256, 유효시간 10분)
+     */
+    public String createJwt() {
+        long nowMillis = System.currentTimeMillis();
+        Date issuedAt = new Date(nowMillis - (60 * 1000)); // 클럭 오차 방어 (1분 전)
+        Date expiration = new Date(nowMillis + (10 * 60 * 1000)); // 10분 후 만료
+
+        return Jwts.builder()
+                .issuer(appId)
+                .issuedAt(issuedAt)
+                .expiration(expiration)
+                .signWith(privateKey, Jwts.SIG.RS256)
+                .compact();
+    }
+
+    /**
+     * Installation ID를 다단계로 해결합니다:
+     * 1) 웹훅 페이로드에서 전달된 값
+     * 2) application.properties 에 설정된 기본값
+     * 3) GitHub API (/app/installations)를 통한 자동 감지
+     */
+    private Long resolveInstallationId(String repoFullName, Long payloadInstallationId, String jwt) {
+        if (payloadInstallationId != null) {
+            return payloadInstallationId;
+        }
+        if (defaultInstallationId != null && !defaultInstallationId.isBlank()) {
+            return Long.parseLong(defaultInstallationId.trim());
+        }
+
+        log.info("[GitHubBot] Installation ID가 누락되어 GitHub API를 통해 설치 목록을 자동 조회합니다.");
+        try {
+            String url = "https://api.github.com/app/installations";
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(jwt);
+
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            JsonNode installations = objectMapper.readTree(response.getBody());
+
+            if (installations.isArray() && !installations.isEmpty()) {
+                // 이 GitHub App이 설치된 첫 번째 계정/레포의 Installation ID 자동 획득
+                Long autoId = installations.get(0).path("id").asLong();
+                log.info("[GitHubBot] GitHub App 설치 ID 자동 감지 성공: {}", autoId);
+                return autoId;
+            }
+        } catch (Exception e) {
+            log.warn("[GitHubBot] Installation ID 자동 조회 실패: {}", e.getMessage());
+        }
+
+        throw new IllegalArgumentException(
+                "Installation ID를 찾을 수 없습니다. GitHub App이 대상 계정/저장소에 'Install' 되어 있는지 확인하거나, " +
+                "application.properties 에 github.app.default-installation-id 값을 지정하세요."
+        );
+    }
+
+    /**
+     * JWT를 사용하여 특정 Installation의 Access Token을 발급받고 메모리에 캐싱합니다.
+     */
+    private String fetchAndCacheInstallationAccessToken(Long installationId, String jwt) {
+        String url = "https://api.github.com/app/installations/" + installationId + "/access_tokens";
+
+        HttpHeaders headers = createBaseHeaders();
+        headers.setBearerAuth(jwt);
+
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(Map.of(), headers);
+
+        try {
+            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+            JsonNode rootNode = objectMapper.readTree(response.getBody());
+            String token = rootNode.path("token").asText("");
+            String expiresAtStr = rootNode.path("expires_at").asText("");
+
+            if (token.isBlank()) {
+                throw new IllegalStateException("응답에서 installation token을 찾을 수 없습니다: " + response.getBody());
+            }
+
+            Instant expiresAt = expiresAtStr.isBlank()
+                    ? Instant.now().plusSeconds(3600)
+                    : Instant.parse(expiresAtStr);
+
+            tokenCache.put(installationId, new CachedToken(token, expiresAt));
+            log.info("[GitHubBot] 신규 Installation Access Token 발급 및 캐싱 완료 (Installation ID: {}, 만료: {})",
+                    installationId, expiresAt);
+
+            return token;
+        } catch (Exception e) {
+            log.error("[GitHubBot] Installation Access Token 발급 실패 (ID: {}): {}", installationId, e.getMessage());
+            throw new RuntimeException("Installation Access Token 획득 실패", e);
+        }
+    }
+
+    /**
+     * PR(Issue)에 코멘트를 등록합니다.
+     */
+    private void createIssueComment(String repoFullName, Integer prNumber, String accessToken, String commentBody) {
+        String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/comments";
+
+        HttpHeaders headers = createBaseHeaders();
+        headers.setBearerAuth(accessToken);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        Map<String, String> requestBody = Map.of("body", commentBody);
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
+
+        try {
+            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+            if (!response.getStatusCode().is2xxSuccessful()) {
+                throw new RuntimeException("코멘트 작성 실패: HTTP " + response.getStatusCode());
+            }
+        } catch (Exception e) {
+            log.error("[GitHubBot] 코멘트 API 호출 실패 (Repo: {}, PR: #{}): {}", repoFullName, prNumber, e.getMessage());
+            throw new RuntimeException("GitHub 코멘트 API 호출 실패", e);
+        }
+    }
+
+    /**
+     * PR 상세 정보 (브랜치명, 최신 커밋 SHA, Clone URL)
+     */
+    public record PullRequestDetails(String branch, String headSha, String cloneUrl) {}
+
+    /**
+     * GitHub PR 상세 API를 호출하여 브랜치, 최신 커밋 SHA, Clone URL을 조회합니다.
+     */
+    public PullRequestDetails getPullRequestDetails(String repoFullName, Integer prNumber, Long installationId) {
+        log.info("[GitHubBot] PR #{} 상세 정보 조회 시작 (Repo: {})", prNumber, repoFullName);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber;
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+
+            JsonNode root = objectMapper.readTree(response.getBody());
+            String branch = root.path("head").path("ref").asText("");
+            String headSha = root.path("head").path("sha").asText("");
+            String cloneUrl = root.path("head").path("repo").path("clone_url").asText("");
+            if (cloneUrl.isBlank()) {
+                cloneUrl = root.path("base").path("repo").path("clone_url").asText("");
+            }
+
+            log.info("[GitHubBot] PR #{} 상세 조회 성공: branch={}, sha={}", prNumber, branch, headSha);
+            return new PullRequestDetails(branch, headSha, cloneUrl);
+        } catch (Exception e) {
+            log.error("[GitHubBot] PR 상세 정보 조회 실패 (Repo: {}, PR: #{}): {}", repoFullName, prNumber, e.getMessage());
+            throw new RuntimeException("PR 상세 정보 조회 실패: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * GitHub Checks API를 호출하여 'in_progress' 상태의 Check Run을 생성합니다.
+     */
+    public Long createCheckRun(String repoFullName, String headSha, Long installationId) {
+        if (headSha == null || headSha.isBlank()) {
+            log.warn("[GitHubBot] headSha가 없어 Check Run 생성을 건너뜁니다.");
+            return null;
+        }
+
+        log.info("[GitHubBot] Check Run 생성 시작 (Repo: {}, SHA: {})", repoFullName, headSha);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/check-runs";
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, Object> body = Map.of(
+                    "name", "PR Guard / Security Scan",
+                    "head_sha", headSha,
+                    "status", "in_progress",
+                    "started_at", Instant.now().toString(),
+                    "output", Map.of(
+                            "title", "보안 스캔 및 AI 분석 진행 중",
+                            "summary", "Trivy 정적 분석 및 Gemini AI 보안 영향도 평가를 진행하고 있습니다..."
+                    )
+            );
+
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+
+            JsonNode root = objectMapper.readTree(response.getBody());
+            Long checkRunId = root.path("id").asLong();
+            log.info("[GitHubBot] Check Run 생성 완료 (ID: {})", checkRunId);
+            return checkRunId;
+        } catch (Exception e) {
+            log.warn("[GitHubBot] Check Run 생성 중 오류 (권한 확인 필요: checks:write): {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * GitHub Checks API를 호출하여 Check Run 결과를 'completed' 상태로 업데이트합니다.
+     *
+     * @param conclusion success, failure, neutral, action_required
+     */
+    public void updateCheckRun(String repoFullName, Long checkRunId, Long installationId,
+                               String conclusion, String title, String summary) {
+        if (checkRunId == null) {
+            return;
+        }
+
+        log.info("[GitHubBot] Check Run 결과 업데이트 시작 (ID: {}, Conclusion: {})", checkRunId, conclusion);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/check-runs/" + checkRunId;
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, Object> body = Map.of(
+                    "name", "PR Guard / Security Scan",
+                    "status", "completed",
+                    "conclusion", conclusion,
+                    "completed_at", Instant.now().toString(),
+                    "output", Map.of(
+                            "title", title,
+                            "summary", summary
+                    )
+            );
+
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            restTemplate.exchange(url, HttpMethod.PATCH, entity, String.class);
+            log.info("[GitHubBot] Check Run 결과 업데이트 완료 (ID: {})", checkRunId);
+        } catch (Exception e) {
+            log.warn("[GitHubBot] Check Run 결과 업데이트 실패: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * PR에 레이블을 추가합니다.
+     */
+    public void addLabel(String repoFullName, Integer prNumber, Long installationId, String label) {
+        if (prNumber == null || label == null || label.isBlank()) {
+            return;
+        }
+        log.info("[GitHubBot] PR #{} 에 레이블 추가 시도: {}", prNumber, label);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/labels";
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, Object> body = Map.of("labels", List.of(label));
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            restTemplate.postForEntity(url, entity, String.class);
+            log.info("[GitHubBot] PR #{} 에 레이블 추가 성공: {}", prNumber, label);
+        } catch (Exception e) {
+            log.warn("[GitHubBot] 레이블 추가 실패: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * PR에서 특정 레이블을 제거합니다. (없을 경우 404 무시)
+     */
+    public void removeLabel(String repoFullName, Integer prNumber, Long installationId, String label) {
+        if (prNumber == null || label == null || label.isBlank()) {
+            return;
+        }
+        log.info("[GitHubBot] PR #{} 에서 레이블 제거 시도: {}", prNumber, label);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/labels/" + label;
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+
+            HttpEntity<Void> entity = new HttpEntity<>(headers);
+            restTemplate.exchange(url, HttpMethod.DELETE, entity, Void.class);
+            log.info("[GitHubBot] PR #{} 에서 레이블 제거 성공: {}", prNumber, label);
+        } catch (Exception e) {
+            // 404 Not Found는 라벨이 이미 없는 정상 케이스이므로 info 레벨 로깅
+            log.debug("[GitHubBot] 레이블 제거 스킵 (이미 없거나 제거됨): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 댓글(Issue Comment)에 이모지 반응(Reaction)을 남깁니다. (예: "eyes", "+1")
+     */
+    public void addReaction(String repoFullName, Long commentId, Long installationId, String content) {
+        if (commentId == null || content == null || content.isBlank()) {
+            return;
+        }
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/issues/comments/" + commentId + "/reactions";
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, String> body = Map.of("content", content);
+            HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+            restTemplate.postForEntity(url, entity, String.class);
+            log.info("[GitHubBot] 댓글 #{} 에 반응 추가 완료: {}", commentId, content);
+        } catch (Exception e) {
+            log.warn("[GitHubBot] 댓글 반응 추가 실패: {}", e.getMessage());
+        }
+    }
+
+    private HttpHeaders createBaseHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Accept", "application/vnd.github+json");
+        headers.set("X-GitHub-Api-Version", "2022-11-28");
+        return headers;
+    }
+}

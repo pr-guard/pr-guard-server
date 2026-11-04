@@ -1,0 +1,376 @@
+package io.github.hanjungho.prguard.service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import io.github.hanjungho.prguard.dto.PrguardConfig;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
+
+@Slf4j
+@Service
+public class TrivyScannerService {
+
+    private static final long PROCESS_TIMEOUT_MINUTES = 5;
+
+    /**
+     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책을 담는 반환 레코드
+     */
+    public record ScanResult(String scanJson, String runtimeContext, PrguardConfig config) {}
+
+    public String scanRepository(String cloneUrl, String branch) {
+        return scanRepositoryWithContext(cloneUrl, branch, null).scanJson();
+    }
+
+    public String scanRepository(String cloneUrl, String branch, String accessToken) {
+        return scanRepositoryWithContext(cloneUrl, branch, accessToken).scanJson();
+    }
+
+    /**
+     * 소스코드를 복제하고, .prguard.yml 정책 및 런타임 환경 설정 파일을 수집한 뒤 Trivy 종합 스캔을 수행합니다.
+     */
+    public ScanResult scanRepositoryWithContext(String cloneUrl, String branch, String accessToken) {
+        Path tempDir = null;
+        try {
+            // 1. UUID 기반 고유 임시 디렉토리 생성
+            tempDir = Files.createTempDirectory("prguard-" + UUID.randomUUID());
+            log.info("[TrivyScanner] 임시 디렉토리 생성 완료: {}", tempDir.toAbsolutePath());
+
+            // 2. Git Clone 실행 (PR 대상 브랜치 명시 및 Private 저장소 토큰 지원)
+            executeGitClone(cloneUrl, branch, tempDir, accessToken);
+
+            // 3. 커스텀 보안 정책 파일(.prguard.yml) 탐색 및 파싱
+            PrguardConfig prguardConfig = extractPrguardConfig(tempDir);
+
+            // 4. 런타임 환경 설정 컨텍스트 추출 (Dockerfile, .nvmrc, package.json, build.gradle 등)
+            String runtimeContext = extractRuntimeContext(tempDir);
+            log.info("[TrivyScanner] 런타임 환경 설정 컨텍스트 추출 완료 (길이: {}자)", runtimeContext.length());
+
+            // 5. Trivy 취약점 스캔 실행 (stdout/stderr 캡처)
+            String scanResult = executeTrivyScan(tempDir);
+            log.info("[TrivyScanner] Trivy 스캔 완료");
+
+            return new ScanResult(scanResult, runtimeContext, prguardConfig);
+        } catch (Exception e) {
+            log.error("[TrivyScanner] 스캔 파이프라인 수행 실패: {}", e.getMessage(), e);
+            throw new RuntimeException("Trivy 스캔 실패: " + e.getMessage(), e);
+        } finally {
+            // 6. 임시 디렉토리 완전 삭제
+            if (tempDir != null) {
+                deleteDirectoryRecursively(tempDir);
+            }
+        }
+    }
+
+    /**
+     * 프로젝트 루트에서 .prguard.yml 또는 .prguard.yaml 파일을 읽어 사용자 커스텀 보안 정책을 로드합니다.
+     */
+    public PrguardConfig extractPrguardConfig(Path rootDir) {
+        Path configFile = rootDir.resolve(".prguard.yml");
+        if (!Files.exists(configFile)) {
+            configFile = rootDir.resolve(".prguard.yaml");
+        }
+        if (Files.exists(configFile) && Files.isRegularFile(configFile)) {
+            try {
+                ObjectMapper yamlMapper = new ObjectMapper(new YAMLFactory());
+                String content = Files.readString(configFile, StandardCharsets.UTF_8);
+                PrguardConfig config = yamlMapper.readValue(content, PrguardConfig.class);
+                log.info("[TrivyScanner] 커스텀 보안 설정(.prguard.yml) 로드 성공: {}", config);
+                return config;
+            } catch (Exception e) {
+                log.warn("[TrivyScanner] .prguard.yml 파싱 실패, 기본 설정을 적용합니다: {}", e.getMessage());
+            }
+        }
+        return PrguardConfig.defaultConfig();
+    }
+
+    /**
+     * 프로젝트 루트에서 런타임 및 기반 프레임워크 환경 설정 파일(Dockerfile, .nvmrc, package.json, build.gradle, pom.xml)을 추출합니다.
+     */
+    public String extractRuntimeContext(Path rootDir) {
+        StringBuilder sb = new StringBuilder();
+
+        // 1. .nvmrc / .node-version
+        readAndAppendIfExists(rootDir, ".nvmrc", sb);
+        readAndAppendIfExists(rootDir, ".node-version", sb);
+
+        // 2. Dockerfile
+        readAndAppendIfExists(rootDir, "Dockerfile", sb);
+        readAndAppendIfExists(rootDir, "dockerfile", sb);
+
+        // 3. package.json (engines, packageManager, dependencies 등 런타임/프레임워크 버전)
+        Path packageJson = rootDir.resolve("package.json");
+        if (Files.exists(packageJson) && Files.isRegularFile(packageJson)) {
+            try {
+                String content = Files.readString(packageJson, StandardCharsets.UTF_8);
+                sb.append("--- [package.json (런타임 및 프레임워크 버전)] ---\n");
+                if (content.length() <= 3000) {
+                    sb.append(content.trim()).append("\n\n");
+                } else {
+                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
+                }
+            } catch (Exception ignored) {}
+        }
+
+        // 4. build.gradle / pom.xml
+        Path buildGradle = rootDir.resolve("build.gradle");
+        if (Files.exists(buildGradle) && Files.isRegularFile(buildGradle)) {
+            try {
+                String content = Files.readString(buildGradle, StandardCharsets.UTF_8);
+                sb.append("--- [build.gradle (Java/Spring Boot 버전)] ---\n");
+                if (content.length() <= 3000) {
+                    sb.append(content.trim()).append("\n\n");
+                } else {
+                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
+                }
+            } catch (Exception ignored) {}
+        }
+
+        Path pomXml = rootDir.resolve("pom.xml");
+        if (Files.exists(pomXml) && Files.isRegularFile(pomXml)) {
+            try {
+                String content = Files.readString(pomXml, StandardCharsets.UTF_8);
+                sb.append("--- [pom.xml (Java/Spring Boot 버전)] ---\n");
+                if (content.length() <= 3000) {
+                    sb.append(content.trim()).append("\n\n");
+                } else {
+                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
+                }
+            } catch (Exception ignored) {}
+        }
+
+        if (sb.isEmpty()) {
+            return "(탐지된 런타임/빌드 환경 설정 파일 없음)";
+        }
+        return sb.toString().trim();
+    }
+
+    private void readAndAppendIfExists(Path rootDir, String fileName, StringBuilder sb) {
+        Path filePath = rootDir.resolve(fileName);
+        if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
+            try {
+                String content = Files.readString(filePath, StandardCharsets.UTF_8);
+                sb.append("--- [").append(fileName).append("] ---\n");
+                if (content.length() <= 2000) {
+                    sb.append(content.trim()).append("\n\n");
+                } else {
+                    sb.append(content.substring(0, 2000)).append("\n... (생략)\n\n");
+                }
+            } catch (Exception ignored) {}
+        }
+    }
+
+    private void executeGitClone(String cloneUrl, String branch, Path targetDir, String accessToken) throws IOException, InterruptedException {
+        log.info("[TrivyScanner] Git Clone 시작: {} (Branch: {})", cloneUrl, branch != null ? branch : "default");
+
+        // GitHub Git HTTP 인증: x-access-token 기본 인증 URL 구성 (GitHub App 공식 지원)
+        String targetCloneUrl = cloneUrl;
+        if (accessToken != null && !accessToken.isBlank() && targetCloneUrl.startsWith("https://")) {
+            targetCloneUrl = "https://x-access-token:" + accessToken + "@" + targetCloneUrl.substring("https://".length());
+        }
+
+        List<String> command = new ArrayList<>();
+        command.add("git");
+        command.add("-c");
+        command.add("credential.helper="); // Git Credential Manager GUI 팝업 완전 차단
+        command.add("clone");
+        command.add("--depth");
+        command.add("1");
+        if (branch != null && !branch.isBlank()) {
+            command.add("-b");
+            command.add(branch);
+        }
+        command.add("--"); // Git 옵션 인젝션 방어 구분자
+        command.add(targetCloneUrl);
+        command.add(targetDir.toAbsolutePath().toString());
+
+        ProcessBuilder processBuilder = new ProcessBuilder(command);
+        processBuilder.environment().put("GIT_TERMINAL_PROMPT", "0"); // 터미널/GUI 대화형 로그인 비활성화
+        processBuilder.environment().put("GCM_INTERACTIVE", "never");  // Windows Git Credential Manager 팝업 금지
+        processBuilder.redirectErrorStream(true);
+
+        Process process = processBuilder.start();
+        String output = readProcessOutput(process);
+
+        boolean finished = process.waitFor(PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new RuntimeException("Git Clone 타임아웃 초과 (" + PROCESS_TIMEOUT_MINUTES + "분)");
+        }
+
+        if (process.exitValue() != 0) {
+            log.warn("[TrivyScanner] 브랜치 지정 Clone 실패 (Exit code: {}), 기본 브랜치로 재시도합니다. 로그: {}",
+                    process.exitValue(), output.trim());
+
+            List<String> fallbackCmd = new ArrayList<>();
+            fallbackCmd.add("git");
+            fallbackCmd.add("-c");
+            fallbackCmd.add("credential.helper=");
+            fallbackCmd.add("clone");
+            fallbackCmd.add("--depth");
+            fallbackCmd.add("1");
+            fallbackCmd.add("--");
+            fallbackCmd.add(targetCloneUrl);
+            fallbackCmd.add(targetDir.toAbsolutePath().toString());
+
+            ProcessBuilder fallbackPb = new ProcessBuilder(fallbackCmd);
+            fallbackPb.environment().put("GIT_TERMINAL_PROMPT", "0");
+            fallbackPb.environment().put("GCM_INTERACTIVE", "never");
+            fallbackPb.redirectErrorStream(true);
+
+            Process fallbackProcess = fallbackPb.start();
+            String fallbackOutput = readProcessOutput(fallbackProcess);
+            boolean fallbackFinished = fallbackProcess.waitFor(PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+
+            if (!fallbackFinished) {
+                fallbackProcess.destroyForcibly();
+                throw new RuntimeException("기본 브랜치 Git Clone 타임아웃 초과 (" + PROCESS_TIMEOUT_MINUTES + "분)");
+            }
+
+            if (fallbackProcess.exitValue() != 0) {
+                log.error("[TrivyScanner] Git Clone 최종 실패 (Exit code: {}): {}",
+                        fallbackProcess.exitValue(), fallbackOutput.trim());
+                throw new RuntimeException("Git Clone 실패 (저장소 접근 권한 또는 브랜치 확인 필요): " + fallbackOutput.trim());
+            }
+        }
+
+        // Clone 완료 후 디렉토리가 실제로 채워졌는지 검증
+        try (var stream = Files.list(targetDir)) {
+            long fileCount = stream.count();
+            if (fileCount == 0) {
+                throw new IllegalStateException("Git Clone은 성공했으나 대상 디렉토리가 비어 있습니다: " + targetDir);
+            }
+            log.info("[TrivyScanner] Git Clone 성공 완료 (다운로드 항목 수: {}개)", fileCount);
+        }
+    }
+
+    private String executeTrivyScan(Path scanTargetDir) throws IOException, InterruptedException {
+        log.info("[TrivyScanner] Trivy 취약점 분석 실행");
+
+        String trivyExecutable = resolveTrivyCommand();
+        log.info("[TrivyScanner] 사용할 Trivy 바이너리 경로: {}", trivyExecutable);
+
+        List<String> command = new ArrayList<>();
+        command.add(trivyExecutable);
+        command.add("fs");
+        command.add("--format");
+        command.add("json");
+        command.add("--scanners");
+        command.add("vuln,misconfig,secret");
+        command.add("--list-all-pkgs");
+        command.add("-q");
+        command.add(scanTargetDir.toAbsolutePath().toString());
+
+        ProcessBuilder processBuilder = new ProcessBuilder(command);
+        processBuilder.redirectErrorStream(true);
+
+        Process process = processBuilder.start();
+
+        String output = readProcessOutput(process);
+
+        boolean finished = process.waitFor(PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new RuntimeException("Trivy 분석 타임아웃 초과 (" + PROCESS_TIMEOUT_MINUTES + "분)");
+        }
+
+        if (process.exitValue() != 0) {
+            log.error("[TrivyScanner] Trivy 스캔 실패 (Exit code: {}):\n{}", process.exitValue(), output);
+            throw new RuntimeException("Trivy 스캔 실패 (Exit code: " + process.exitValue() + ", 원인: " + output.trim() + ")");
+        }
+
+        return output;
+    }
+
+    private String resolveTrivyCommand() {
+        boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+        if (!isWindows) {
+            return "trivy";
+        }
+
+        try {
+            Process p = new ProcessBuilder("where.exe", "trivy").start();
+            if (p.waitFor() == 0) {
+                return "trivy";
+            }
+        } catch (Exception ignored) {
+        }
+
+        String localAppData = System.getenv("LOCALAPPDATA");
+        if (localAppData != null) {
+            Path wingetLink = Path.of(localAppData, "Microsoft", "WinGet", "Links", "trivy.exe");
+            if (Files.exists(wingetLink)) {
+                return wingetLink.toAbsolutePath().toString();
+            }
+
+            Path wingetPackages = Path.of(localAppData, "Microsoft", "WinGet", "Packages");
+            if (Files.exists(wingetPackages)) {
+                try (Stream<Path> stream = Files.walk(wingetPackages, 3)) {
+                    var trivyPath = stream
+                            .filter(p -> p.getFileName().toString().equalsIgnoreCase("trivy.exe"))
+                            .findFirst();
+                    if (trivyPath.isPresent()) {
+                        return trivyPath.get().toAbsolutePath().toString();
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        return "trivy";
+    }
+
+    private String readProcessOutput(Process process) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append(System.lineSeparator());
+            }
+        }
+        return sb.toString();
+    }
+
+    private void deleteDirectoryRecursively(Path rootPath) {
+        try {
+            if (!Files.exists(rootPath)) {
+                return;
+            }
+            Files.walkFileTree(rootPath, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    File f = file.toFile();
+                    if (!f.canWrite()) {
+                        f.setWritable(true);
+                    }
+                    Files.delete(file);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                    Files.delete(dir);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            log.info("[TrivyScanner] 임시 디렉토리 클린업 완료: {}", rootPath.toAbsolutePath());
+        } catch (IOException e) {
+            log.warn("[TrivyScanner] 임시 디렉토리 삭제 중 경고 발생: {}", e.getMessage());
+        }
+    }
+}
