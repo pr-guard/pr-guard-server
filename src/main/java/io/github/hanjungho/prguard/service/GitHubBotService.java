@@ -43,6 +43,9 @@ public class GitHubBotService {
     @Value("${github.app.private-key-path}")
     private String privateKeyPath;
 
+    @Value("${github.app.private-key:}")
+    private String privateKeyContent;
+
     @Value("${github.app.default-installation-id:}")
     private String defaultInstallationId;
 
@@ -60,13 +63,40 @@ public class GitHubBotService {
     private final Map<Long, CachedToken> tokenCache = new ConcurrentHashMap<>();
 
     /**
-     * 서버 기동 시 .pem 파일에서 Private Key(PKCS#1 또는 PKCS#8)를 1회 파싱하여 메모리에 캐싱합니다.
+     * 서버 기동 시 .pem 파일(또는 환경변수 원시 텍스트)에서 Private Key를 1회 파싱하여 메모리에 캐싱합니다.
+     * 외부 마운트 파일(/etc/secrets/...), 환경변수 직접 주입, 클래스패스 로드를 모두 지원합니다.
      */
     @PostConstruct
     public void initPrivateKey() {
         try {
-            ClassPathResource resource = new ClassPathResource(privateKeyPath);
-            try (PEMParser pemParser = new PEMParser(new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8))) {
+            java.io.Reader reader = null;
+
+            // 1. 환경 변수로 직접 PEM 문자열이 주입된 경우 (Render 등 클라우드 배포 시 가장 간편)
+            if (privateKeyContent != null && !privateKeyContent.isBlank() && privateKeyContent.contains("PRIVATE KEY")) {
+                log.info("[GitHubBot] 환경 변수(GITHUB_APP_PRIVATE_KEY)에서 Private Key 직접 로드");
+                reader = new java.io.StringReader(privateKeyContent.replace("\\n", "\n"));
+            }
+            // 2. 파일 경로가 지정된 경우
+            else if (privateKeyPath != null && !privateKeyPath.isBlank()) {
+                java.nio.file.Path filePath = java.nio.file.Path.of(privateKeyPath);
+                // 2-1. 외부 파일 시스템 경로 확인 (Render Secret File: /etc/secrets/...)
+                if (java.nio.file.Files.exists(filePath) && java.nio.file.Files.isRegularFile(filePath)) {
+                    log.info("[GitHubBot] 외부 파일 시스템({})에서 Private Key 로드", filePath.toAbsolutePath());
+                    reader = new InputStreamReader(java.nio.file.Files.newInputStream(filePath), StandardCharsets.UTF_8);
+                } else {
+                    // 2-2. 클래스패스 확인 (로컬 개발 환경)
+                    log.info("[GitHubBot] 클래스패스({})에서 Private Key 로드", privateKeyPath);
+                    ClassPathResource resource = new ClassPathResource(privateKeyPath);
+                    reader = new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8);
+                }
+            }
+
+            if (reader == null) {
+                throw new IllegalStateException("GitHub App Private Key 설정이 누락되었습니다. " +
+                        "GITHUB_APP_PRIVATE_KEY 환경변수 또는 GITHUB_APP_PRIVATE_KEY_PATH를 설정하세요.");
+            }
+
+            try (PEMParser pemParser = new PEMParser(reader)) {
                 Object object = pemParser.readObject();
                 JcaPEMKeyConverter converter = new JcaPEMKeyConverter();
 
