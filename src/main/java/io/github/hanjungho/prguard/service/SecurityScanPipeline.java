@@ -7,6 +7,12 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -81,6 +87,21 @@ public class SecurityScanPipeline {
             runScanPipeline(fullName, prNumber, prDetails.cloneUrl(), prDetails.branch(), prDetails.headSha(), installationId);
         } catch (Exception e) {
             log.error("[Pipeline] ChatOps 재스캔 준비 실패 (PR #{}, Repo: {}): {}", prNumber, fullName, e.getMessage(), e);
+            sendFailureFeedbackComment(fullName, prNumber, installationId, e);
+        }
+    }
+
+    /**
+     * GitHub UI에서 개발자가 'Re-run' 또는 'Re-run failed checks' 버튼을 클릭했을 때 비동기 재스캔 실행
+     */
+    @Async("scanTaskExecutor")
+    public void executeRescanForPr(String fullName, Integer prNumber, Long installationId) {
+        log.info("[Pipeline] GitHub Checks UI Re-run 요청 수신 (PR #{}, Repo: {})", prNumber, fullName);
+        try {
+            GitHubBotService.PullRequestDetails prDetails = gitHubBotService.getPullRequestDetails(fullName, prNumber, installationId);
+            runScanPipeline(fullName, prNumber, prDetails.cloneUrl(), prDetails.branch(), prDetails.headSha(), installationId);
+        } catch (Exception e) {
+            log.error("[Pipeline] Re-run 재스캔 준비 실패 (PR #{}, Repo: {}): {}", prNumber, fullName, e.getMessage(), e);
             sendFailureFeedbackComment(fullName, prNumber, installationId, e);
         }
     }
@@ -161,8 +182,12 @@ public class SecurityScanPipeline {
             log.info("[Pipeline] Step 4: GitHub PR #{} 에 통합 분석 리포트 코멘트 등록", prNumber);
             gitHubBotService.postComment(fullName, prNumber, installationId, aiAnalysisReport.trim());
 
-            // 7. GitHub Checks API 및 PR Labels 상태 동기화 (Merge 차단 통제)
-            applySecurityVerdictToGitHub(fullName, prNumber, checkRunId, installationId, verdict);
+            // 7. 코드 라인별 보안 결함 인라인 리뷰 코멘트 및 Checks 어노테이션 수집
+            List<GitHubBotService.CheckRunAnnotation> annotations = processSecurityFindingsAndPostInlineComments(
+                    fullName, prNumber, headSha, installationId, prDiff, outcome.summaryPayload());
+
+            // 8. GitHub Checks API, PR Labels, Commit Status 상태 동기화 (Merge 차단 통제)
+            applySecurityVerdictToGitHub(fullName, prNumber, checkRunId, headSha, installationId, verdict, annotations);
 
             log.info("[Pipeline] 비동기 보안 분석 및 통제 파이프라인 완료 (PR #{}, Repo: {}, Verdict: {})", prNumber, fullName, verdict);
 
@@ -199,36 +224,200 @@ public class SecurityScanPipeline {
     }
 
     /**
-     * 최종 판정(BLOCK / WARN / PASS)에 따라 GitHub Checks API 결과 업데이트 및 security-risk 라벨 관리
+     * 최종 판정(BLOCK / WARN / PASS)에 따라 GitHub Checks API 결과 업데이트 및 security-risk 라벨, Commit Status 관리
      */
     private void applySecurityVerdictToGitHub(String fullName, Integer prNumber, Long checkRunId,
-                                             Long installationId, LLMAnalysisService.SecurityVerdict verdict) {
+                                              String headSha, Long installationId,
+                                              LLMAnalysisService.SecurityVerdict verdict,
+                                              List<GitHubBotService.CheckRunAnnotation> annotations) {
+        String statusState;
+        String statusDesc;
         switch (verdict) {
             case BLOCK -> {
-                // Merge 차단(failure) 및 security-risk 라벨 부착
+                statusState = "failure";
+                statusDesc = "차단 권고 (BLOCK): 심각한 보안 위험 검출";
                 gitHubBotService.updateCheckRun(fullName, checkRunId, installationId,
                         "failure",
-                        "차단 권고 (BLOCK): 심각한 보안 위험 검출",
-                        "고위험 취약점 또는 코드 내 보안 결함이 검출되어 병합(Merge)이 차단되었습니다. PR 코멘트의 즉시 조치 가이드를 확인해 주세요.");
+                        statusDesc,
+                        "고위험 취약점 또는 코드 내 보안 결함이 검출되어 병합(Merge)이 차단되었습니다. PR 코멘트 및 코드 라인별 안내를 확인해 주세요.",
+                        annotations);
                 gitHubBotService.addLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "REQUEST_CHANGES",
+                        "### 🛡️ PR Guard 차단 권고 (BLOCK)\n심각한 보안 취약점(CRITICAL/HIGH) 또는 시크릿 노출이 검출되었습니다. 머지 전 조치가 필요합니다.");
             }
             case WARN -> {
-                // 경고(neutral) 및 security-risk 라벨 제거
+                statusState = "success";
+                statusDesc = "주의 권고 (WARN): 보안 주의 사항 검출";
                 gitHubBotService.updateCheckRun(fullName, checkRunId, installationId,
                         "neutral",
-                        "주의 권고 (WARN): 보안 주의 사항 검출",
-                        "경미한 취약점 또는 설정 주의 사항이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.");
+                        statusDesc,
+                        "경미한 취약점 또는 설정 주의 사항이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.",
+                        annotations);
                 gitHubBotService.removeLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "COMMENT",
+                        "### 🛡️ PR Guard 주의 (WARN)\n주의가 필요한 보안 결함이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.");
             }
             case PASS -> {
-                // 통과(success) 및 security-risk 라벨 제거
+                statusState = "success";
+                statusDesc = "승인 (PASS): 보안 위협 미검출";
                 gitHubBotService.updateCheckRun(fullName, checkRunId, installationId,
                         "success",
-                        "승인 (PASS): 보안 위협 미검출",
-                        "오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.");
+                        statusDesc,
+                        "오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.",
+                        annotations);
                 gitHubBotService.removeLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "APPROVE",
+                        "### 🛡️ PR Guard 승인 (PASS)\n오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다. 안전하게 병합할 수 있습니다.");
+            }
+            default -> {
+                statusState = "success";
+                statusDesc = "보안 검증 완료";
             }
         }
+
+        // 엔터프라이즈 브랜치 보호 규칙 호환을 위한 GitHub Commit Status 동기화
+        if (headSha != null && !headSha.isBlank()) {
+            gitHubBotService.createCommitStatus(fullName, headSha, installationId, statusState, statusDesc, null);
+        }
+    }
+
+    /**
+     * 보안 결함(시크릿 노출, 설정 오류)을 분석하여 Check Run Annotation 생성 및
+     * PR Diff에 포함된 문제 라인에 1-Click 인라인 리뷰 코멘트를 등록합니다.
+     */
+    private List<GitHubBotService.CheckRunAnnotation> processSecurityFindingsAndPostInlineComments(
+            String repoFullName, Integer prNumber, String headSha, Long installationId,
+            String prDiff, LLMAnalysisService.ScanSummaryPayload summaryPayload) {
+        List<GitHubBotService.CheckRunAnnotation> annotations = new ArrayList<>();
+        if (summaryPayload == null) return annotations;
+
+        Map<String, Set<Integer>> diffHunkLines = parseDiffHunkLines(prDiff);
+        int inlineCommentsPosted = 0;
+        final int MAX_INLINE_COMMENTS = 5;
+
+        // 1. 하드코딩된 시크릿 결함 처리
+        if (summaryPayload.secrets() != null) {
+            for (LLMAnalysisService.SecretDetail secret : summaryPayload.secrets()) {
+                if (secret.targetFile() == null || secret.targetFile().isBlank()) continue;
+                int line = Math.max(1, secret.startLine());
+                String cleanPath = normalizeFilePath(secret.targetFile());
+                String title = "Hardcoded Secret: " + secret.title();
+                String message = "코드 내에 민감한 시크릿/인증 토큰이 직접 노출되어 있습니다 (규칙: " + secret.ruleId() + "). 환경 변수나 Secret Manager를 사용하세요.";
+
+                annotations.add(new GitHubBotService.CheckRunAnnotation(cleanPath, line, "failure", title, message));
+
+                if (inlineCommentsPosted < MAX_INLINE_COMMENTS && isLineInDiff(diffHunkLines, cleanPath, line)) {
+                    String commentBody = """
+                            ⚠️ **[PR Guard 보안 경고]** 하드코딩된 시크릿/토큰 감지 (`%s`)
+                            > **위험도:** `CRITICAL` (규칙 ID: `%s`)
+                            > 
+                            > 코드 내에 인증 정보나 암호키가 직접 노출되었습니다. GitHub 저장소에 커밋되면 즉시 유출 사고로 이어질 수 있습니다.
+                            > `System.getenv()`, `process.env` 등 환경 변수 또는 Secret Manager를 통해 주입받도록 수정해 주세요.
+                            """.formatted(secret.title(), secret.ruleId());
+
+                    if (gitHubBotService.postInlineReviewComment(repoFullName, prNumber, headSha, installationId, cleanPath, line, commentBody)) {
+                        inlineCommentsPosted++;
+                    }
+                }
+            }
+        }
+
+        // 2. 보안 설정 오류(Misconfiguration) 결함 처리
+        if (summaryPayload.misconfigurations() != null) {
+            for (LLMAnalysisService.MisconfigDetail misconfig : summaryPayload.misconfigurations()) {
+                if (misconfig.targetFile() == null || misconfig.targetFile().isBlank()) continue;
+                int line = Math.max(1, misconfig.startLine());
+                String cleanPath = normalizeFilePath(misconfig.targetFile());
+                boolean isHigh = "CRITICAL".equalsIgnoreCase(misconfig.severity()) || "HIGH".equalsIgnoreCase(misconfig.severity());
+                String annotationLevel = isHigh ? "failure" : "warning";
+                String title = "Misconfiguration: " + misconfig.title();
+                String message = misconfig.message() + (misconfig.resolution().isBlank() ? "" : "\n조치 방안: " + misconfig.resolution());
+
+                annotations.add(new GitHubBotService.CheckRunAnnotation(cleanPath, line, annotationLevel, title, message));
+
+                if (inlineCommentsPosted < MAX_INLINE_COMMENTS && isLineInDiff(diffHunkLines, cleanPath, line)) {
+                    String resolutionGuide = misconfig.resolution().isBlank() ? "안전한 기본 설정으로 변경하세요." : misconfig.resolution();
+                    String commentBody = """
+                            ⚠️ **[PR Guard 보안 경고]** 보안 설정 결함 감지 (`%s`)
+                            > **위험도:** `%s` (ID: `%s`)
+                            > **설명:** %s
+                            > **권장 조치:** %s
+                            """.formatted(misconfig.title(), misconfig.severity(), misconfig.id(), misconfig.message(), resolutionGuide);
+
+                    if (gitHubBotService.postInlineReviewComment(repoFullName, prNumber, headSha, installationId, cleanPath, line, commentBody)) {
+                        inlineCommentsPosted++;
+                    }
+                }
+            }
+        }
+
+        log.info("[Pipeline] 코드 결함 분석 완료 (생성된 Annotation: {}개, 등록된 인라인 코멘트: {}개)",
+                annotations.size(), inlineCommentsPosted);
+        return annotations;
+    }
+
+    private String normalizeFilePath(String path) {
+        if (path == null) return "";
+        String p = path.replace('\\', '/').trim();
+        if (p.startsWith("./")) p = p.substring(2);
+        if (p.startsWith("/")) p = p.substring(1);
+        return p;
+    }
+
+    private boolean isLineInDiff(Map<String, Set<Integer>> diffHunkLines, String filePath, int line) {
+        if (diffHunkLines == null || filePath == null || diffHunkLines.isEmpty()) {
+            return false;
+        }
+        String cleanPath = normalizeFilePath(filePath);
+
+        for (Map.Entry<String, Set<Integer>> entry : diffHunkLines.entrySet()) {
+            String diffFile = normalizeFilePath(entry.getKey());
+            if (diffFile.equals(cleanPath) || diffFile.endsWith("/" + cleanPath) || cleanPath.endsWith("/" + diffFile)) {
+                return entry.getValue().contains(line);
+            }
+        }
+        return false;
+    }
+
+    private Map<String, Set<Integer>> parseDiffHunkLines(String diff) {
+        Map<String, Set<Integer>> result = new HashMap<>();
+        if (diff == null || diff.isBlank()) return result;
+
+        String currentFile = null;
+        int currentLine = 0;
+
+        for (String line : diff.lines().toList()) {
+            if (line.startsWith("diff --git ")) {
+                int bIdx = line.indexOf(" b/");
+                if (bIdx != -1) {
+                    currentFile = normalizeFilePath(line.substring(bIdx + 3).trim());
+                    result.putIfAbsent(currentFile, new HashSet<>());
+                } else {
+                    currentFile = null;
+                }
+            } else if (line.startsWith("@@ ") && currentFile != null) {
+                int plusIdx = line.indexOf('+');
+                if (plusIdx != -1) {
+                    int commaIdx = line.indexOf(',', plusIdx);
+                    int spaceIdx = line.indexOf(' ', plusIdx);
+                    int endIdx = (commaIdx != -1 && commaIdx < spaceIdx) ? commaIdx : spaceIdx;
+                    if (endIdx != -1) {
+                        try {
+                            currentLine = Integer.parseInt(line.substring(plusIdx + 1, endIdx).trim());
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+            } else if (currentFile != null && currentLine > 0) {
+                if (line.startsWith("+")) {
+                    result.get(currentFile).add(currentLine);
+                    currentLine++;
+                } else if (line.startsWith(" ")) {
+                    result.get(currentFile).add(currentLine);
+                    currentLine++;
+                }
+            }
+        }
+        return result;
     }
 
     private void sendFailureFeedbackComment(String fullName, Integer prNumber, Long installationId, Exception e) {

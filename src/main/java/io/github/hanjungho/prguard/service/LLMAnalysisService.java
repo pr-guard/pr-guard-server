@@ -121,7 +121,12 @@ public class LLMAnalysisService {
             String severity,
             String title,
             String message,
-            String resolution) {
+            String resolution,
+            int startLine,
+            String targetFile) {
+        public MisconfigDetail(String id, String type, String severity, String title, String message, String resolution) {
+            this(id, type, severity, title, message, resolution, 1, "");
+        }
     }
 
     /**
@@ -132,7 +137,11 @@ public class LLMAnalysisService {
             String category,
             String severity,
             String title,
-            int startLine) {
+            int startLine,
+            String targetFile) {
+        public SecretDetail(String ruleId, String category, String severity, String title, int startLine) {
+            this(ruleId, category, severity, title, startLine, "");
+        }
     }
 
     /**
@@ -508,6 +517,8 @@ public class LLMAnalysisService {
 
             if (results.isArray()) {
                 for (JsonNode resultNode : results) {
+                    String targetFile = resultNode.path("Target").asText("");
+
                     // 1. SBOM Packages 수집 (다중 Results 완전 순회)
                     collectPackagesFromResultNode(resultNode, seenPackageKeys, sbomPackages, packageCounts);
 
@@ -552,11 +563,12 @@ public class LLMAnalysisService {
                             String title = misNode.path("Title").asText("");
                             String message = misNode.path("Message").asText("");
                             String resolution = misNode.path("Resolution").asText("");
+                            int startLine = misNode.path("CauseMetadata").path("StartLine").asInt(1);
 
-                            String key = id + ":" + title;
+                            String key = id + ":" + title + ":" + targetFile;
                             if (!misconfigMap.containsKey(key)) {
                                 misconfigMap.put(key,
-                                        new MisconfigDetail(id, type, severity, title, message, resolution));
+                                        new MisconfigDetail(id, type, severity, title, message, resolution, startLine, targetFile));
                             }
                         }
                     }
@@ -569,11 +581,11 @@ public class LLMAnalysisService {
                             String category = secNode.path("Category").asText("");
                             String severity = secNode.path("Severity").asText("UNKNOWN").toUpperCase();
                             String title = secNode.path("Title").asText("");
-                            int startLine = secNode.path("StartLine").asInt(0);
+                            int startLine = secNode.path("StartLine").asInt(1);
 
-                            String key = ruleId + ":" + title + ":" + startLine;
+                            String key = ruleId + ":" + title + ":" + targetFile + ":" + startLine;
                             if (!secretMap.containsKey(key)) {
-                                secretMap.put(key, new SecretDetail(ruleId, category, severity, title, startLine));
+                                secretMap.put(key, new SecretDetail(ruleId, category, severity, title, startLine, targetFile));
                             }
                         }
                     }

@@ -26,6 +26,45 @@ public class GithubWebhookPayload {
     @JsonProperty("comment")
     private Comment comment;
 
+    @JsonProperty("check_run")
+    private CheckRun checkRun;
+
+    @JsonProperty("check_suite")
+    private CheckSuite checkSuite;
+
+    @Getter
+    @NoArgsConstructor
+    @ToString
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class CheckRun {
+        private Long id;
+        @JsonProperty("head_sha")
+        private String headSha;
+        @JsonProperty("pull_requests")
+        private java.util.List<CheckRunPullRequest> pullRequests;
+    }
+
+    @Getter
+    @NoArgsConstructor
+    @ToString
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class CheckSuite {
+        private Long id;
+        @JsonProperty("head_sha")
+        private String headSha;
+        @JsonProperty("pull_requests")
+        private java.util.List<CheckRunPullRequest> pullRequests;
+    }
+
+    @Getter
+    @NoArgsConstructor
+    @ToString
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class CheckRunPullRequest {
+        private Integer number;
+        private String url;
+    }
+
     @Getter
     @NoArgsConstructor
     @ToString
