@@ -527,12 +527,15 @@ public class LLMAnalysisService {
         StringBuilder sb = new StringBuilder();
         sb.append("<details>\n");
         sb.append("<summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 ").append(totalCount).append("개)</b></summary>\n\n");
+        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개<br>\n");
         if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment) && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
-            sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("\n");
+            sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("<br>\n");
         }
-        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개\n");
-        sb.append("> **의존성 구분 기준:** 직접 의존성(Direct)은 개발자가 매니페스트에 직접 선언한 라이브러리이며, 간접 의존성(Transitive)은 런타임 종속 패키지(취약점의 80% 이상 발생)입니다.\n");
-        sb.append("> **표준 규격:** OWASP CycloneDX v1.5 JSON 및 Package URL (purl) 지원\n\n");
+        sb.append("> **표준 규격:** OWASP CycloneDX v1.5 JSON (Package URL `purl` 매핑)<br>\n");
+        sb.append(">\n");
+        sb.append("> 💡 **의존성 구분 안내**<br>\n");
+        sb.append("> • **직접 의존성 (Direct):** 개발자가 매니페스트에 직접 선언한 상위 라이브러리<br>\n");
+        sb.append("> • **간접 의존성 (Transitive):** 런타임 종속 전이 패키지 (*공급망 취약점의 80% 이상 발생*)<br>\n\n");
 
         // 1. 직접 의존성 표 (Direct Dependencies)
         sb.append("#### 직접 의존성 (Direct Dependencies - ").append(directCount).append("개)\n\n");
