@@ -29,13 +29,16 @@ import java.util.stream.Stream;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class TrivyScannerService {
 
     private final UniversalDependencyScanner universalDependencyScanner;
 
+    public TrivyScannerService(UniversalDependencyScanner universalDependencyScanner) {
+        this.universalDependencyScanner = universalDependencyScanner;
+    }
+
     public TrivyScannerService() {
-        this.universalDependencyScanner = new UniversalDependencyScanner(new ObjectMapper());
+        this(new UniversalDependencyScanner(new ObjectMapper()));
     }
 
     @org.springframework.beans.factory.annotation.Value("${trivy.process.timeout-minutes:5}")
@@ -164,54 +167,19 @@ public class TrivyScannerService {
     public String extractRuntimeContext(Path rootDir) {
         StringBuilder sb = new StringBuilder();
 
-        // 1. .nvmrc / .node-version
-        readAndAppendIfExists(rootDir, ".nvmrc", sb);
-        readAndAppendIfExists(rootDir, ".node-version", sb);
+        // 1. Node.js 버전 힌트 (.nvmrc / .node-version)
+        readAndAppendIfExists(rootDir, ".nvmrc", ".nvmrc", 1000, sb);
+        readAndAppendIfExists(rootDir, ".node-version", ".node-version", 1000, sb);
 
-        // 2. Dockerfile
-        readAndAppendIfExists(rootDir, "Dockerfile", sb);
-        readAndAppendIfExists(rootDir, "dockerfile", sb);
+        // 2. 컨테이너 환경 (Dockerfile)
+        readAndAppendIfExists(rootDir, "Dockerfile", "Dockerfile", 3000, sb);
+        readAndAppendIfExists(rootDir, "dockerfile", "dockerfile", 3000, sb);
 
-        // 3. package.json (engines, packageManager, dependencies 등 런타임/프레임워크 버전)
-        Path packageJson = rootDir.resolve("package.json");
-        if (Files.exists(packageJson) && Files.isRegularFile(packageJson)) {
-            try {
-                String content = Files.readString(packageJson, StandardCharsets.UTF_8);
-                sb.append("--- [package.json (런타임 및 프레임워크 버전)] ---\n");
-                if (content.length() <= 3000) {
-                    sb.append(content.trim()).append("\n\n");
-                } else {
-                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
-                }
-            } catch (Exception ignored) {}
-        }
-
-        // 4. build.gradle / pom.xml
-        Path buildGradle = rootDir.resolve("build.gradle");
-        if (Files.exists(buildGradle) && Files.isRegularFile(buildGradle)) {
-            try {
-                String content = Files.readString(buildGradle, StandardCharsets.UTF_8);
-                sb.append("--- [build.gradle (Java/Spring Boot 버전)] ---\n");
-                if (content.length() <= 3000) {
-                    sb.append(content.trim()).append("\n\n");
-                } else {
-                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
-                }
-            } catch (Exception ignored) {}
-        }
-
-        Path pomXml = rootDir.resolve("pom.xml");
-        if (Files.exists(pomXml) && Files.isRegularFile(pomXml)) {
-            try {
-                String content = Files.readString(pomXml, StandardCharsets.UTF_8);
-                sb.append("--- [pom.xml (Java/Spring Boot 버전)] ---\n");
-                if (content.length() <= 3000) {
-                    sb.append(content.trim()).append("\n\n");
-                } else {
-                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
-                }
-            } catch (Exception ignored) {}
-        }
+        // 3. 언어 및 프레임워크 빌드 명세서
+        readAndAppendIfExists(rootDir, "package.json", "package.json (런타임 및 프레임워크 버전)", 3000, sb);
+        readAndAppendIfExists(rootDir, "build.gradle", "build.gradle (Java/Spring Boot 버전)", 3000, sb);
+        readAndAppendIfExists(rootDir, "build.gradle.kts", "build.gradle.kts (Kotlin/Spring Boot 버전)", 3000, sb);
+        readAndAppendIfExists(rootDir, "pom.xml", "pom.xml (Java/Spring Boot 버전)", 3000, sb);
 
         if (sb.isEmpty()) {
             return "(탐지된 런타임/빌드 환경 설정 파일 없음)";
@@ -219,16 +187,16 @@ public class TrivyScannerService {
         return sb.toString().trim();
     }
 
-    private void readAndAppendIfExists(Path rootDir, String fileName, StringBuilder sb) {
+    private void readAndAppendIfExists(Path rootDir, String fileName, String label, int maxChars, StringBuilder sb) {
         Path filePath = rootDir.resolve(fileName);
         if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
             try {
-                String content = Files.readString(filePath, StandardCharsets.UTF_8);
-                sb.append("--- [").append(fileName).append("] ---\n");
-                if (content.length() <= 2000) {
-                    sb.append(content.trim()).append("\n\n");
+                String content = Files.readString(filePath, StandardCharsets.UTF_8).trim();
+                sb.append("--- [").append(label).append("] ---\n");
+                if (content.length() <= maxChars) {
+                    sb.append(content).append("\n\n");
                 } else {
-                    sb.append(content.substring(0, 2000)).append("\n... (생략)\n\n");
+                    sb.append(content.substring(0, maxChars)).append("\n... (일부 생략)\n\n");
                 }
             } catch (Exception ignored) {}
         }

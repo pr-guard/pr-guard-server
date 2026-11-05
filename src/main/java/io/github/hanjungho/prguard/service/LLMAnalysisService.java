@@ -510,7 +510,7 @@ public class LLMAnalysisService {
         int[] packageCounts = new int[2]; // [0]: direct, [1]: transitive
 
         Map<String, VulnerabilityDetail> vulnMap = new LinkedHashMap<>();
-        int criticalCount = 0, highCount = 0, mediumCount = 0, lowCount = 0;
+        int[] severityCounts = new int[4]; // [0]: critical, [1]: high, [2]: medium, [3]: low
 
         Map<String, MisconfigDetail> misconfigMap = new LinkedHashMap<>();
         Map<String, SecretDetail> secretMap = new LinkedHashMap<>();
@@ -523,93 +523,23 @@ public class LLMAnalysisService {
                 for (JsonNode resultNode : results) {
                     String targetFile = resultNode.path("Target").asText("");
 
-                    // 1. SBOM Packages 수집 (다중 Results 완전 순회)
+                    // 1. SBOM Packages 수집
                     collectPackagesFromResultNode(resultNode, seenPackageKeys, sbomPackages, packageCounts);
 
                     // 2. Vulnerabilities 수집 (커스텀 룰 필터링 적용)
-                    JsonNode vulnerabilities = resultNode.path("Vulnerabilities");
-                    if (vulnerabilities.isArray()) {
-                        for (JsonNode vulnNode : vulnerabilities) {
-                            String vulnId = vulnNode.path("VulnerabilityID").asText("");
-                            String pkgName = vulnNode.path("PkgName").asText("");
-                            String severity = vulnNode.path("Severity").asText("UNKNOWN").toUpperCase();
-                            String installedVer = vulnNode.path("InstalledVersion").asText("");
-                            String fixedVer = vulnNode.path("FixedVersion").asText("");
-                            String title = vulnNode.path("Title").asText("");
-
-                            // 커스텀 예외 정책(.prguard.yml)에 해당하는 취약점은 제외
-                            if (config != null && config.isVulnerabilityIgnored(vulnId, pkgName, severity)) {
-                                continue;
-                            }
-
-                            String key = vulnId + ":" + pkgName;
-                            if (!vulnMap.containsKey(key)) {
-                                vulnMap.put(key, new VulnerabilityDetail(vulnId, pkgName, installedVer, fixedVer,
-                                        severity, title));
-
-                                switch (severity) {
-                                    case "CRITICAL" -> criticalCount++;
-                                    case "HIGH" -> highCount++;
-                                    case "MEDIUM" -> mediumCount++;
-                                    case "LOW" -> lowCount++;
-                                }
-                            }
-                        }
-                    }
+                    collectVulnerabilitiesFromResultNode(resultNode.path("Vulnerabilities"), config, vulnMap, severityCounts);
 
                     // 3. Misconfigurations 수집
-                    JsonNode misconfigs = resultNode.path("Misconfigurations");
-                    if (misconfigs.isArray()) {
-                        for (JsonNode misNode : misconfigs) {
-                            String id = misNode.path("ID").asText("");
-                            String type = misNode.path("Type").asText("");
-                            String severity = misNode.path("Severity").asText("UNKNOWN").toUpperCase();
-                            String title = misNode.path("Title").asText("");
-                            String message = misNode.path("Message").asText("");
-                            String resolution = misNode.path("Resolution").asText("");
-                            int startLine = misNode.path("CauseMetadata").path("StartLine").asInt(1);
+                    collectMisconfigurationsFromResultNode(resultNode.path("Misconfigurations"), targetFile, misconfigMap);
 
-                            String key = id + ":" + title + ":" + targetFile;
-                            if (!misconfigMap.containsKey(key)) {
-                                misconfigMap.put(key,
-                                        new MisconfigDetail(id, type, severity, title, message, resolution, startLine, targetFile));
-                            }
-                        }
-                    }
-
-                    // 4. Secrets 수집 (실제 노출된 비밀값 Match는 마스킹 처리하여 제외)
-                    JsonNode secrets = resultNode.path("Secrets");
-                    if (secrets.isArray()) {
-                        for (JsonNode secNode : secrets) {
-                            String ruleId = secNode.path("RuleID").asText("");
-                            String category = secNode.path("Category").asText("");
-                            String severity = secNode.path("Severity").asText("UNKNOWN").toUpperCase();
-                            String title = secNode.path("Title").asText("");
-                            int startLine = secNode.path("StartLine").asInt(1);
-
-                            String key = ruleId + ":" + title + ":" + targetFile + ":" + startLine;
-                            if (!secretMap.containsKey(key)) {
-                                secretMap.put(key, new SecretDetail(ruleId, category, severity, title, startLine, targetFile));
-                            }
-                        }
-                    }
+                    // 4. Secrets 수집
+                    collectSecretsFromResultNode(resultNode.path("Secrets"), targetFile, secretMap);
                 }
             }
 
-            // 5. 트리 전체 재검색 방어 로직: 만약 Results 순회 후에도 sbomPackages가 비어 있다면 JSON 전체에서 Packages
-            // 탐색
+            // 5. 트리 전체 재검색 방어 로직: Results 순회 후에도 sbomPackages가 비어 있다면 JSON 전체에서 탐색
             if (sbomPackages.isEmpty()) {
-                List<JsonNode> allPackageArrays = root.findValues("Packages");
-                if (allPackageArrays.isEmpty()) {
-                    allPackageArrays = root.findValues("packages");
-                }
-                for (JsonNode pkgArray : allPackageArrays) {
-                    if (pkgArray.isArray()) {
-                        for (JsonNode pkgNode : pkgArray) {
-                            parseAndAddPackage(pkgNode, seenPackageKeys, sbomPackages, packageCounts);
-                        }
-                    }
-                }
+                collectFallbackPackages(root, seenPackageKeys, sbomPackages, packageCounts);
             }
 
         } catch (Exception e) {
@@ -630,7 +560,7 @@ public class LLMAnalysisService {
         List<SecretDetail> topSecrets = secretMap.values().stream().limit(20).toList();
 
         SbomStats sbomStats = new SbomStats(sbomPackages.size(), packageCounts[0], packageCounts[1]);
-        VulnStats vulnStats = new VulnStats(vulnMap.size(), criticalCount, highCount, mediumCount, lowCount);
+        VulnStats vulnStats = new VulnStats(vulnMap.size(), severityCounts[0], severityCounts[1], severityCounts[2], severityCounts[3]);
 
         return new ScanSummaryPayload(
                 sbomStats,
@@ -642,6 +572,88 @@ public class LLMAnalysisService {
                 misconfigMap.size(),
                 topSecrets,
                 secretMap.size());
+    }
+
+    private void collectVulnerabilitiesFromResultNode(JsonNode vulnerabilities, PrguardConfig config,
+                                                     Map<String, VulnerabilityDetail> vulnMap, int[] severityCounts) {
+        if (!vulnerabilities.isArray()) return;
+
+        for (JsonNode vulnNode : vulnerabilities) {
+            String vulnId = vulnNode.path("VulnerabilityID").asText("");
+            String pkgName = vulnNode.path("PkgName").asText("");
+            String severity = vulnNode.path("Severity").asText("UNKNOWN").toUpperCase();
+            String installedVer = vulnNode.path("InstalledVersion").asText("");
+            String fixedVer = vulnNode.path("FixedVersion").asText("");
+            String title = vulnNode.path("Title").asText("");
+
+            if (config != null && config.isVulnerabilityIgnored(vulnId, pkgName, severity)) {
+                continue;
+            }
+
+            String key = vulnId + ":" + pkgName;
+            if (!vulnMap.containsKey(key)) {
+                vulnMap.put(key, new VulnerabilityDetail(vulnId, pkgName, installedVer, fixedVer, severity, title));
+
+                switch (severity) {
+                    case "CRITICAL" -> severityCounts[0]++;
+                    case "HIGH" -> severityCounts[1]++;
+                    case "MEDIUM" -> severityCounts[2]++;
+                    case "LOW" -> severityCounts[3]++;
+                }
+            }
+        }
+    }
+
+    private void collectMisconfigurationsFromResultNode(JsonNode misconfigs, String targetFile,
+                                                         Map<String, MisconfigDetail> misconfigMap) {
+        if (!misconfigs.isArray()) return;
+
+        for (JsonNode misNode : misconfigs) {
+            String id = misNode.path("ID").asText("");
+            String type = misNode.path("Type").asText("");
+            String severity = misNode.path("Severity").asText("UNKNOWN").toUpperCase();
+            String title = misNode.path("Title").asText("");
+            String message = misNode.path("Message").asText("");
+            String resolution = misNode.path("Resolution").asText("");
+            int startLine = misNode.path("CauseMetadata").path("StartLine").asInt(1);
+
+            String key = id + ":" + title + ":" + targetFile;
+            if (!misconfigMap.containsKey(key)) {
+                misconfigMap.put(key, new MisconfigDetail(id, type, severity, title, message, resolution, startLine, targetFile));
+            }
+        }
+    }
+
+    private void collectSecretsFromResultNode(JsonNode secrets, String targetFile, Map<String, SecretDetail> secretMap) {
+        if (!secrets.isArray()) return;
+
+        for (JsonNode secNode : secrets) {
+            String ruleId = secNode.path("RuleID").asText("");
+            String category = secNode.path("Category").asText("");
+            String severity = secNode.path("Severity").asText("UNKNOWN").toUpperCase();
+            String title = secNode.path("Title").asText("");
+            int startLine = secNode.path("StartLine").asInt(1);
+
+            String key = ruleId + ":" + title + ":" + targetFile + ":" + startLine;
+            if (!secretMap.containsKey(key)) {
+                secretMap.put(key, new SecretDetail(ruleId, category, severity, title, startLine, targetFile));
+            }
+        }
+    }
+
+    private void collectFallbackPackages(JsonNode root, Set<String> seenPackageKeys,
+                                         List<SbomPackageDetail> sbomPackages, int[] packageCounts) {
+        List<JsonNode> allPackageArrays = root.findValues("Packages");
+        if (allPackageArrays.isEmpty()) {
+            allPackageArrays = root.findValues("packages");
+        }
+        for (JsonNode pkgArray : allPackageArrays) {
+            if (pkgArray.isArray()) {
+                for (JsonNode pkgNode : pkgArray) {
+                    parseAndAddPackage(pkgNode, seenPackageKeys, sbomPackages, packageCounts);
+                }
+            }
+        }
     }
 
     private void collectPackagesFromResultNode(JsonNode resultNode, Set<String> seenKeys, List<SbomPackageDetail> list,

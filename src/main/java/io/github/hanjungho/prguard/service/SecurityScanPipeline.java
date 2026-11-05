@@ -121,114 +121,136 @@ public class SecurityScanPipeline {
         }
     }
 
+    private record PipelineTarget(
+            String fullName,
+            Integer prNumber,
+            String cloneUrl,
+            String branch,
+            String headSha,
+            Long installationId
+    ) {
+        String prKey() {
+            return fullName + "#" + prNumber;
+        }
+
+        String commitKey() {
+            return (headSha != null && !headSha.isBlank()) ? prKey() + "@" + headSha : null;
+        }
+    }
+
     /**
      * 전체 보안 분석, AI 평가, GitHub Checks 및 레이블 관리 파이프라인
      */
     private void runScanPipeline(String fullName, Integer prNumber, String cloneUrl, String branch, String headSha, Long installationId) {
-        Long checkRunId = null;
+        PipelineTarget target = resolvePipelineTarget(fullName, prNumber, cloneUrl, branch, headSha, installationId);
 
-        // 0. 최신 commit sha가 없으면 PR 상세 조회로 보완
-        if (headSha == null || headSha.isBlank()) {
+        if (isDuplicateOrActive(target)) {
+            return;
+        }
+
+        Long checkRunId = null;
+        try {
+            checkRunId = gitHubBotService.createCheckRun(target.fullName(), target.headSha(), target.installationId());
+            executePipelineStages(target, checkRunId);
+        } catch (Exception e) {
+            handlePipelineFailure(target, checkRunId, e);
+        } finally {
+            finishPipeline(target);
+        }
+    }
+
+    private PipelineTarget resolvePipelineTarget(String fullName, Integer prNumber, String cloneUrl, String branch, String headSha, Long installationId) {
+        String resolvedSha = headSha;
+        String resolvedCloneUrl = cloneUrl;
+        String resolvedBranch = branch;
+
+        if (resolvedSha == null || resolvedSha.isBlank()) {
             try {
                 GitHubBotService.PullRequestDetails details = gitHubBotService.getPullRequestDetails(fullName, prNumber, installationId);
-                headSha = details.headSha();
-                if (cloneUrl == null) cloneUrl = details.cloneUrl();
-                if (branch == null) branch = details.branch();
+                resolvedSha = details.headSha();
+                if (resolvedCloneUrl == null) resolvedCloneUrl = details.cloneUrl();
+                if (resolvedBranch == null) resolvedBranch = details.branch();
             } catch (Exception ignored) {}
         }
 
-        String prKey = fullName + "#" + prNumber;
-        String commitKey = (headSha != null) ? prKey + "@" + headSha : null;
+        return new PipelineTarget(fullName, prNumber, resolvedCloneUrl, resolvedBranch, resolvedSha, installationId);
+    }
 
-        // 1. 최근 설정 시간 내 동일 커밋 스캔 완료 여부 검사 (중복 웹훅 차단)
+    private boolean isDuplicateOrActive(PipelineTarget target) {
+        String commitKey = target.commitKey();
         if (commitKey != null) {
             Long lastCompletedTime = recentCompletedScans.get(commitKey);
             if (lastCompletedTime != null && (System.currentTimeMillis() - lastCompletedTime) < getDedupWindowMs()) {
                 log.info("[Pipeline] ⏭️ 동일 커밋(SHA: {})에 대한 스캔이 최근 이미 완료되었습니다. 중복 스캔 생략 (Repo: {}, PR #{})",
-                        headSha, fullName, prNumber);
-                return;
+                        target.headSha(), target.fullName(), target.prNumber());
+                return true;
             }
         }
 
-        // 2. 동일 PR에 대한 진행 중인 스캔 중복 제어 (연속 푸시 방어)
-        String runningSha = activeScans.putIfAbsent(prKey, headSha != null ? headSha : "UNKNOWN");
+        String runningSha = activeScans.putIfAbsent(target.prKey(), target.headSha() != null ? target.headSha() : "UNKNOWN");
         if (runningSha != null) {
             log.warn("[Pipeline] ⚠️ PR #{} 에 대한 스캔이 이미 진행 중입니다 (진행 중 SHA: {}, 신규 요청 SHA: {}). 중복 파이프라인 방지.",
-                    prNumber, runningSha, headSha);
-            return;
+                    target.prNumber(), runningSha, target.headSha());
+            return true;
         }
 
-        try {
-            // 1. GitHub Checks API를 호출하여 'PR Guard / Security Scan' 진행 중(in_progress) 등록
-            checkRunId = gitHubBotService.createCheckRun(fullName, headSha, installationId);
+        return false;
+    }
 
-            // 2. Private 저장소 복제 및 인증을 위한 Installation Access Token 획득 (캐시 적용)
-            String accessToken = gitHubBotService.getInstallationAccessToken(fullName, installationId);
+    private void executePipelineStages(PipelineTarget target, Long checkRunId) {
+        String accessToken = gitHubBotService.getInstallationAccessToken(target.fullName(), target.installationId());
 
-            // 3. PR 코드 Diff 수집을 비동기 병렬로 시작 (소스코드 Clone 및 Trivy 스캔과 동시 수행하여 지연 최소화)
-            log.info("[Pipeline] Step 1: PR #{} 코드 Diff 수집 및 Trivy 스캔 비동기 병렬 시작", prNumber);
-            java.util.concurrent.CompletableFuture<String> prDiffFuture = java.util.concurrent.CompletableFuture.supplyAsync(
-                    () -> gitHubBotService.getPullRequestDiff(fullName, prNumber, installationId)
-            );
+        log.info("[Pipeline] Step 1: PR #{} 코드 Diff 수집 및 Trivy 스캔 비동기 병렬 시작", target.prNumber());
+        java.util.concurrent.CompletableFuture<String> prDiffFuture = java.util.concurrent.CompletableFuture.supplyAsync(
+                () -> gitHubBotService.getPullRequestDiff(target.fullName(), target.prNumber(), target.installationId())
+        );
 
-            // 4. PR 대상 소스코드 Clone, .prguard.yml 커스텀 정책 로드, 런타임 환경 설정 수집 및 Trivy 스캔
-            log.info("[Pipeline] Step 2: Trivy 종합 보안 스캔 및 커스텀 정책 로드 실행");
-            TrivyScannerService.ScanResult scanResult = trivyScannerService.scanRepositoryWithContext(cloneUrl, branch, accessToken);
-            String scanResultJson = scanResult.scanJson();
-            String runtimeContext = scanResult.runtimeContext();
-            PrguardConfig prguardConfig = scanResult.config();
-            log.info("[Pipeline] Trivy 스캔 완료 (수집 데이터: {} KB, 런타임: {}자, 커스텀 정책: {})",
-                    scanResultJson.length() / 1024, runtimeContext.length(), prguardConfig.toSummaryString());
+        log.info("[Pipeline] Step 2: Trivy 종합 보안 스캔 및 커스텀 정책 로드 실행");
+        TrivyScannerService.ScanResult scanResult = trivyScannerService.scanRepositoryWithContext(
+                target.cloneUrl(), target.branch(), accessToken);
 
-            // 5. 비동기로 동시 수집 중이던 PR Diff 결과 회수
-            String prDiff = prDiffFuture.join();
+        String prDiff = prDiffFuture.join();
 
-            // 5. 커스텀 정책 기반 필터링 및 Gemini AI 종합 보안/런타임 영향도 분석 (캐시 & Short-Circuit 및 범용 매니페스트 통합)
-            log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개)",
-                    scanResult.manifestPackages() != null ? scanResult.manifestPackages().size() : 0);
-            LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
-                    scanResultJson, prDiff, runtimeContext, prguardConfig, scanResult.manifestPackages());
+        log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개)",
+                scanResult.manifestPackages() != null ? scanResult.manifestPackages().size() : 0);
+        LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
+                scanResult.scanJson(), prDiff, scanResult.runtimeContext(), scanResult.config(), scanResult.manifestPackages());
 
-            String aiAnalysisReport = outcome.reportMarkdown();
-            LLMAnalysisService.SecurityVerdict verdict = outcome.verdict();
-            log.info("[Pipeline] AI 보안 분석 완료 - 최종 판정: {}", verdict);
+        log.info("[Pipeline] Step 4: GitHub PR #{} 에 통합 분석 리포트 코멘트 등록", target.prNumber());
+        gitHubBotService.postComment(target.fullName(), target.prNumber(), target.installationId(), outcome.reportMarkdown().trim());
 
-            // 6. GitHub PR에 Bot 리포트 코멘트 등록
-            log.info("[Pipeline] Step 4: GitHub PR #{} 에 통합 분석 리포트 코멘트 등록", prNumber);
-            gitHubBotService.postComment(fullName, prNumber, installationId, aiAnalysisReport.trim());
+        List<GitHubBotService.CheckRunAnnotation> annotations = processSecurityFindingsAndPostInlineComments(
+                target.fullName(), target.prNumber(), target.headSha(), target.installationId(), prDiff, outcome.summaryPayload());
 
-            // 7. 코드 라인별 보안 결함 인라인 리뷰 코멘트 및 Checks 어노테이션 수집
-            List<GitHubBotService.CheckRunAnnotation> annotations = processSecurityFindingsAndPostInlineComments(
-                    fullName, prNumber, headSha, installationId, prDiff, outcome.summaryPayload());
+        applySecurityVerdictToGitHub(target.fullName(), target.prNumber(), checkRunId, target.headSha(),
+                target.installationId(), outcome.verdict(), annotations);
 
-            // 8. GitHub Checks API, PR Labels, Commit Status 상태 동기화 (Merge 차단 통제)
-            applySecurityVerdictToGitHub(fullName, prNumber, checkRunId, headSha, installationId, verdict, annotations);
+        log.info("[Pipeline] 비동기 보안 분석 및 통제 파이프라인 완료 (PR #{}, Repo: {}, Verdict: {})",
+                target.prNumber(), target.fullName(), outcome.verdict());
+    }
 
-            log.info("[Pipeline] 비동기 보안 분석 및 통제 파이프라인 완료 (PR #{}, Repo: {}, Verdict: {})", prNumber, fullName, verdict);
+    private void handlePipelineFailure(PipelineTarget target, Long checkRunId, Exception e) {
+        log.error("[Pipeline] 보안 분석 및 코멘트 파이프라인 수행 실패 (PR #{}, Repo: {}): {}",
+                target.prNumber(), target.fullName(), e.getMessage(), e);
 
-        } catch (Exception e) {
-            log.error("[Pipeline] 보안 분석 및 코멘트 파이프라인 수행 실패 (PR #{}, Repo: {}): {}",
-                    prNumber, fullName, e.getMessage(), e);
-
-            // Checks API 오류 마킹
-            if (checkRunId != null) {
-                gitHubBotService.updateCheckRun(fullName, checkRunId, installationId,
-                        "action_required",
-                        "스캔 실패: 일시적 오류 발생",
-                        "보안 분석 파이프라인 실행 중 오류가 발생했습니다: " + e.getMessage());
-            }
-
-            // 에러 발생 시 PR에 안내 코멘트 등록 (Silent Failure 방지 Fallback)
-            if (prNumber != null && !"N/A".equals(fullName)) {
-                sendFailureFeedbackComment(fullName, prNumber, installationId, e);
-            }
-        } finally {
-            activeScans.remove(prKey);
-            if (commitKey != null) {
-                recentCompletedScans.put(commitKey, System.currentTimeMillis());
-            }
-            cleanupExpiredCompletedScans();
+        if (checkRunId != null) {
+            gitHubBotService.updateCheckRun(target.fullName(), checkRunId, target.installationId(),
+                    "action_required",
+                    "스캔 실패: 일시적 오류 발생",
+                    "보안 분석 파이프라인 실행 중 오류가 발생했습니다: " + e.getMessage());
         }
+
+        if (target.prNumber() != null && !"N/A".equals(target.fullName())) {
+            sendFailureFeedbackComment(target.fullName(), target.prNumber(), target.installationId(), e);
+        }
+    }
+
+    private void finishPipeline(PipelineTarget target) {
+        activeScans.remove(target.prKey());
+        if (target.commitKey() != null) {
+            recentCompletedScans.put(target.commitKey(), System.currentTimeMillis());
+        }
+        cleanupExpiredCompletedScans();
     }
 
     private void cleanupExpiredCompletedScans() {
