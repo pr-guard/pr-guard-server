@@ -6,6 +6,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -145,12 +146,12 @@ class CycloneDxSbomServiceTest {
     }
 
     @Test
-    @DisplayName("저장소 내 설정 및 코드 파일에서 외부 SaaS 및 타사 서비스 엔드포인트를 자동 감지해야 한다")
+    @DisplayName("저장소 내 설정 파일(properties, yaml, env)에서 실제 외부 SaaS 엔드포인트를 동적 감지해야 한다")
     void shouldDetectExternalServicesFromRepositoryFiles(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws java.io.IOException {
         java.nio.file.Files.writeString(tempDir.resolve("application.properties"),
                 "gemini.api.url=https://generativelanguage.googleapis.com/v1beta/models\ngithub.api.url=https://api.github.com\n");
-        java.nio.file.Files.writeString(tempDir.resolve("PaymentService.java"),
-                "String endpoint = \"https://api.tosspayments.com/v1/payments\";\n");
+        java.nio.file.Files.writeString(tempDir.resolve("application-payment.yml"),
+                "toss:\n  payments:\n    url: https://api.tosspayments.com/v1/payments\n");
 
         List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(tempDir);
 
@@ -159,6 +160,38 @@ class CycloneDxSbomServiceTest {
         assertTrue(services.stream().anyMatch(s -> s.name().contains("Gemini") && s.endpoint().contains("googleapis.com")));
         assertTrue(services.stream().anyMatch(s -> s.name().contains("GitHub") && s.endpoint().contains("github.com")));
         assertTrue(services.stream().anyMatch(s -> s.name().contains("Toss") && s.endpoint().contains("tosspayments.com")));
+    }
+
+    @Test
+    @DisplayName("설정 파일에 명시되지 않은 서비스는 감지되지 않아야 하며, 소스코드 자체 리터럴로 인한 셀프 감지가 발생하지 않아야 한다")
+    void shouldNotDetectUnconfiguredServices(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws java.io.IOException {
+        java.nio.file.Files.writeString(tempDir.resolve("application.properties"),
+                "gemini.api.url=https://generativelanguage.googleapis.com/v1beta/models\ngithub.api.url=https://api.github.com\n");
+        // 소스코드 파일 안에 온갖 문자열이 적혀 있어도 설정 파일이 아니므로 감지되지 않아야 함
+        java.nio.file.Files.writeString(tempDir.resolve("MockService.java"),
+                "String a = \"https://api.openai.com\";\nString b = \"https://api.stripe.com\";\n");
+
+        List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(tempDir);
+
+        assertNotNull(services);
+        assertEquals(2, services.size(), "오직 설정 파일(application.properties)에 기술된 Gemini와 GitHub만 감지되어야 함");
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("OpenAI")));
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("Stripe")));
+    }
+
+    @Test
+    @DisplayName("PR Guard 프로젝트 자체를 스캔했을 때 application.properties에 설정된 Gemini와 GitHub API 2개만 감지되어야 한다")
+    void shouldDetectOnlyConfiguredServicesOnPrGuardProject() {
+        List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(Path.of("."));
+        assertNotNull(services);
+        assertEquals(2, services.size(), "prguard 프로젝트는 오직 Gemini AI와 GitHub API 2개만 사용하므로 2개만 감지되어야 함 (10개 셀프 오탐 방지)");
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Gemini")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("GitHub")));
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("Toss")));
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("Stripe")));
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("Kakao")));
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("OpenAI")));
+        assertFalse(services.stream().anyMatch(s -> s.name().contains("Slack")));
     }
 
     @Test

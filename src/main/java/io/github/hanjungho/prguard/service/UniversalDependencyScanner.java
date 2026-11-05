@@ -428,11 +428,12 @@ public class UniversalDependencyScanner {
             String name = m.group(2).trim();
             String version = m.group(3) != null ? m.group(3).trim() : null;
 
-            if ((version == null || version.isBlank() || "(managed)".equals(version))
-                    && group.startsWith("org.springframework.boot") && bootVersion != null) {
-                version = bootVersion;
+            if (group.startsWith("org.springframework.boot") && bootVersion != null) {
+                if (version == null || version.isBlank() || "(managed)".equals(version)) {
+                    version = bootVersion;
+                }
             } else if (version == null || version.isBlank()) {
-                version = (bootVersion != null) ? bootVersion : "BOM-managed";
+                version = "(managed)";
             }
 
             String fullName = group + ":" + name;
@@ -882,11 +883,18 @@ public class UniversalDependencyScanner {
         command.add("dependencies");
         command.add("--configuration");
         command.add("runtimeClasspath");
+        command.add("--no-daemon");
+        command.add("--console=plain");
+        command.add("-Dorg.gradle.daemon=false");
+        command.add("-Dorg.gradle.jvmargs=-Xmx256m -XX:MaxMetaspaceSize=128m");
 
         String output = runProcessWithTimeout(command, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper");
         if (output == null || !output.contains("---")) {
             List<String> fallbackCmd = new ArrayList<>(command);
-            fallbackCmd.set(fallbackCmd.size() - 1, "compileClasspath");
+            int idx = fallbackCmd.indexOf("runtimeClasspath");
+            if (idx >= 0) {
+                fallbackCmd.set(idx, "compileClasspath");
+            }
             output = runProcessWithTimeout(fallbackCmd, rootDir, 45, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
         }
 
@@ -1046,6 +1054,10 @@ public class UniversalDependencyScanner {
         pb.directory(rootDir.toFile());
         pb.redirectErrorStream(true);
         pb.environment().put("GRADLE_OPTS", "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false");
+        String userHome = System.getProperty("user.home");
+        if (userHome != null && !userHome.isBlank()) {
+            pb.environment().put("GRADLE_USER_HOME", userHome + "/.gradle");
+        }
 
         try {
             Process process = pb.start();

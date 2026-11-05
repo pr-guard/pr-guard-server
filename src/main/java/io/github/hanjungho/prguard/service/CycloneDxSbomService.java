@@ -24,6 +24,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * OWASP CycloneDX v1.5 표준 규격을 완벽히 준수하는 기계 판독형 SBOM(Software Bill of Materials) 엔진.
@@ -83,12 +85,14 @@ public class CycloneDxSbomService {
 
         String hint = (ecosystemHint != null) ? ecosystemHint.toLowerCase() : "";
 
-        // 1. Maven / Gradle (group:artifact 형태)
+        // 1. Maven / Gradle (group:artifact 형태 또는 gradle 플러그인)
         if (trimmedName.contains(":") && (hint.contains("maven") || hint.contains("gradle") || !hint.contains("npm"))) {
             String[] parts = trimmedName.split(":", 2);
             String group = parts[0].trim();
             String artifact = parts[1].trim();
             return String.format("pkg:maven/%s/%s@%s", group, artifact, safeVersion);
+        } else if (!trimmedName.contains(":") && (hint.contains("gradle") || hint.contains("maven"))) {
+            return String.format("pkg:gradle/%s@%s", trimmedName, safeVersion);
         }
 
         // 2. npm / Node.js
@@ -145,6 +149,15 @@ public class CycloneDxSbomService {
      * 저장소 내 실제 코드 및 설정 파일(application.properties, .env, Dockerfile 등)을 정밀 스캔하여
      * 통신 중인 외부 SaaS 및 타사 서비스 엔드포인트를 자동 감지합니다.
      */
+    private static final Pattern EXTERNAL_URL_PATTERN = Pattern.compile(
+            "https?://([a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\\s\"'<>#`]*)?"
+    );
+
+    /**
+     * 프로젝트 설정 파일(application.properties, YAML, .env 등)을 실제 검사하여
+     * 외부로 통신하는 실제 SaaS 및 API 서비스 엔드포인트를 동적으로 감지합니다.
+     * (소스코드 내 문자열 리터럴을 맹목적으로 오탐하거나 가짜 목데이터를 생성하지 않습니다)
+     */
     public List<ExternalServiceDetail> detectExternalServices(Path rootDir) {
         if (rootDir == null || !Files.exists(rootDir)) {
             return Collections.emptyList();
@@ -172,13 +185,12 @@ public class CycloneDxSbomService {
                         return FileVisitResult.TERMINATE;
                     }
                     String lower = file.getFileName().toString().toLowerCase();
+                    // 오직 실제 외부 환경/설정이 기술되는 설정 파일 및 배포 매니페스트만 검사 (소스코드 오탐 방지)
                     if (lower.endsWith(".properties") || lower.endsWith(".yml") || lower.endsWith(".yaml")
-                            || lower.endsWith(".json") || lower.endsWith(".java") || lower.endsWith(".ts")
-                            || lower.endsWith(".js") || lower.endsWith(".py") || lower.endsWith(".go")
-                            || lower.endsWith(".cs") || lower.equals(".env") || lower.startsWith(".env.")) {
+                            || lower.equals(".env") || lower.startsWith(".env.") || lower.equals("dockerfile")) {
                         try {
                             String content = Files.readString(file, StandardCharsets.UTF_8);
-                            checkContentForServices(content, detected);
+                            checkContentForConfiguredUrls(content, detected);
                         } catch (Exception ignored) {}
                     }
                     return FileVisitResult.CONTINUE;
@@ -191,46 +203,68 @@ public class CycloneDxSbomService {
         return new ArrayList<>(detected.values());
     }
 
-    private void checkContentForServices(String content, Map<String, ExternalServiceDetail> map) {
-        if (content.contains("generativelanguage.googleapis.com") || (content.contains("gemini") && content.contains("api.url"))) {
-            map.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
-                    "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+    private void checkContentForConfiguredUrls(String content, Map<String, ExternalServiceDetail> map) {
+        if (content == null || content.isBlank()) {
+            return;
         }
-        if (content.contains("api.github.com") || content.contains("github.com/api")) {
-            map.putIfAbsent("GitHub API", new ExternalServiceDetail(
-                    "GitHub REST & Checks API", "GitHub / Microsoft", "https://api.github.com", "Check Run 상태 동기화 및 PR 코멘트 등록"));
-        }
-        if (content.contains("api.openai.com")) {
-            map.putIfAbsent("OpenAI API", new ExternalServiceDetail(
-                    "OpenAI API", "OpenAI", "https://api.openai.com", "LLM 인퍼런스 프롬프트 및 완성 데이터"));
-        }
-        if (content.contains("api.tosspayments.com") || content.contains("tosspayments")) {
-            map.putIfAbsent("Toss Payments", new ExternalServiceDetail(
-                    "Toss Payments", "비바리퍼블리카", "https://api.tosspayments.com", "전자결제 주문 및 결제 승인 데이터 (PCI-DSS)"));
-        }
-        if (content.contains("api.stripe.com")) {
-            map.putIfAbsent("Stripe", new ExternalServiceDetail(
-                    "Stripe Payments", "Stripe", "https://api.stripe.com", "결제 트랜잭션 및 인증 토큰"));
-        }
-        if (content.contains("kapi.kakao.com")) {
-            map.putIfAbsent("Kakao API", new ExternalServiceDetail(
-                    "Kakao API", "카카오", "https://kapi.kakao.com", "사용자 계정 인증 및 소셜 연동"));
-        }
-        if (content.contains(".amazonaws.com")) {
-            map.putIfAbsent("AWS", new ExternalServiceDetail(
-                    "Amazon Web Services (AWS)", "Amazon", "https://*.amazonaws.com", "클라우드 스토리지 / 백엔드 인프라 자원"));
-        }
-        if (content.contains("firebaseio.com") || content.contains("firestore.googleapis.com")) {
-            map.putIfAbsent("Firebase", new ExternalServiceDetail(
-                    "Firebase", "Google Cloud", "https://*.firebaseio.com", "실시간 데이터베이스 및 푸시 알림"));
-        }
-        if (content.contains(".ingest.sentry.io") || content.contains("sentry.io")) {
-            map.putIfAbsent("Sentry", new ExternalServiceDetail(
-                    "Sentry Error Tracking", "Functional Software", "https://*.ingest.sentry.io", "애플리케이션 런타임 에러 스택 트레이스"));
-        }
-        if (content.contains("hooks.slack.com")) {
-            map.putIfAbsent("Slack", new ExternalServiceDetail(
-                    "Slack Webhook", "Salesforce", "https://hooks.slack.com", "CI/CD 빌드 알림 메시지"));
+
+        Matcher m = EXTERNAL_URL_PATTERN.matcher(content);
+        while (m.find()) {
+            String fullUrl = m.group(0);
+            String host = m.group(1).toLowerCase();
+
+            // 내부 통신, 로컬호스트, 표준 XML/JSON 스키마, 저장소 자체 도메인은 제외
+            if (host.equals("localhost") || host.equals("127.0.0.1") || host.equals("0.0.0.0")
+                    || host.endsWith(".local") || host.endsWith(".internal") || host.equals("example.com")
+                    || host.contains("schemas.android.com") || host.contains("www.w3.org")
+                    || host.contains("json-schema.org") || host.contains("xml.apache.org")
+                    || host.contains("repo.maven.apache.org") || host.contains("plugins.gradle.org")
+                    || host.contains("registry.npmjs.org") || host.contains("registry-1.docker.io")) {
+                continue;
+            }
+
+            // GitHub 저장소 일반 웹페이지 URL 제외 (단, api.github.com 등 실제 API 엔드포인트는 허용)
+            if (host.equals("github.com") && !fullUrl.contains("/api")) {
+                continue;
+            }
+
+            // 실제 설정에 존재하는 호스트별 표준 서비스 매핑
+            if (host.equals("generativelanguage.googleapis.com") || (host.contains("googleapis.com") && fullUrl.contains("gemini"))) {
+                map.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
+                        "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+            } else if (host.equals("api.github.com") || fullUrl.contains("github.com/api")) {
+                map.putIfAbsent("GitHub API", new ExternalServiceDetail(
+                        "GitHub REST & Checks API", "GitHub / Microsoft", "https://api.github.com", "Check Run 상태 동기화 및 PR 코멘트 등록"));
+            } else if (host.equals("api.openai.com")) {
+                map.putIfAbsent("OpenAI API", new ExternalServiceDetail(
+                        "OpenAI API", "OpenAI", "https://api.openai.com", "LLM 인퍼런스 프롬프트 및 완성 데이터"));
+            } else if (host.contains("tosspayments.com")) {
+                map.putIfAbsent("Toss Payments", new ExternalServiceDetail(
+                        "Toss Payments", "비바리퍼블리카", "https://api.tosspayments.com", "전자결제 주문 및 결제 승인 데이터 (PCI-DSS)"));
+            } else if (host.contains("stripe.com")) {
+                map.putIfAbsent("Stripe", new ExternalServiceDetail(
+                        "Stripe Payments", "Stripe", "https://api.stripe.com", "결제 트랜잭션 및 인증 토큰"));
+            } else if (host.contains("kakao.com") && (host.startsWith("kapi") || host.startsWith("kauth"))) {
+                map.putIfAbsent("Kakao API", new ExternalServiceDetail(
+                        "Kakao API", "카카오", "https://" + host, "사용자 계정 인증 및 소셜 연동"));
+            } else if (host.endsWith(".amazonaws.com")) {
+                map.putIfAbsent("AWS", new ExternalServiceDetail(
+                        "Amazon Web Services (AWS)", "Amazon", "https://" + host, "클라우드 스토리지 / 백엔드 인프라 자원"));
+            } else if (host.contains("firebaseio.com") || host.contains("firestore.googleapis.com")) {
+                map.putIfAbsent("Firebase", new ExternalServiceDetail(
+                        "Firebase", "Google Cloud", "https://" + host, "실시간 데이터베이스 및 푸시 알림"));
+            } else if (host.contains("sentry.io")) {
+                map.putIfAbsent("Sentry", new ExternalServiceDetail(
+                        "Sentry Error Tracking", "Functional Software", "https://" + host, "애플리케이션 런타임 에러 스택 트레이스"));
+            } else if (host.equals("hooks.slack.com")) {
+                map.putIfAbsent("Slack", new ExternalServiceDetail(
+                        "Slack Webhook", "Salesforce", "https://hooks.slack.com", "CI/CD 빌드 알림 메시지"));
+            } else {
+                // 그 외 설정 파일에 등록된 실제 외부 통신 API 엔드포인트 동적 등록
+                String serviceName = host.replace("api.", "").replace(".com", "").replace(".io", "").toUpperCase() + " API";
+                map.putIfAbsent(host, new ExternalServiceDetail(
+                        serviceName, host, "https://" + host, "외부 연동 웹 서비스 API"));
+            }
         }
     }
 
