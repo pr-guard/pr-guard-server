@@ -211,10 +211,12 @@ public class SecurityScanPipeline {
 
         String prDiff = prDiffFuture.join();
 
-        log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개)",
-                scanResult.manifestPackages() != null ? scanResult.manifestPackages().size() : 0);
+        log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개, 환경: {})",
+                scanResult.manifestPackages() != null ? scanResult.manifestPackages().size() : 0,
+                scanResult.projectEnvironment());
         LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
-                scanResult.scanJson(), prDiff, scanResult.runtimeContext(), scanResult.config(), scanResult.manifestPackages());
+                scanResult.scanJson(), prDiff, scanResult.runtimeContext(), scanResult.config(),
+                scanResult.manifestPackages(), scanResult.projectEnvironment());
 
         log.info("[Pipeline] Step 4: GitHub PR #{} 에 통합 분석 리포트 코멘트 등록", target.prNumber());
         gitHubBotService.postComment(target.fullName(), target.prNumber(), target.installationId(), outcome.reportMarkdown().trim());

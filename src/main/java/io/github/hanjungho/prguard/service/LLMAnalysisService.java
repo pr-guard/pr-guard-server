@@ -228,7 +228,17 @@ public class LLMAnalysisService {
      */
     public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
                                                  PrguardConfig config, List<SbomPackageDetail> manifestPackages) {
-        log.info("[LLMAnalysis] 종합 보안 분석 시작 (커스텀 정책 적용 여부: {}, 범용 매니페스트 패키지: {}개)",
+        return analyzeVulnerabilities(rawTrivyJson, prDiff, runtimeContext, config, manifestPackages, "미지정 (기타 프로젝트)");
+    }
+
+    /**
+     * 프로젝트 기본 사용 언어/빌드 도구/프레임워크 환경 메타데이터(projectEnvironment)를 포함한 종합 분석
+     */
+    public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
+                                                 PrguardConfig config, List<SbomPackageDetail> manifestPackages,
+                                                 String projectEnvironment) {
+        log.info("[LLMAnalysis] 종합 보안 분석 시작 (프로젝트 환경: {}, 커스텀 정책: {}, 매니페스트 패키지: {}개)",
+                projectEnvironment != null ? projectEnvironment : "미지정",
                 config != null && !config.toSummaryString().contains("예외 룰 없음"),
                 manifestPackages != null ? manifestPackages.size() : 0);
 
@@ -279,26 +289,27 @@ public class LLMAnalysisService {
             );
         }
 
-        log.info("[LLMAnalysis] 스캔 집계 결과: SBOM 총 {}개(직접 {}, 간접 {}), CVE 총 {}건(상위 {}건 선별), Misconfig {}건, Secret {}건",
+        log.info("[LLMAnalysis] 스캔 집계 결과: 환경 [{}], SBOM 총 {}개(직접 {}, 간접 {}), CVE 총 {}건, Misconfig {}건, Secret {}건",
+                projectEnvironment != null ? projectEnvironment : "미지정",
                 summaryPayload.sbomStats().totalCount(),
                 summaryPayload.sbomStats().directCount(),
                 summaryPayload.sbomStats().transitiveCount(),
                 summaryPayload.totalVulnerabilitiesCount(),
-                summaryPayload.topVulnerabilities().size(),
                 summaryPayload.totalMisconfigCount(),
                 summaryPayload.totalSecretCount());
 
         boolean hasCodeDiff = prDiff != null && !prDiff.isBlank() && !prDiff.contains("(PR 변경 코드 Diff가 비어 있습니다)");
 
         // 2. Java 단에서 직접 전체 SBOM 패키지 토글 마크다운 생성 (LLM 토큰 0 소모)
-        String sbomMarkdownTable = generateSbomMarkdownTable(summaryPayload.sbomPackages());
+        String sbomMarkdownTable = generateSbomMarkdownTable(summaryPayload.sbomPackages(), projectEnvironment);
 
-        // ⚡ 입력 컨텍스트(요약 JSON + Diff + 런타임 + 설정) SHA-256 메모이제이션 캐시 조회
+        // ⚡ 입력 컨텍스트(요약 JSON + Diff + 런타임 + 설정 + 프로젝트 환경) SHA-256 메모이제이션 캐시 조회
         String cacheKey = computeSha256(
                 summaryPayload.toString(),
                 prDiff != null ? prDiff : "",
                 runtimeContext != null ? runtimeContext : "",
-                config != null ? config.toSummaryString() : ""
+                config != null ? config.toSummaryString() : "",
+                projectEnvironment != null ? projectEnvironment : ""
         );
 
         AnalysisOutcome cached = reportCache.get(cacheKey);
@@ -320,9 +331,10 @@ public class LLMAnalysisService {
                     > ### 승인 (PASS)
                     > 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.
                     >
+                    > - **프로젝트 환경:** %s
                     > - **오픈소스 취약점 (CVE):** 0건 (안전)
                     > - **코드 로직 및 설정 결함:** 0건 (안전)
-                    """;
+                    """.formatted((projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "미지정 (기타 프로젝트)");
             String finalReport = (sbomMarkdownTable != null && !sbomMarkdownTable.isBlank())
                     ? reportText.trim() + "\n\n---\n\n" + sbomMarkdownTable.trim()
                     : reportText.trim();
@@ -336,14 +348,14 @@ public class LLMAnalysisService {
                 String minifiedJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(summaryPayload);
 
                 // 5. Reachability, 비즈니스 로직, 런타임/Base Image 검증 및 커스텀 정책 주입 프롬프트 생성
-                String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config);
+                String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config, projectEnvironment);
 
                 // 6. Google Gemini API 호출 (일시적 503/429 장애 시 지수 백오프 및 다중 모델 Fallback 후 자가 복구 리포트 생성)
                 try {
                     reportText = callGeminiApi(prompt);
                 } catch (Exception llmEx) {
                     log.warn("[LLMAnalysis] ⚠️ 모든 Gemini 모델 호출 일시 장애 발생({}). Trivy 정적 전수 검사 결과 기반으로 자가 복구 리포트를 생성합니다.", llmEx.getMessage());
-                    reportText = buildFallbackDeterministicReport(summaryPayload, config, llmEx.getMessage());
+                    reportText = buildFallbackDeterministicReport(summaryPayload, config, llmEx.getMessage(), projectEnvironment);
                 }
 
                 // 7. SecurityVerdict 종합 판정
@@ -416,6 +428,15 @@ public class LLMAnalysisService {
      * LLM 토큰 비용을 0으로 유지합니다 (최대 200개 제한 안전장치 적용).
      */
     public String generateSbomMarkdownTable(List<SbomPackageDetail> packages) {
+        return generateSbomMarkdownTable(packages, null);
+    }
+
+    /**
+     * Java 단에서 직접 전체 SBOM 패키지 목록을 마크다운 표 및 <details> 태그로 렌더링합니다.
+     * 직접 의존성과 간접 의존성을 2개의 독립된 표로 분리하고 라이선스 정보를 포함하여 가독성을 극대화하며,
+     * LLM 토큰 비용을 0으로 유지합니다 (최대 200개 제한 안전장치 적용).
+     */
+    public String generateSbomMarkdownTable(List<SbomPackageDetail> packages, String projectEnvironment) {
         if (packages == null || packages.isEmpty()) {
             return """
                     <details>
@@ -445,6 +466,9 @@ public class LLMAnalysisService {
         StringBuilder sb = new StringBuilder();
         sb.append("<details>\n");
         sb.append("<summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 ").append(totalCount).append("개)</b></summary>\n\n");
+        if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment) && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
+            sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("\n");
+        }
         sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개\n\n");
 
         // 1. 직접 의존성 표 (Direct Dependencies)
@@ -760,13 +784,18 @@ public class LLMAnalysisService {
     }
 
     String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext) {
-        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, PrguardConfig.defaultConfig());
+        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, PrguardConfig.defaultConfig(), "미지정 (기타 프로젝트)");
+    }
+
+    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config) {
+        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, config, "미지정 (기타 프로젝트)");
     }
 
     /**
-     * 보안 전문 AI 시스템 프롬프트 및 마크다운 고정 템플릿 구성 (커스텀 정책 적용)
+     * 보안 전문 AI 시스템 프롬프트 및 마크다운 고정 템플릿 구성 (커스텀 정책 및 프로젝트 환경 적용)
      */
-    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config) {
+    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config, String projectEnvironment) {
+        String safeEnv = (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "미지정 (기타 프로젝트)";
         return """
                 [System Prompt]
                 너는 10년 차 수석 애플리케이션 보안 아키텍트이자 DevSecOps 코드 리뷰어다.
@@ -787,7 +816,8 @@ public class LLMAnalysisService {
                    - 최상단 마스터 Alert 배너 내부 구성:
                      - 판정 헤드라인: `### 차단 권고 (BLOCK)` 또는 `### 주의 (WARN)` 또는 `### 승인 (PASS)`
                      - 핵심 판정 사유 1~2줄 요약
-                     - 2개 항목 퀵 체크리스트(불릿 리스트):
+                     - 3개 항목 퀵 체크리스트(불릿 리스트):
+                       - `- **프로젝트 환경:** %s`
                        - `- **오픈소스 취약점 (CVE):** 총 N건 (CRITICAL N건, HIGH N건, ...)` 또는 `0건 (안전)`
                        - `- **코드 로직 및 설정 결함:** 총 N건 (핵심 결함 요약)` 또는 `0건 (안전)`
 
@@ -833,6 +863,7 @@ public class LLMAnalysisService {
                 %s
 
                 [입력 데이터 3: 프로젝트 런타임 및 환경 설정 컨텍스트]
+                - 프로젝트 환경: %s
                 %s
 
                 [입력 데이터 4: 프로젝트 커스텀 보안 정책 (.prguard.yml)]
@@ -847,6 +878,7 @@ public class LLMAnalysisService {
                 > ### 차단 권고 (BLOCK) *(또는 ### 주의 (WARN))*
                 > (핵심 판정 사유 1~2줄 요약)
                 >
+                > - **프로젝트 환경:** %s
                 > - **오픈소스 취약점 (CVE):** 총 N건 (CRITICAL N건, HIGH N건, ...)
                 > - **코드 로직 및 설정 결함:** 총 N건 (핵심 결함 요약)
 
@@ -896,14 +928,19 @@ public class LLMAnalysisService {
                 > ### 승인 (PASS)
                 > 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.
                 >
+                > - **프로젝트 환경:** %s
                 > - **오픈소스 취약점 (CVE):** 0건 (안전)
                 > - **코드 로직 및 설정 결함:** 0건 (안전)
                 """
                 .formatted(
+                        safeEnv,
                         minifiedSummaryJson,
                         (prDiff != null && !prDiff.isBlank()) ? prDiff : "(PR 변경 코드 Diff 없음)",
+                        safeEnv,
                         (runtimeContext != null && !runtimeContext.isBlank()) ? runtimeContext : "(런타임 환경 설정 컨텍스트 없음)",
-                        (config != null) ? config.toSummaryString() : "(기본 엔터프라이즈 정책 적용 중 - 예외 룰 없음)");
+                        (config != null) ? config.toSummaryString() : "(기본 엔터프라이즈 정책 적용 중 - 예외 룰 없음)",
+                        safeEnv,
+                        safeEnv);
     }
 
     /**
@@ -1018,10 +1055,14 @@ public class LLMAnalysisService {
      * 파이프라인 중단 없이 안전하게 자동 판정하는 자가 복구 리포트 생성기.
      */
     public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config) {
-        return buildFallbackDeterministicReport(payload, config, null);
+        return buildFallbackDeterministicReport(payload, config, null, null);
     }
 
     public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config, String errorReason) {
+        return buildFallbackDeterministicReport(payload, config, errorReason, null);
+    }
+
+    public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config, String errorReason, String projectEnv) {
         StringBuilder sb = new StringBuilder();
 
         if (hasBlockingVulnerabilities(payload, config)) {
@@ -1038,6 +1079,9 @@ public class LLMAnalysisService {
             sb.append("> 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.\n>\n");
         }
 
+        if (projectEnv != null && !projectEnv.isBlank()) {
+            sb.append("> - **프로젝트 환경:** ").append(projectEnv).append("\n");
+        }
         sb.append("> - **오픈소스 취약점 (CVE):** 총 ").append(payload.totalVulnerabilitiesCount()).append("건");
         if (payload.totalVulnerabilitiesCount() == 0) {
             sb.append(" (안전)\n");

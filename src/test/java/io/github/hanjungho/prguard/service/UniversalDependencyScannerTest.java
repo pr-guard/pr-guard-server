@@ -293,4 +293,38 @@ class UniversalDependencyScannerTest {
         assertTrue(packages.stream().anyMatch(p -> p.name().equals("serde") && "1.0.200".equals(p.version())));
         assertTrue(packages.stream().anyMatch(p -> p.name().equals("tokio") && "1.38.0".equals(p.version())));
     }
+
+    @Test
+    @DisplayName("Java Gradle Spring Boot 환경이 정확하게 감지되어야 한다")
+    void shouldDetectProjectEnvironmentForJavaGradleSpringBoot(@TempDir Path tempDir) throws IOException {
+        Files.writeString(tempDir.resolve("build.gradle"), "plugins { id 'org.springframework.boot' version '3.2.0' }");
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("org.springframework.boot:spring-boot", "3.2.0", false)
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertEquals("Java", env.language());
+        assertEquals("Gradle", env.buildTool());
+        assertTrue(env.framework().contains("Spring Boot"));
+        assertEquals("Java (Gradle) / Spring Boot 3.2.0", env.toSummaryString());
+    }
+
+    @Test
+    @DisplayName("TypeScript Node.js React 환경이 정확하게 감지되어야 한다")
+    void shouldDetectProjectEnvironmentForNodeTypeScriptReact(@TempDir Path tempDir) throws IOException {
+        Files.writeString(tempDir.resolve("package.json"), "{\"name\": \"my-app\"}");
+        Files.writeString(tempDir.resolve("tsconfig.json"), "{}");
+        Files.writeString(tempDir.resolve("package-lock.json"), "{}");
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("react", "18.2.0", false)
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertEquals("TypeScript", env.language());
+        assertEquals("npm", env.buildTool());
+        assertEquals("React", env.framework());
+        assertEquals("TypeScript (npm) / React", env.toSummaryString());
+    }
 }

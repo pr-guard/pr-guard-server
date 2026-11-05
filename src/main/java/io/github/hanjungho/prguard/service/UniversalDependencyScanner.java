@@ -37,8 +37,35 @@ public class UniversalDependencyScanner {
 
     private final ObjectMapper objectMapper;
 
-    @org.springframework.beans.factory.annotation.Value("${scanner.wrapper.enabled:false}")
-    private boolean wrapperExecutionEnabled = false;
+    @org.springframework.beans.factory.annotation.Value("${scanner.wrapper.enabled:true}")
+    private boolean wrapperExecutionEnabled = true;
+
+    /**
+     * 프로젝트 기본 사용 언어, 빌드 도구 및 주요 프레임워크 환경 메타데이터
+     */
+    public record ProjectEnvironment(
+            String language,
+            String buildTool,
+            String framework
+    ) {
+        public static ProjectEnvironment unknown() {
+            return new ProjectEnvironment("알 수 없음", "미지정", "미지정");
+        }
+
+        public String toSummaryString() {
+            StringBuilder sb = new StringBuilder();
+            if (language != null && !language.isBlank() && !"알 수 없음".equals(language)) {
+                sb.append(language);
+            }
+            if (buildTool != null && !buildTool.isBlank() && !"미지정".equals(buildTool)) {
+                sb.append(" (").append(buildTool).append(")");
+            }
+            if (framework != null && !framework.isBlank() && !"미지정".equals(framework)) {
+                sb.append(" / ").append(framework);
+            }
+            return sb.isEmpty() ? "기타/다중 언어 프로젝트" : sb.toString();
+        }
+    }
 
     private static final Set<String> IGNORED_DIRS = Set.of(
             ".git", ".gradle", ".idea", "node_modules", "target", "build", "bin", "obj",
@@ -166,6 +193,133 @@ public class UniversalDependencyScanner {
         log.info("[UniversalScanner] 실제 저장소 매니페스트 스캔 완료: 직접 {}개, 간접 {}개, 총 {}개 패키지 검출",
                 direct, indirect, result.size());
         return result;
+    }
+
+    /**
+     * 저장소 내 실제 매니페스트 파일 및 패키지 구성을 바탕으로 기본 프로그래밍 언어, 빌드 툴, 프레임워크를 동적으로 식별합니다.
+     */
+    public ProjectEnvironment detectProjectEnvironment(Path rootDir, List<LLMAnalysisService.SbomPackageDetail> packages) {
+        if (rootDir == null || !Files.exists(rootDir)) {
+            return ProjectEnvironment.unknown();
+        }
+
+        List<LLMAnalysisService.SbomPackageDetail> safePackages = (packages != null) ? packages : Collections.emptyList();
+
+        // 1. Java / Kotlin (JVM)
+        boolean hasGradleKts = Files.exists(rootDir.resolve("build.gradle.kts"));
+        boolean hasGradle = Files.exists(rootDir.resolve("build.gradle")) || hasGradleKts;
+        boolean hasMaven = Files.exists(rootDir.resolve("pom.xml"));
+
+        if (hasGradle || hasMaven) {
+            String language = hasGradleKts ? "Kotlin / Java" : "Java";
+            String buildTool = hasGradle ? "Gradle" : "Maven";
+            String framework = "미지정";
+
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                if (p.name().contains("spring-boot")) {
+                    String ver = (p.version() != null && !p.version().isBlank() && !"(managed)".equals(p.version()))
+                            ? " " + p.version().trim()
+                            : "";
+                    framework = "Spring Boot" + ver;
+                    break;
+                } else if (p.name().contains("quarkus")) {
+                    framework = "Quarkus";
+                    break;
+                } else if (p.name().contains("micronaut")) {
+                    framework = "Micronaut";
+                    break;
+                }
+            }
+            return new ProjectEnvironment(language, buildTool, framework);
+        }
+
+        // 2. Node.js (JavaScript / TypeScript)
+        if (Files.exists(rootDir.resolve("package.json"))) {
+            boolean isTs = Files.exists(rootDir.resolve("tsconfig.json"));
+            String language = isTs ? "TypeScript" : "JavaScript";
+            String buildTool;
+            if (Files.exists(rootDir.resolve("pnpm-lock.yaml"))) buildTool = "pnpm";
+            else if (Files.exists(rootDir.resolve("yarn.lock"))) buildTool = "Yarn";
+            else if (Files.exists(rootDir.resolve("package-lock.json"))) buildTool = "npm";
+            else buildTool = "npm";
+
+            String framework = "Node.js";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("next")) { framework = "Next.js"; break; }
+                if (n.equals("react")) { framework = "React"; break; }
+                if (n.equals("vue")) { framework = "Vue.js"; break; }
+                if (n.equals("express")) { framework = "Express"; break; }
+                if (n.equals("@nestjs/core")) { framework = "NestJS"; break; }
+            }
+            return new ProjectEnvironment(language, buildTool, framework);
+        }
+
+        // 3. Python
+        if (Files.exists(rootDir.resolve("requirements.txt")) || Files.exists(rootDir.resolve("pyproject.toml")) || Files.exists(rootDir.resolve("Pipfile"))) {
+            String buildTool;
+            if (Files.exists(rootDir.resolve("poetry.lock"))) buildTool = "Poetry";
+            else if (Files.exists(rootDir.resolve("Pipfile.lock"))) buildTool = "Pipenv";
+            else buildTool = "pip";
+
+            String framework = "미지정";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("django")) { framework = "Django"; break; }
+                if (n.equals("fastapi")) { framework = "FastAPI"; break; }
+                if (n.equals("flask")) { framework = "Flask"; break; }
+            }
+            return new ProjectEnvironment("Python", buildTool, framework);
+        }
+
+        // 4. Rust
+        if (Files.exists(rootDir.resolve("Cargo.toml"))) {
+            String framework = "미지정";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("actix-web")) { framework = "Actix Web"; break; }
+                if (n.equals("axum")) { framework = "Axum"; break; }
+                if (n.equals("tokio")) { framework = "Tokio"; break; }
+            }
+            return new ProjectEnvironment("Rust", "Cargo", framework);
+        }
+
+        // 5. Go
+        if (Files.exists(rootDir.resolve("go.mod"))) {
+            String framework = "미지정";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.contains("gin-gonic/gin")) { framework = "Gin"; break; }
+                if (n.contains("labstack/echo")) { framework = "Echo"; break; }
+                if (n.contains("gofiber/fiber")) { framework = "Fiber"; break; }
+            }
+            return new ProjectEnvironment("Go", "Go Modules", framework);
+        }
+
+        // 6. C# / .NET
+        boolean hasCsproj = false;
+        try (var s = Files.list(rootDir)) {
+            hasCsproj = s.anyMatch(p -> p.getFileName().toString().toLowerCase().endsWith(".csproj"));
+        } catch (Exception ignored) {}
+        if (hasCsproj) {
+            return new ProjectEnvironment("C# (.NET)", "NuGet / MSBuild", "ASP.NET Core / .NET");
+        }
+
+        // 7. C / C++
+        if (Files.exists(rootDir.resolve("CMakeLists.txt")) || Files.exists(rootDir.resolve("conanfile.txt")) || Files.exists(rootDir.resolve("vcpkg.json"))) {
+            String buildTool = Files.exists(rootDir.resolve("CMakeLists.txt")) ? "CMake" : (Files.exists(rootDir.resolve("conanfile.txt")) ? "Conan" : "vcpkg");
+            return new ProjectEnvironment("C / C++", buildTool, "Native");
+        }
+
+        // 8. Mobile / iOS / Flutter
+        if (Files.exists(rootDir.resolve("pubspec.yaml"))) {
+            return new ProjectEnvironment("Dart", "Flutter / pub", "Flutter");
+        }
+        if (Files.exists(rootDir.resolve("Podfile")) || Files.exists(rootDir.resolve("Package.swift"))) {
+            return new ProjectEnvironment("Swift", "SPM / CocoaPods", "iOS / Apple");
+        }
+
+        return ProjectEnvironment.unknown();
     }
 
     private void parseManifestFile(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {

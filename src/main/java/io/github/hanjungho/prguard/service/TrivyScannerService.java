@@ -70,11 +70,21 @@ public class TrivyScannerService {
     private final AtomicLong lastDbUpdateTime = new AtomicLong(0L);
 
     /**
-     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책 및 범용 매니페스트 패키지 목록을 담는 반환 레코드
+     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책, 범용 매니페스트 패키지 목록 및 기술 스택 메타데이터를 담는 반환 레코드
      */
-    public record ScanResult(String scanJson, String runtimeContext, PrguardConfig config, List<LLMAnalysisService.SbomPackageDetail> manifestPackages) {
+    public record ScanResult(
+            String scanJson,
+            String runtimeContext,
+            PrguardConfig config,
+            List<LLMAnalysisService.SbomPackageDetail> manifestPackages,
+            String projectEnvironment
+    ) {
+        public ScanResult(String scanJson, String runtimeContext, PrguardConfig config, List<LLMAnalysisService.SbomPackageDetail> manifestPackages) {
+            this(scanJson, runtimeContext, config, manifestPackages, "미지정 (기타 프로젝트)");
+        }
+
         public ScanResult(String scanJson, String runtimeContext, PrguardConfig config) {
-            this(scanJson, runtimeContext, config, Collections.emptyList());
+            this(scanJson, runtimeContext, config, Collections.emptyList(), "미지정 (기타 프로젝트)");
         }
     }
 
@@ -109,11 +119,16 @@ public class TrivyScannerService {
             // 3. 커스텀 보안 정책 파일(.prguard.yml) 탐색 및 파싱
             PrguardConfig prguardConfig = extractPrguardConfig(tempDir);
 
-            // 4. 범용 매니페스트 스캐너 실행 (C++, C#, Unity, Unreal, Mobile, Flutter, Gradle 등 모든 생태계 직접 의존성 수집)
+            // 4. 범용 매니페스트 스캐너 실행 (C++, C#, Unity, Unreal, Mobile, Flutter, Gradle 등 모든 생태계 직접/간접 의존성 수집)
             List<LLMAnalysisService.SbomPackageDetail> manifestPackages = (universalDependencyScanner != null)
                     ? universalDependencyScanner.scan(tempDir)
                     : Collections.emptyList();
             log.info("[TrivyScanner] 범용 매니페스트 패키지 수집 완료: 총 {}개", manifestPackages.size());
+
+            String projectEnvironment = (universalDependencyScanner != null)
+                    ? universalDependencyScanner.detectProjectEnvironment(tempDir, manifestPackages).toSummaryString()
+                    : "미지정 (기타 프로젝트)";
+            log.info("[TrivyScanner] 프로젝트 기술 스택 및 주요 언어 감지: {}", projectEnvironment);
 
             // 5. 런타임 환경 설정 컨텍스트 추출 (Dockerfile, .nvmrc, package.json, build.gradle 등)
             String runtimeContext = extractRuntimeContext(tempDir);
@@ -123,7 +138,7 @@ public class TrivyScannerService {
             String scanResult = executeTrivyScan(tempDir);
             log.info("[TrivyScanner] Trivy 스캔 완료");
 
-            return new ScanResult(scanResult, runtimeContext, prguardConfig, manifestPackages);
+            return new ScanResult(scanResult, runtimeContext, prguardConfig, manifestPackages, projectEnvironment);
         } catch (Exception e) {
             log.error("[TrivyScanner] 스캔 파이프라인 수행 실패: {}", e.getMessage(), e);
             throw new RuntimeException("Trivy 스캔 실패: " + e.getMessage(), e);
