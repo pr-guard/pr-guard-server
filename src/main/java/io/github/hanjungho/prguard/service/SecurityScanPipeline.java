@@ -234,14 +234,27 @@ public class SecurityScanPipeline {
     private void sendFailureFeedbackComment(String fullName, Integer prNumber, Long installationId, Exception e) {
         try {
             String failureMessage = e.getMessage() != null ? e.getMessage() : "상세 사유 미확인";
-            String failureComment = """
-                    ### [PR Guard] 보안 검증 파이프라인 안내: 일시적 오류 발생
+            String actionAdvice = "일시적인 네트워크 지연 또는 외부 API 응답 오류일 수 있습니다. `@prguard rescan`을 입력하여 재시도하거나 잠시 후 커밋을 다시 푸시해 주세요.";
 
-                    > **안내:** PR 대상 코드 보안 분석 파이프라인 수행 중 일시적인 오류가 발생했습니다.
+            if (failureMessage.contains("Contents: Read") || failureMessage.contains("접근 권한 부족")
+                    || failureMessage.contains("terminal prompts disabled") || failureMessage.contains("could not read Username")) {
+                actionAdvice = """
+                        **비공개(Private) 저장소의 소스코드를 분석하기 위해서는 GitHub App의 저장소 코드 접근 권한이 필요합니다.**
+                        1. **GitHub App 권한 설정**: [GitHub App Settings](https://github.com/settings/apps) -> **Permissions & events** -> **Repository permissions** 에서 **`Contents` 권한을 `Access: Read-only` (또는 Read and write)** 로 변경 후 저장합니다.
+                        2. **저장소 설치 승인(Update Permissions)**: 권한 변경 후 해당 계정(또는 조직)의 **Settings -> Applications -> Installed GitHub Apps -> PR Guard** 로 이동하여 **`Review permission update request`** (새 권한 승인) 버튼을 눌러 승인해 주세요.
+                        3. 승인 후 PR에서 `@prguard rescan`을 입력하면 정상적으로 분석이 진행됩니다.
+                        """;
+            }
+
+            String failureComment = """
+                    ### [PR Guard] 보안 검증 파이프라인 안내: 접근 권한 또는 일시적 오류 확인 필요
+
+                    > **안내:** PR 대상 코드 보안 분석 파이프라인 수행 중 오류가 발생했습니다.
 
                     - **오류 사유:** `%s`
-                    - **권장 조치:** 일시적인 네트워크 지연 또는 외부 API 응답 오류일 수 있습니다. `@prguard rescan`을 입력하여 재시도하거나 잠시 후 커밋을 다시 푸시해 주세요.
-                    """.formatted(failureMessage);
+                    - **권장 조치:**
+                    %s
+                    """.formatted(failureMessage, actionAdvice);
 
             gitHubBotService.postComment(fullName, prNumber, installationId, failureComment);
             log.info("[Pipeline] PR #{} 에 실패 안내 코멘트 등록 완료", prNumber);

@@ -266,34 +266,42 @@ public class TrivyScannerService {
 
         // GitHub Git HTTP 인증: x-access-token 기본 인증 URL 구성 (GitHub App 공식 지원)
         String targetCloneUrl = cloneUrl;
-        if (accessToken != null && !accessToken.isBlank() && targetCloneUrl.startsWith("https://")) {
+        boolean hasToken = accessToken != null && !accessToken.isBlank();
+        if (hasToken && targetCloneUrl.startsWith("https://")) {
             targetCloneUrl = "https://x-access-token:" + accessToken + "@" + targetCloneUrl.substring("https://".length());
         }
 
         // 1차 시도: 브랜치 지정 + 액세스 토큰 URL Clone
         ProcessRunResult result = runGitCloneCmd(targetCloneUrl, branch, targetDir);
 
-        // 2차 시도: 인증 토큰 실패 또는 오픈소스 Fork PR 브랜치 권한 오류 시 무인증(Public) 원본 cloneUrl로 재시도
-        if (result.exitCode() != 0 && !targetCloneUrl.equals(cloneUrl)) {
-            log.warn("[TrivyScanner] 인증 토큰 Clone 실패 (Exit code: {}). 오픈소스 퍼블릭 Fork 저장소일 수 있으므로 무인증 Clone으로 재시도합니다.",
-                    result.exitCode());
-            result = runGitCloneCmd(cloneUrl, branch, targetDir);
+        // 2차 시도: 브랜치 미존재 등 오류 시, 토큰 인증을 유지한 채 기본 브랜치(default branch)로 재시도
+        if (result.exitCode() != 0 && branch != null && !branch.isBlank()) {
+            log.warn("[TrivyScanner] 브랜치({}) 지정 Clone 실패 (Exit code: {}). 토큰을 유지한 채 기본 브랜치로 재시도합니다.",
+                    branch, result.exitCode());
+            result = runGitCloneCmd(targetCloneUrl, null, targetDir);
         }
 
-        // 3차 시도: 특정 브랜치 미존재 시 기본 브랜치(default branch)로 Fallback Clone
-        if (result.exitCode() != 0 && branch != null && !branch.isBlank()) {
-            log.warn("[TrivyScanner] 브랜치 지정 Clone 실패 (Exit code: {}). 기본 브랜치로 최종 재시도합니다. 로그: {}",
-                    result.exitCode(), result.output().trim());
-            result = runGitCloneCmd(targetCloneUrl.equals(cloneUrl) ? cloneUrl : targetCloneUrl, null, targetDir);
-            if (result.exitCode() != 0 && !targetCloneUrl.equals(cloneUrl)) {
+        // 3차 시도: 오픈소스 퍼블릭 Fork 저장소일 수 있으므로 무인증(Public) 원본 cloneUrl로 재시도
+        if (result.exitCode() != 0 && hasToken) {
+            log.warn("[TrivyScanner] 인증 토큰 Clone 실패 (Exit code: {}). 오픈소스 퍼블릭 저장소일 수 있으므로 무인증 Clone으로 재시도합니다.",
+                    result.exitCode());
+            result = runGitCloneCmd(cloneUrl, branch, targetDir);
+            if (result.exitCode() != 0 && branch != null && !branch.isBlank()) {
                 result = runGitCloneCmd(cloneUrl, null, targetDir);
             }
         }
 
         if (result.exitCode() != 0) {
+            String sanitizedOutput = sanitizeToken(result.output().trim(), accessToken);
             log.error("[TrivyScanner] Git Clone 최종 실패 (Exit code: {}): {}",
-                    result.exitCode(), result.output().trim());
-            throw new RuntimeException("Git Clone 실패 (저장소 접근 권한 또는 브랜치 확인 필요): " + result.output().trim());
+                    result.exitCode(), sanitizedOutput);
+
+            if (sanitizedOutput.contains("terminal prompts disabled") || sanitizedOutput.contains("could not read Username")
+                    || sanitizedOutput.contains("Repository not found") || sanitizedOutput.contains("Authentication failed")) {
+                throw new RuntimeException("Git Clone 실패 (비공개 저장소 접근 권한 부족): GitHub App 설정에서 Repository permissions -> 'Contents: Read' 권한을 활성화하고 저장소 소유자가 승인했는지 확인해주세요. (원문: " + sanitizedOutput + ")");
+            }
+
+            throw new RuntimeException("Git Clone 실패 (저장소 접근 권한 또는 브랜치 확인 필요): " + sanitizedOutput);
         }
 
         // Clone 완료 후 디렉토리가 실제로 채워졌는지 검증
@@ -304,6 +312,15 @@ public class TrivyScannerService {
             }
             log.info("[TrivyScanner] Git Clone 성공 완료 (다운로드 항목 수: {}개)", fileCount);
         }
+    }
+
+    private String sanitizeToken(String text, String token) {
+        if (text == null) return "";
+        String sanitized = text;
+        if (token != null && !token.isBlank()) {
+            sanitized = sanitized.replace(token, "ghs_***");
+        }
+        return sanitized.replaceAll("ghs_[a-zA-Z0-9]+", "ghs_***");
     }
 
     private ProcessRunResult runGitCloneCmd(String cloneUrl, String branch, Path targetDir) throws IOException, InterruptedException {
