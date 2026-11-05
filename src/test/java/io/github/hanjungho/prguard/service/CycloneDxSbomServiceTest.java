@@ -143,4 +143,76 @@ class CycloneDxSbomServiceTest {
         assertNotNull(hash);
         assertEquals(64, hash.length(), "SHA-256 해시는 64자리 16진수여야 함");
     }
+
+    @Test
+    @DisplayName("저장소 내 설정 및 코드 파일에서 외부 SaaS 및 타사 서비스 엔드포인트를 자동 감지해야 한다")
+    void shouldDetectExternalServicesFromRepositoryFiles(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws java.io.IOException {
+        java.nio.file.Files.writeString(tempDir.resolve("application.properties"),
+                "gemini.api.url=https://generativelanguage.googleapis.com/v1beta/models\ngithub.api.url=https://api.github.com\n");
+        java.nio.file.Files.writeString(tempDir.resolve("PaymentService.java"),
+                "String endpoint = \"https://api.tosspayments.com/v1/payments\";\n");
+
+        List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(tempDir);
+
+        assertNotNull(services);
+        assertEquals(3, services.size());
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Gemini") && s.endpoint().contains("googleapis.com")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("GitHub") && s.endpoint().contains("github.com")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Toss") && s.endpoint().contains("tosspayments.com")));
+    }
+
+    @Test
+    @DisplayName("CycloneDX 데이터를 기반으로 4대 카테고리(환경, 의존성, 외부 서비스, 무결성 링크) 마크다운 리포트가 정상 생성되어야 한다")
+    void shouldRender4CategorySbomMarkdownReport() {
+        List<LLMAnalysisService.SbomPackageDetail> packages = List.of(
+                new LLMAnalysisService.SbomPackageDetail("react", "18.2.0", false, "MIT"),
+                new LLMAnalysisService.SbomPackageDetail("loose-envify", "1.4.0", true, "Apache-2.0")
+        );
+
+        List<CycloneDxSbomService.ExternalServiceDetail> services = List.of(
+                new CycloneDxSbomService.ExternalServiceDetail("Google Gemini AI", "Google Cloud",
+                        "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단")
+        );
+
+        String markdown = service.renderSbomMarkdownReport(
+                "owner/my-web",
+                42,
+                "TypeScript (npm) / React",
+                "FROM node:20-alpine\nWORKDIR /app\n",
+                packages,
+                services,
+                "{\"bomFormat\":\"CycloneDX\"}"
+        );
+
+        assertNotNull(markdown);
+        // 토글 헤더 검증
+        assertTrue(markdown.contains("<details>"));
+        assertTrue(markdown.contains("<summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 3개)</b></summary>"));
+        assertTrue(markdown.contains("OWASP CycloneDX v1.5 JSON"));
+
+        // 카테고리 1: 런타임 및 빌드 환경 검증
+        assertTrue(markdown.contains("### 1. 런타임 및 빌드 환경 (Environment)"));
+        assertTrue(markdown.contains("`TypeScript`"));
+        assertTrue(markdown.contains("`npm`"));
+        assertTrue(markdown.contains("`React`"));
+        assertTrue(markdown.contains("Docker (node:20-alpine)"));
+
+        // 카테고리 2: 오픈소스 및 패키지 의존성 검증
+        assertTrue(markdown.contains("### 2. 오픈소스 및 패키지 의존성 (Dependencies)"));
+        assertTrue(markdown.contains("#### 직접 의존성 (Direct Dependencies - 1개)"));
+        assertTrue(markdown.contains("| `react` | `18.2.0` | MIT | `pkg:npm/react@18.2.0` |"));
+        assertTrue(markdown.contains("#### 간접 의존성 (Transitive Dependencies - 1개)"));
+        assertTrue(markdown.contains("| `loose-envify` | `1.4.0` | Apache-2.0 | `pkg:npm/loose-envify@1.4.0` |"));
+
+        // 카테고리 3: 외부 연동 서비스 및 SaaS 자산 검증
+        assertTrue(markdown.contains("### 3. 외부 연동 서비스 및 SaaS 자산 (External Services)"));
+        assertTrue(markdown.contains("| `Google Gemini AI` | Google Cloud | `https://generativelanguage.googleapis.com` | AI 코드 분석 및 보안 진단 |"));
+
+        // 카테고리 4: 무결성 검증 및 다운로드 링크 검증
+        assertTrue(markdown.contains("### 4. 무결성 원본 데이터 및 기계 판독 다운로드"));
+        assertTrue(markdown.contains("https://prguard.onrender.com/api/sbom/owner/my-web/42"));
+        assertTrue(markdown.contains("SHA-256 무결성 해시:"));
+        assertTrue(markdown.contains("</details>"));
+    }
 }
+

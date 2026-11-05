@@ -32,13 +32,20 @@ import java.util.stream.Stream;
 public class TrivyScannerService {
 
     private final UniversalDependencyScanner universalDependencyScanner;
+    private final CycloneDxSbomService cycloneDxSbomService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public TrivyScannerService(UniversalDependencyScanner universalDependencyScanner, CycloneDxSbomService cycloneDxSbomService) {
+        this.universalDependencyScanner = universalDependencyScanner;
+        this.cycloneDxSbomService = cycloneDxSbomService;
+    }
 
     public TrivyScannerService(UniversalDependencyScanner universalDependencyScanner) {
-        this.universalDependencyScanner = universalDependencyScanner;
+        this(universalDependencyScanner, new CycloneDxSbomService(new ObjectMapper()));
     }
 
     public TrivyScannerService() {
-        this(new UniversalDependencyScanner(new ObjectMapper()));
+        this(new UniversalDependencyScanner(new ObjectMapper()), new CycloneDxSbomService(new ObjectMapper()));
     }
 
     @org.springframework.beans.factory.annotation.Value("${trivy.process.timeout-minutes:5}")
@@ -70,21 +77,28 @@ public class TrivyScannerService {
     private final AtomicLong lastDbUpdateTime = new AtomicLong(0L);
 
     /**
-     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책, 범용 매니페스트 패키지 목록 및 기술 스택 메타데이터를 담는 반환 레코드
+     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책, 범용 매니페스트 패키지 목록,
+     * 기술 스택 메타데이터 및 외부 연동 SaaS 서비스 목록을 담는 반환 레코드
      */
     public record ScanResult(
             String scanJson,
             String runtimeContext,
             PrguardConfig config,
             List<LLMAnalysisService.SbomPackageDetail> manifestPackages,
-            String projectEnvironment
+            String projectEnvironment,
+            List<CycloneDxSbomService.ExternalServiceDetail> externalServices
     ) {
+        public ScanResult(String scanJson, String runtimeContext, PrguardConfig config,
+                          List<LLMAnalysisService.SbomPackageDetail> manifestPackages, String projectEnvironment) {
+            this(scanJson, runtimeContext, config, manifestPackages, projectEnvironment, Collections.emptyList());
+        }
+
         public ScanResult(String scanJson, String runtimeContext, PrguardConfig config, List<LLMAnalysisService.SbomPackageDetail> manifestPackages) {
-            this(scanJson, runtimeContext, config, manifestPackages, "미지정 (기타 프로젝트)");
+            this(scanJson, runtimeContext, config, manifestPackages, "미지정 (기타 프로젝트)", Collections.emptyList());
         }
 
         public ScanResult(String scanJson, String runtimeContext, PrguardConfig config) {
-            this(scanJson, runtimeContext, config, Collections.emptyList(), "미지정 (기타 프로젝트)");
+            this(scanJson, runtimeContext, config, Collections.emptyList(), "미지정 (기타 프로젝트)", Collections.emptyList());
         }
     }
 
@@ -130,6 +144,12 @@ public class TrivyScannerService {
                     : "미지정 (기타 프로젝트)";
             log.info("[TrivyScanner] 프로젝트 기술 스택 및 주요 언어 감지: {}", projectEnvironment);
 
+            // 4-1. 외부 연동 SaaS 및 타사 서비스 감지 (Gemini, GitHub, Toss, Stripe, AWS 등)
+            List<CycloneDxSbomService.ExternalServiceDetail> externalServices = (cycloneDxSbomService != null)
+                    ? cycloneDxSbomService.detectExternalServices(tempDir)
+                    : Collections.emptyList();
+            log.info("[TrivyScanner] 외부 연동 SaaS 서비스 감지: 총 {}개", externalServices.size());
+
             // 5. 런타임 환경 설정 컨텍스트 추출 (Dockerfile, .nvmrc, package.json, build.gradle 등)
             String runtimeContext = extractRuntimeContext(tempDir);
             log.info("[TrivyScanner] 런타임 환경 설정 컨텍스트 추출 완료 (길이: {}자)", runtimeContext.length());
@@ -138,7 +158,7 @@ public class TrivyScannerService {
             String scanResult = executeTrivyScan(tempDir);
             log.info("[TrivyScanner] Trivy 스캔 완료");
 
-            return new ScanResult(scanResult, runtimeContext, prguardConfig, manifestPackages, projectEnvironment);
+            return new ScanResult(scanResult, runtimeContext, prguardConfig, manifestPackages, projectEnvironment, externalServices);
         } catch (Exception e) {
             log.error("[TrivyScanner] 스캔 파이프라인 수행 실패: {}", e.getMessage(), e);
             throw new RuntimeException("Trivy 스캔 실패: " + e.getMessage(), e);

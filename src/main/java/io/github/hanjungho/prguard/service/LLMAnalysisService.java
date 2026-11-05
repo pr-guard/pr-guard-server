@@ -32,11 +32,22 @@ import java.util.Set;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class LLMAnalysisService {
 
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
+    private final CycloneDxSbomService cycloneDxSbomService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public LLMAnalysisService(ObjectMapper objectMapper, RestTemplate restTemplate, CycloneDxSbomService cycloneDxSbomService) {
+        this.objectMapper = objectMapper;
+        this.restTemplate = restTemplate;
+        this.cycloneDxSbomService = cycloneDxSbomService;
+    }
+
+    public LLMAnalysisService(ObjectMapper objectMapper, RestTemplate restTemplate) {
+        this(objectMapper, restTemplate, new CycloneDxSbomService(objectMapper));
+    }
 
     private static final int MAX_CACHE_SIZE = 500;
 
@@ -90,11 +101,11 @@ public class LLMAnalysisService {
             String purl) {
 
         public SbomPackageDetail(String name, String version, boolean indirect, String license) {
-            this(name, version, indirect, license, CycloneDxSbomService.generatePurl(name, version, license));
+            this(name, version, indirect, license, "");
         }
 
         public SbomPackageDetail(String name, String version, boolean indirect) {
-            this(name, version, indirect, "-", CycloneDxSbomService.generatePurl(name, version, "-"));
+            this(name, version, indirect, "-", "");
         }
     }
 
@@ -242,8 +253,22 @@ public class LLMAnalysisService {
     public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
                                                  PrguardConfig config, List<SbomPackageDetail> manifestPackages,
                                                  String projectEnvironment) {
-        log.info("[LLMAnalysis] 종합 보안 분석 시작 (프로젝트 환경: {}, 커스텀 정책: {}, 매니페스트 패키지: {}개)",
+        return analyzeVulnerabilities(rawTrivyJson, prDiff, runtimeContext, config, manifestPackages,
+                projectEnvironment, Collections.emptyList(), null, null);
+    }
+
+    /**
+     * 외부 SaaS 연동 서비스 및 GitHub 레포지토리/PR 식별자를 포함한 OWASP CycloneDX v1.5 연계 종합 보안 분석
+     */
+    public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
+                                                 PrguardConfig config, List<SbomPackageDetail> manifestPackages,
+                                                 String projectEnvironment,
+                                                 List<CycloneDxSbomService.ExternalServiceDetail> externalServices,
+                                                 String repoFullName,
+                                                 Integer prNumber) {
+        log.info("[LLMAnalysis] 종합 보안 분석 시작 (프로젝트 환경: {}, 외부서비스: {}개, 커스텀 정책: {}, 매니페스트 패키지: {}개)",
                 projectEnvironment != null ? projectEnvironment : "미지정",
+                externalServices != null ? externalServices.size() : 0,
                 config != null && !config.toSummaryString().contains("예외 룰 없음"),
                 manifestPackages != null ? manifestPackages.size() : 0);
 
@@ -297,19 +322,37 @@ public class LLMAnalysisService {
             );
         }
 
-        log.info("[LLMAnalysis] 스캔 집계 결과: 환경 [{}], SBOM 총 {}개(직접 {}, 간접 {}), CVE 총 {}건, Misconfig {}건, Secret {}건",
+        log.info("[LLMAnalysis] 스캔 집계 결과: 환경 [{}], SBOM 총 {}개(직접 {}, 간접 {}), 외부서비스 {}개, CVE 총 {}건, Misconfig {}건, Secret {}건",
                 projectEnvironment != null ? projectEnvironment : "미지정",
                 summaryPayload.sbomStats().totalCount(),
                 summaryPayload.sbomStats().directCount(),
                 summaryPayload.sbomStats().transitiveCount(),
+                externalServices != null ? externalServices.size() : 0,
                 summaryPayload.totalVulnerabilitiesCount(),
                 summaryPayload.totalMisconfigCount(),
                 summaryPayload.totalSecretCount());
 
         boolean hasCodeDiff = prDiff != null && !prDiff.isBlank() && !prDiff.contains("(PR 변경 코드 Diff가 비어 있습니다)");
 
-        // 2. Java 단에서 직접 전체 SBOM 패키지 토글 마크다운 생성 (LLM 토큰 0 소모)
-        String sbomMarkdownTable = generateSbomMarkdownTable(summaryPayload.sbomPackages(), projectEnvironment);
+        // 1-2. 기계 판독형 CycloneDX v1.5 JSON 생성 및 REST 캐시 등록
+        String cycloneDxJson = null;
+        if (cycloneDxSbomService != null) {
+            cycloneDxJson = cycloneDxSbomService.buildCycloneDxJson(
+                    repoFullName,
+                    prNumber,
+                    projectEnvironment,
+                    summaryPayload.sbomPackages(),
+                    summaryPayload.topVulnerabilities(),
+                    externalServices
+            );
+        }
+
+        // 2. Java 단에서 직접 전체 SBOM 4-카테고리 상세 마크다운 생성 (LLM 토큰 0 소모)
+        String sbomMarkdownTable = (cycloneDxSbomService != null)
+                ? cycloneDxSbomService.renderSbomMarkdownReport(
+                        repoFullName, prNumber, projectEnvironment, runtimeContext,
+                        summaryPayload.sbomPackages(), externalServices, cycloneDxJson)
+                : generateSbomMarkdownTable(summaryPayload.sbomPackages(), projectEnvironment);
 
         // ⚡ 입력 컨텍스트(요약 JSON + Diff + 런타임 + 설정 + 프로젝트 환경) SHA-256 메모이제이션 캐시 조회
         String cacheKey = computeSha256(
@@ -317,7 +360,9 @@ public class LLMAnalysisService {
                 prDiff != null ? prDiff : "",
                 runtimeContext != null ? runtimeContext : "",
                 config != null ? config.toSummaryString() : "",
-                projectEnvironment != null ? projectEnvironment : ""
+                projectEnvironment != null ? projectEnvironment : "",
+                String.valueOf(repoFullName),
+                String.valueOf(prNumber)
         );
 
         AnalysisOutcome cached = reportCache.get(cacheKey);
@@ -445,6 +490,14 @@ public class LLMAnalysisService {
      * LLM 토큰 비용을 0으로 유지합니다 (최대 200개 제한 안전장치 적용).
      */
     public String generateSbomMarkdownTable(List<SbomPackageDetail> packages, String projectEnvironment) {
+        if (cycloneDxSbomService != null) {
+            return cycloneDxSbomService.renderSbomMarkdownReport(
+                    null, null, projectEnvironment, null, packages, Collections.emptyList(), null);
+        }
+        return fallbackSbomMarkdownTable(packages, projectEnvironment);
+    }
+
+    private String fallbackSbomMarkdownTable(List<SbomPackageDetail> packages, String projectEnvironment) {
         if (packages == null || packages.isEmpty()) {
             return """
                     <details>

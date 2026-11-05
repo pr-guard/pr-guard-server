@@ -34,14 +34,15 @@ public class WebhookController {
 
     @org.springframework.beans.factory.annotation.Autowired
     public WebhookController(SecurityScanPipeline securityScanPipeline, GitHubBotService gitHubBotService,
-                             ObjectMapper objectMapper, io.github.hanjungho.prguard.service.CycloneDxSbomService cycloneDxSbomService) {
+            ObjectMapper objectMapper, io.github.hanjungho.prguard.service.CycloneDxSbomService cycloneDxSbomService) {
         this.securityScanPipeline = securityScanPipeline;
         this.gitHubBotService = gitHubBotService;
         this.objectMapper = objectMapper;
         this.cycloneDxSbomService = cycloneDxSbomService;
     }
 
-    public WebhookController(SecurityScanPipeline securityScanPipeline, GitHubBotService gitHubBotService, ObjectMapper objectMapper) {
+    public WebhookController(SecurityScanPipeline securityScanPipeline, GitHubBotService gitHubBotService,
+            ObjectMapper objectMapper) {
         this(securityScanPipeline, gitHubBotService, objectMapper, null);
     }
 
@@ -60,21 +61,22 @@ public class WebhookController {
     }
 
     /**
-     * OWASP CycloneDX v1.5 표준 규격 기계 판독형 SBOM(Software Bill of Materials) JSON 다운로드 엔드포인트
+     * OWASP CycloneDX v1.5 표준 규격 기계 판독형 SBOM(Software Bill of Materials) JSON 다운로드
+     * 엔드포인트
      */
-    @GetMapping(value = {"/sbom/{owner}/{repo}/{prNumber}", "/sbom/{owner}/{repo}/{prNumber}.json"},
-            produces = "application/vnd.cyclonedx+json;charset=UTF-8")
+    @GetMapping(value = { "/sbom/{owner}/{repo}/{prNumber}",
+            "/sbom/{owner}/{repo}/{prNumber}.json" }, produces = "application/vnd.cyclonedx+json;charset=UTF-8")
     public ResponseEntity<String> getCycloneDxSbom(
             @org.springframework.web.bind.annotation.PathVariable("owner") String owner,
             @org.springframework.web.bind.annotation.PathVariable("repo") String repo,
-            @org.springframework.web.bind.annotation.PathVariable("prNumber") Integer prNumber
-    ) {
+            @org.springframework.web.bind.annotation.PathVariable("prNumber") Integer prNumber) {
         String repoFullName = owner + "/" + repo;
         String sbomJson = (cycloneDxSbomService != null) ? cycloneDxSbomService.getSbom(repoFullName, prNumber) : null;
         if (sbomJson == null || sbomJson.isBlank()) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND)
                     .header("Content-Type", "application/json;charset=UTF-8")
-                    .body("{\"error\": \"SBOM not found for " + repoFullName + " PR #" + prNumber + ". 스캔이 아직 진행 중이거나 만료되었습니다.\"}");
+                    .body("{\"error\": \"SBOM not found for " + repoFullName + " PR #" + prNumber
+                            + ". 스캔이 아직 진행 중이거나 만료되었습니다.\"}");
         }
         return ResponseEntity.ok(sbomJson);
     }
@@ -86,8 +88,7 @@ public class WebhookController {
     @PostMapping("/webhook")
     public ResponseEntity<String> receiveWebhook(
             @RequestHeader(value = "X-Hub-Signature-256", required = false) String signatureHeader,
-            @RequestBody byte[] rawPayload
-    ) {
+            @RequestBody byte[] rawPayload) {
         // 1. HMAC SHA-256 서명 검증
         if (!isSignatureValid(signatureHeader, rawPayload)) {
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid or missing HMAC signature");
@@ -138,15 +139,15 @@ public class WebhookController {
 
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec secretKey = new SecretKeySpec(webhookSecret.trim().getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+            SecretKeySpec secretKey = new SecretKeySpec(webhookSecret.trim().getBytes(StandardCharsets.UTF_8),
+                    "HmacSHA256");
             mac.init(secretKey);
             byte[] computedHash = mac.doFinal(rawPayload);
             String expectedSignature = "sha256=" + HexFormat.of().formatHex(computedHash);
 
             boolean matched = MessageDigest.isEqual(
                     expectedSignature.getBytes(StandardCharsets.UTF_8),
-                    signatureHeader.getBytes(StandardCharsets.UTF_8)
-            );
+                    signatureHeader.getBytes(StandardCharsets.UTF_8));
             if (!matched) {
                 log.warn("[Webhook] HMAC 서명 불일치 (위조되거나 변조된 요청 차단)");
             }
@@ -175,7 +176,8 @@ public class WebhookController {
     }
 
     private ResponseEntity<String> handleIssueCommentEvent(GithubWebhookPayload payload) {
-        if (!"created".equalsIgnoreCase(payload.getAction()) || payload.getIssue() == null || !payload.getIssue().isPullRequest()) {
+        if (!"created".equalsIgnoreCase(payload.getAction()) || payload.getIssue() == null
+                || !payload.getIssue().isPullRequest()) {
             return null;
         }
 
@@ -183,12 +185,15 @@ public class WebhookController {
             return null;
         }
 
-        if (payload.getComment().getUser() != null && "Bot".equalsIgnoreCase(payload.getComment().getUser().getType())) {
+        if (payload.getComment().getUser() != null
+                && "Bot".equalsIgnoreCase(payload.getComment().getUser().getType())) {
             log.info("[Webhook] Bot이 작성한 댓글이므로 스킵합니다.");
             return ResponseEntity.ok("Ignored bot comment");
         }
 
-        String commentBody = payload.getComment().getBody() != null ? payload.getComment().getBody().trim().toLowerCase() : "";
+        String commentBody = payload.getComment().getBody() != null
+                ? payload.getComment().getBody().trim().toLowerCase()
+                : "";
         String prefix = "@" + getEffectiveBotName().toLowerCase();
         String repoFullName = resolveRepoFullName(payload);
         Integer prNumber = payload.getIssue().getNumber();
@@ -201,7 +206,8 @@ public class WebhookController {
         }
 
         if (isRescanCommand(commentBody, prefix)) {
-            log.info("[Webhook] ChatOps 재스캔 명령어 감지! (Repo: {}, PR #{}, Comment: '{}')", repoFullName, prNumber, commentBody);
+            log.info("[Webhook] ChatOps 재스캔 명령어 감지! (Repo: {}, PR #{}, Comment: '{}')", repoFullName, prNumber,
+                    commentBody);
             securityScanPipeline.executeRescanAsync(payload);
             return ResponseEntity.accepted().body("Rescan command scheduled successfully");
         }
@@ -215,9 +221,11 @@ public class WebhookController {
         }
 
         Integer targetPrNumber = null;
-        if (payload.getCheckRun() != null && payload.getCheckRun().getPullRequests() != null && !payload.getCheckRun().getPullRequests().isEmpty()) {
+        if (payload.getCheckRun() != null && payload.getCheckRun().getPullRequests() != null
+                && !payload.getCheckRun().getPullRequests().isEmpty()) {
             targetPrNumber = payload.getCheckRun().getPullRequests().get(0).getNumber();
-        } else if (payload.getCheckSuite() != null && payload.getCheckSuite().getPullRequests() != null && !payload.getCheckSuite().getPullRequests().isEmpty()) {
+        } else if (payload.getCheckSuite() != null && payload.getCheckSuite().getPullRequests() != null
+                && !payload.getCheckSuite().getPullRequests().isEmpty()) {
             targetPrNumber = payload.getCheckSuite().getPullRequests().get(0).getNumber();
         }
 
@@ -235,13 +243,13 @@ public class WebhookController {
     private void postHelpGuide(String repoFullName, Integer prNumber, Long installationId, String botPrefix) {
         String helpGuide = """
                 ### 🛡️ PR Guard 봇 사용 가이드
-                
+
                 PR Guard는 Pull Request에 대한 자동화된 보안 검증 및 취약점 통제를 수행합니다.
-                
+
                 **사용 가능한 명령어:**
                 - `%s rescan` 또는 `/rescan`: 현재 PR의 소스코드 및 의존성에 대한 보안 재스캔을 즉시 실행합니다.
                 - `%s help` 또는 `/help`: 이 도움말 메시지를 출력합니다.
-                
+
                 **제공 기능:**
                 - 🔍 **오픈소스 CVE 취약점 분석**: 알려진 보안 취약점 전수 검사 및 SBOM 인벤토리 제공
                 - 🔑 **하드코딩된 시크릿 노출 감지**: 코드 내 API 키/토큰 노출 시 해당 코드 라인에 인라인 경고 등록
@@ -257,11 +265,13 @@ public class WebhookController {
 
     private boolean isRescanCommand(String body, String prefix) {
         return body.contains(prefix + " rescan") || body.contains("@prguard rescan")
-                || body.startsWith("/rescan") || body.contains(prefix + " /rescan") || body.contains("@prguard /rescan");
+                || body.startsWith("/rescan") || body.contains(prefix + " /rescan")
+                || body.contains("@prguard /rescan");
     }
 
     private String resolveCloneUrl(GithubWebhookPayload payload) {
-        if (payload.getPullRequest() != null && payload.getPullRequest().getHead() != null && payload.getPullRequest().getHead().getRepo() != null) {
+        if (payload.getPullRequest() != null && payload.getPullRequest().getHead() != null
+                && payload.getPullRequest().getHead().getRepo() != null) {
             return payload.getPullRequest().getHead().getRepo().getCloneUrl();
         }
         return payload.getRepository() != null ? payload.getRepository().getCloneUrl() : null;

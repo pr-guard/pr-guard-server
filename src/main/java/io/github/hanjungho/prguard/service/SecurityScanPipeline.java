@@ -224,12 +224,14 @@ public class SecurityScanPipeline {
 
         String prDiff = prDiffFuture.join();
 
-        log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 추출 패키지: {}개, 환경: {})",
+        log.info("[Pipeline] Step 3: Gemini AI 종합 보안 분석 진행 중... (매니페스트 패키지: {}개, 외부서비스: {}개, 환경: {})",
                 scanResult.manifestPackages() != null ? scanResult.manifestPackages().size() : 0,
+                scanResult.externalServices() != null ? scanResult.externalServices().size() : 0,
                 scanResult.projectEnvironment());
         LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
                 scanResult.scanJson(), prDiff, scanResult.runtimeContext(), scanResult.config(),
-                scanResult.manifestPackages(), scanResult.projectEnvironment());
+                scanResult.manifestPackages(), scanResult.projectEnvironment(),
+                scanResult.externalServices(), target.fullName(), target.prNumber());
 
         // CycloneDX v1.5 JSON 생성 및 캐싱 (REST API /api/sbom/{owner}/{repo}/{prNumber} 서빙용)
         if (cycloneDxSbomService != null && outcome.summaryPayload() != null) {

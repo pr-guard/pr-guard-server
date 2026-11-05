@@ -9,10 +9,16 @@ import org.springframework.stereotype.Service;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,7 +29,7 @@ import java.util.UUID;
  * OWASP CycloneDX v1.5 표준 규격을 완벽히 준수하는 기계 판독형 SBOM(Software Bill of Materials) 엔진.
  * 미국 백악관 행정명령(EO 14028) 및 NTIA Minimum Elements for SBOM 규격에 따라
  * 고유 PURL(Package URL), SPDX 라이선스, SHA-256 무결성 해시, 프로젝트 환경 메타데이터 및
- * 직접/간접(전이) 의존성 관계 트리를 국제 표준 JSON 형식으로 생성하고 REST API로 제공합니다.
+ * 직접/간접(전이) 의존성 관계 트리, 외부 SaaS 연동 서비스를 국제 표준 JSON 형식으로 생성하고 REST API로 제공합니다.
  */
 @Slf4j
 @Service
@@ -33,6 +39,16 @@ public class CycloneDxSbomService {
     private final ObjectMapper objectMapper;
 
     private static final int MAX_CACHE_SIZE = 200;
+
+    /**
+     * 외부 SaaS 연동 서비스 상세 레코드 (CycloneDX 1.5 'services' 컴포넌트 대응)
+     */
+    public record ExternalServiceDetail(
+            String name,
+            String provider,
+            String endpoint,
+            String dataClassification
+    ) {}
 
     /**
      * 최근 생성된 CycloneDX SBOM JSON 메모이제이션 캐시 (REST API 조회용)
@@ -56,7 +72,7 @@ public class CycloneDxSbomService {
             return "";
         }
 
-        String safeVersion = (version != null && !version.isBlank() && !"(managed)".equals(version))
+        String safeVersion = (version != null && !version.isBlank() && !"(managed)".equals(version) && !"BOM-managed".equals(version))
                 ? version.trim()
                 : "unknown";
 
@@ -126,14 +142,118 @@ public class CycloneDxSbomService {
     }
 
     /**
-     * 수집된 패키지 및 취약점 정보를 바탕으로 CycloneDX v1.5 JSON 규격의 SBOM을 동적으로 생성합니다.
+     * 저장소 내 실제 코드 및 설정 파일(application.properties, .env, Dockerfile 등)을 정밀 스캔하여
+     * 통신 중인 외부 SaaS 및 타사 서비스 엔드포인트를 자동 감지합니다.
      */
+    public List<ExternalServiceDetail> detectExternalServices(Path rootDir) {
+        if (rootDir == null || !Files.exists(rootDir)) {
+            return Collections.emptyList();
+        }
+
+        Map<String, ExternalServiceDetail> detected = new LinkedHashMap<>();
+
+        try {
+            Files.walkFileTree(rootDir, new SimpleFileVisitor<>() {
+                private int scannedFiles = 0;
+
+                @Override
+                public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
+                    String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
+                    if (name.startsWith(".") || name.equals("node_modules") || name.equals("build")
+                            || name.equals("target") || name.equals(".git") || name.equals("gradle")) {
+                        if (!name.equals(".")) return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                    if (++scannedFiles > 200) {
+                        return FileVisitResult.TERMINATE;
+                    }
+                    String lower = file.getFileName().toString().toLowerCase();
+                    if (lower.endsWith(".properties") || lower.endsWith(".yml") || lower.endsWith(".yaml")
+                            || lower.endsWith(".json") || lower.endsWith(".java") || lower.endsWith(".ts")
+                            || lower.endsWith(".js") || lower.endsWith(".py") || lower.endsWith(".go")
+                            || lower.endsWith(".cs") || lower.equals(".env") || lower.startsWith(".env.")) {
+                        try {
+                            String content = Files.readString(file, StandardCharsets.UTF_8);
+                            checkContentForServices(content, detected);
+                        } catch (Exception ignored) {}
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        } catch (Exception e) {
+            log.debug("[CycloneDx] 외부 서비스 탐색 중 경고: {}", e.getMessage());
+        }
+
+        return new ArrayList<>(detected.values());
+    }
+
+    private void checkContentForServices(String content, Map<String, ExternalServiceDetail> map) {
+        if (content.contains("generativelanguage.googleapis.com") || (content.contains("gemini") && content.contains("api.url"))) {
+            map.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
+                    "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+        }
+        if (content.contains("api.github.com") || content.contains("github.com/api")) {
+            map.putIfAbsent("GitHub API", new ExternalServiceDetail(
+                    "GitHub REST & Checks API", "GitHub / Microsoft", "https://api.github.com", "Check Run 상태 동기화 및 PR 코멘트 등록"));
+        }
+        if (content.contains("api.openai.com")) {
+            map.putIfAbsent("OpenAI API", new ExternalServiceDetail(
+                    "OpenAI API", "OpenAI", "https://api.openai.com", "LLM 인퍼런스 프롬프트 및 완성 데이터"));
+        }
+        if (content.contains("api.tosspayments.com") || content.contains("tosspayments")) {
+            map.putIfAbsent("Toss Payments", new ExternalServiceDetail(
+                    "Toss Payments", "비바리퍼블리카", "https://api.tosspayments.com", "전자결제 주문 및 결제 승인 데이터 (PCI-DSS)"));
+        }
+        if (content.contains("api.stripe.com")) {
+            map.putIfAbsent("Stripe", new ExternalServiceDetail(
+                    "Stripe Payments", "Stripe", "https://api.stripe.com", "결제 트랜잭션 및 인증 토큰"));
+        }
+        if (content.contains("kapi.kakao.com")) {
+            map.putIfAbsent("Kakao API", new ExternalServiceDetail(
+                    "Kakao API", "카카오", "https://kapi.kakao.com", "사용자 계정 인증 및 소셜 연동"));
+        }
+        if (content.contains(".amazonaws.com")) {
+            map.putIfAbsent("AWS", new ExternalServiceDetail(
+                    "Amazon Web Services (AWS)", "Amazon", "https://*.amazonaws.com", "클라우드 스토리지 / 백엔드 인프라 자원"));
+        }
+        if (content.contains("firebaseio.com") || content.contains("firestore.googleapis.com")) {
+            map.putIfAbsent("Firebase", new ExternalServiceDetail(
+                    "Firebase", "Google Cloud", "https://*.firebaseio.com", "실시간 데이터베이스 및 푸시 알림"));
+        }
+        if (content.contains(".ingest.sentry.io") || content.contains("sentry.io")) {
+            map.putIfAbsent("Sentry", new ExternalServiceDetail(
+                    "Sentry Error Tracking", "Functional Software", "https://*.ingest.sentry.io", "애플리케이션 런타임 에러 스택 트레이스"));
+        }
+        if (content.contains("hooks.slack.com")) {
+            map.putIfAbsent("Slack", new ExternalServiceDetail(
+                    "Slack Webhook", "Salesforce", "https://hooks.slack.com", "CI/CD 빌드 알림 메시지"));
+        }
+    }
+
     public String buildCycloneDxJson(
             String repoFullName,
             Integer prNumber,
             String projectEnvironment,
             List<LLMAnalysisService.SbomPackageDetail> packages,
             List<LLMAnalysisService.VulnerabilityDetail> vulnerabilities
+    ) {
+        return buildCycloneDxJson(repoFullName, prNumber, projectEnvironment, packages, vulnerabilities, Collections.emptyList());
+    }
+
+    /**
+     * 수집된 패키지, 외부 SaaS 서비스 및 취약점 정보를 바탕으로 CycloneDX v1.5 JSON 규격의 SBOM을 동적으로 생성합니다.
+     */
+    public String buildCycloneDxJson(
+            String repoFullName,
+            Integer prNumber,
+            String projectEnvironment,
+            List<LLMAnalysisService.SbomPackageDetail> packages,
+            List<LLMAnalysisService.VulnerabilityDetail> vulnerabilities,
+            List<ExternalServiceDetail> externalServices
     ) {
         ObjectNode root = objectMapper.createObjectNode();
 
@@ -186,14 +306,14 @@ public class CycloneDxSbomService {
                 ObjectNode comp = components.addObject();
                 comp.put("type", "library");
 
-                String purl = (pkg.purl() != null && !pkg.purl().isBlank())
+                String purl = (pkg.purl() != null && !pkg.purl().isBlank() && !pkg.purl().startsWith("pkg:generic/"))
                         ? pkg.purl()
-                        : generatePurl(pkg.name(), pkg.version(), pkg.license());
+                        : generatePurl(pkg.name(), pkg.version(), (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : pkg.license());
 
                 comp.put("bom-ref", purl);
                 comp.put("name", pkg.name());
 
-                String ver = (pkg.version() != null && !pkg.version().isBlank() && !"(managed)".equals(pkg.version()))
+                String ver = (pkg.version() != null && !pkg.version().isBlank() && !"(managed)".equals(pkg.version()) && !"BOM-managed".equals(pkg.version()))
                         ? pkg.version()
                         : "unknown";
                 comp.put("version", ver);
@@ -221,7 +341,28 @@ public class CycloneDxSbomService {
             }
         }
 
-        // 4. Vulnerabilities (검출된 취약점이 있을 경우 CycloneDX VEX 형태로 연계)
+        // 4. Services (외부 연동 SaaS / API 자산 등록 - CycloneDX 1.5 규격)
+        if (externalServices != null && !externalServices.isEmpty()) {
+            ArrayNode servicesArray = root.putArray("services");
+            for (ExternalServiceDetail s : externalServices) {
+                ObjectNode sNode = servicesArray.addObject();
+                sNode.put("bom-ref", "service:" + s.name().toLowerCase().replaceAll("[^a-z0-9]", "-"));
+                sNode.put("name", s.name());
+
+                ArrayNode endpoints = sNode.putArray("endpoints");
+                endpoints.add(s.endpoint());
+
+                ObjectNode provider = sNode.putObject("provider");
+                provider.put("name", s.provider());
+
+                ArrayNode data = sNode.putArray("data");
+                ObjectNode dNode = data.addObject();
+                dNode.put("flow", "bi-directional");
+                dNode.put("classification", s.dataClassification());
+            }
+        }
+
+        // 5. Vulnerabilities (검출된 취약점이 있을 경우 CycloneDX VEX 형태로 연계)
         if (vulnerabilities != null && !vulnerabilities.isEmpty()) {
             ArrayNode vulnsArray = root.putArray("vulnerabilities");
             for (LLMAnalysisService.VulnerabilityDetail vuln : vulnerabilities) {
@@ -261,6 +402,220 @@ public class CycloneDxSbomService {
         }
 
         return jsonResult;
+    }
+
+    /**
+     * CycloneDX SBOM 데이터를 인간이 읽기 가장 편한 최적의 4-카테고리 마크다운 리포트로 렌더링합니다.
+     * ① 런타임 및 빌드 환경 (Environment)
+     * ② 오픈소스 및 패키지 의존성 (Dependencies - Direct vs Transitive)
+     * ③ 외부 연동 서비스 및 SaaS 자산 (External Services)
+     * ④ 무결성 원본 데이터 및 기계 판독 다운로드 링크 (Integrity & Download)
+     */
+    public String renderSbomMarkdownReport(
+            String repoFullName,
+            Integer prNumber,
+            String projectEnvironment,
+            String runtimeContext,
+            List<LLMAnalysisService.SbomPackageDetail> packages,
+            List<ExternalServiceDetail> externalServices,
+            String cycloneDxJson
+    ) {
+        int totalPackages = (packages != null) ? packages.size() : 0;
+        int totalServices = (externalServices != null) ? externalServices.size() : 0;
+        int totalCount = totalPackages + totalServices;
+
+        if (totalCount == 0) {
+            return """
+                    <details>
+                    <summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (등록된 외부 의존성 없음)</b></summary>
+
+                    > **구성 요소 정보 없음:** 대상 레포지토리에 외부 의존성 매니페스트 파일 또는 패키지가 존재하지 않습니다.
+
+                    </details>""";
+        }
+
+        List<LLMAnalysisService.SbomPackageDetail> directPackages = new ArrayList<>();
+        List<LLMAnalysisService.SbomPackageDetail> indirectPackages = new ArrayList<>();
+
+        if (packages != null) {
+            for (LLMAnalysisService.SbomPackageDetail pkg : packages) {
+                if (pkg.indirect()) {
+                    indirectPackages.add(pkg);
+                } else {
+                    directPackages.add(pkg);
+                }
+            }
+        }
+
+        String nowIso = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
+        String sha256 = (cycloneDxJson != null && !cycloneDxJson.isBlank())
+                ? computeSha256(cycloneDxJson)
+                : computeSha256(packages.toString());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("<details>\n");
+        sb.append("<summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 ").append(totalCount).append("개)</b></summary>\n\n");
+
+        sb.append("> **SBOM 규격:** OWASP CycloneDX v1.5 JSON | **분석 도구:** PR Guard v1.0.0 | **수집 일시:** ").append(nowIso).append("\n");
+        if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment) && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
+            sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("\n");
+        }
+        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directPackages.size()).append("개 / 간접 의존성 ").append(indirectPackages.size()).append("개");
+        if (totalServices > 0) {
+            sb.append(" / 외부 연동 서비스 ").append(totalServices).append("개");
+        }
+        sb.append("\n");
+        sb.append("> **의존성 구분 기준:** 직접 의존성(Direct)은 개발자가 매니페스트에 직접 선언한 라이브러리이며, 간접 의존성(Transitive)은 런타임 종속 패키지(취약점의 80% 이상 발생)입니다.\n");
+        sb.append("> **표준 규격:** OWASP CycloneDX v1.5 JSON 및 Package URL (purl) 지원\n\n");
+
+        // -------------------------------------------------------------
+        // 카테고리 1: 런타임 및 빌드 환경 (Environment)
+        // -------------------------------------------------------------
+        sb.append("---\n\n### 1. 런타임 및 빌드 환경 (Environment)\n\n");
+        sb.append("| 항목 | 명칭 및 환경 정보 | 비고 |\n");
+        sb.append("| :--- | :--- | :--- |\n");
+
+        String langEnv = (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "표준 프로젝트";
+        sb.append("| **언어 및 런타임** | `").append(extractLanguage(langEnv)).append("` | 핵심 프로그래밍 실행 환경 |\n");
+        sb.append("| **빌드 도구 / 패키지 매니저** | `").append(extractBuildTool(langEnv)).append("` | 의존성 해결 및 패키징 엔진 |\n");
+        sb.append("| **핵심 프레임워크** | `").append(extractFramework(langEnv)).append("` | 애플리케이션 프레임워크 |\n");
+
+        String containerInfo = extractContainerOrCi(runtimeContext);
+        sb.append("| **배포 컨테이너 / 인프라** | `").append(containerInfo).append("` | 런타임 베이스 이미지 / CI |\n\n");
+
+        // -------------------------------------------------------------
+        // 카테고리 2: 오픈소스 및 패키지 의존성 (Dependencies)
+        // -------------------------------------------------------------
+        sb.append("---\n\n### 2. 오픈소스 및 패키지 의존성 (Dependencies)\n\n");
+
+        // 가. 직접 의존성 표 (Direct Dependencies)
+        sb.append("#### 직접 의존성 (Direct Dependencies - ").append(directPackages.size()).append("개)\n\n");
+        if (directPackages.isEmpty()) {
+            sb.append("*(등록된 직접 의존성이 없습니다)*\n\n");
+        } else {
+            sb.append("| 패키지명 | 설치된 버전 | 라이선스 | 식별자 (PURL) |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
+            int maxRender = 200;
+            int limit = Math.min(directPackages.size(), maxRender);
+            for (int i = 0; i < limit; i++) {
+                LLMAnalysisService.SbomPackageDetail pkg = directPackages.get(i);
+                String ver = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
+                String lic = pkg.license().isBlank() ? "-" : pkg.license();
+                String resolvedPurl = (pkg.purl() != null && !pkg.purl().isBlank() && !pkg.purl().startsWith("pkg:generic/"))
+                        ? pkg.purl()
+                        : generatePurl(pkg.name(), pkg.version(), projectEnvironment);
+                String purl = (resolvedPurl != null && !resolvedPurl.isBlank()) ? "`" + resolvedPurl + "`" : "-";
+                sb.append("| `").append(pkg.name()).append("` | ").append(ver).append(" | ").append(lic).append(" | ").append(purl).append(" |\n");
+            }
+            if (directPackages.size() > maxRender) {
+                sb.append("| ... | 외 ").append(directPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
+            }
+            sb.append("\n");
+        }
+
+        // 나. 간접 전이 의존성 표 (Transitive Dependencies)
+        sb.append("#### 간접 의존성 (Transitive Dependencies - ").append(indirectPackages.size()).append("개)\n\n");
+        if (indirectPackages.isEmpty()) {
+            sb.append("*(등록된 간접 의존성이 없습니다)*\n\n");
+        } else {
+            sb.append("| 패키지명 | 설치된 버전 | 라이선스 | 식별자 (PURL) |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
+            int maxRender = 200;
+            int limit = Math.min(indirectPackages.size(), maxRender);
+            for (int i = 0; i < limit; i++) {
+                LLMAnalysisService.SbomPackageDetail pkg = indirectPackages.get(i);
+                String ver = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
+                String lic = pkg.license().isBlank() ? "-" : pkg.license();
+                String resolvedPurl = (pkg.purl() != null && !pkg.purl().isBlank() && !pkg.purl().startsWith("pkg:generic/"))
+                        ? pkg.purl()
+                        : generatePurl(pkg.name(), pkg.version(), projectEnvironment);
+                String purl = (resolvedPurl != null && !resolvedPurl.isBlank()) ? "`" + resolvedPurl + "`" : "-";
+                sb.append("| `").append(pkg.name()).append("` | ").append(ver).append(" | ").append(lic).append(" | ").append(purl).append(" |\n");
+            }
+            if (indirectPackages.size() > maxRender) {
+                sb.append("| ... | 외 ").append(indirectPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
+            }
+            sb.append("\n");
+        }
+
+        // -------------------------------------------------------------
+        // 카테고리 3: 외부 연동 서비스 및 SaaS 자산 (External Services)
+        // -------------------------------------------------------------
+        sb.append("---\n\n### 3. 외부 연동 서비스 및 SaaS 자산 (External Services)\n\n");
+        if (externalServices == null || externalServices.isEmpty()) {
+            sb.append("*(코드 및 설정에서 감지된 외부 SaaS 연동 서비스 없음)*\n\n");
+        } else {
+            sb.append("| 서비스명 | 제공자 (Provider) | 통신 엔드포인트 | 데이터 성격 / 민감도 |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
+            for (ExternalServiceDetail s : externalServices) {
+                sb.append("| `").append(s.name()).append("` | ").append(s.provider()).append(" | `").append(s.endpoint()).append("` | ").append(s.dataClassification()).append(" |\n");
+            }
+            sb.append("\n");
+        }
+
+        // -------------------------------------------------------------
+        // 카테고리 4: 무결성 검증 및 기계 판독 데이터 (Integrity & Raw Data Link)
+        // -------------------------------------------------------------
+        sb.append("---\n\n### 4. 무결성 원본 데이터 및 기계 판독 다운로드\n\n");
+        if (repoFullName != null && prNumber != null) {
+            String downloadUrl = "https://prguard.onrender.com/api/sbom/" + repoFullName + "/" + prNumber;
+            sb.append("- **기계 판독용 원본 다운로드:** [📥 CycloneDX v1.5 JSON 다운로드](").append(downloadUrl).append(")\n");
+            sb.append("- **SHA-256 무결성 해시:** `").append(sha256).append("`\n");
+            sb.append("- **CLI 원클릭 조회:**\n");
+            sb.append("  ```bash\n");
+            sb.append("  curl -s ").append(downloadUrl).append(" | jq .\n");
+            sb.append("  ```\n\n");
+        } else {
+            sb.append("- **SHA-256 무결성 해시:** `").append(sha256).append("`\n\n");
+        }
+
+        sb.append("</details>");
+        return sb.toString();
+    }
+
+    private String extractLanguage(String projectEnv) {
+        if (projectEnv == null || projectEnv.isBlank() || "미지정".equals(projectEnv)) {
+            return "알 수 없음";
+        }
+        int slashIdx = projectEnv.indexOf('/');
+        String first = (slashIdx > 0) ? projectEnv.substring(0, slashIdx).trim() : projectEnv.trim();
+        int parenIdx = first.indexOf('(');
+        return (parenIdx > 0) ? first.substring(0, parenIdx).trim() : first;
+    }
+
+    private String extractBuildTool(String projectEnv) {
+        if (projectEnv == null) return "미지정";
+        int start = projectEnv.indexOf('(');
+        int end = projectEnv.indexOf(')');
+        if (start >= 0 && end > start) {
+            return projectEnv.substring(start + 1, end).trim();
+        }
+        return "미지정";
+    }
+
+    private String extractFramework(String projectEnv) {
+        if (projectEnv == null) return "미지정";
+        int slashIdx = projectEnv.indexOf('/');
+        if (slashIdx > 0 && slashIdx + 1 < projectEnv.length()) {
+            return projectEnv.substring(slashIdx + 1).trim();
+        }
+        return "미지정";
+    }
+
+    private String extractContainerOrCi(String runtimeContext) {
+        if (runtimeContext == null || runtimeContext.isBlank()) {
+            return "클라우드 네이티브 / Bare Metal";
+        }
+        for (String line : runtimeContext.split("\\r?\\n")) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith("FROM ")) {
+                return "Docker (" + trimmed.substring(5).trim() + ")";
+            }
+        }
+        if (runtimeContext.contains("node:")) {
+            return "Node Container";
+        }
+        return "클라우드 네이티브 / Bare Metal";
     }
 
     /**
