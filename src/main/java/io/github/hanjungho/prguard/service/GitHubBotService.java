@@ -24,7 +24,10 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.PrivateKey;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -579,17 +582,44 @@ public class GitHubBotService {
     }
 
     /**
+     * Check Run 코드 라인별 어노테이션(Inline Annotation) 레코드
+     */
+    public record CheckRunAnnotation(
+            String path,
+            int startLine,
+            int endLine,
+            String annotationLevel,
+            String title,
+            String message,
+            String rawDetails
+    ) {
+        public CheckRunAnnotation(String path, int line, String annotationLevel, String title, String message) {
+            this(path, line, line, annotationLevel, title, message, null);
+        }
+    }
+
+    /**
      * GitHub Checks API를 호출하여 Check Run 결과를 'completed' 상태로 업데이트합니다.
      *
      * @param conclusion success, failure, neutral, action_required
      */
     public void updateCheckRun(String repoFullName, Long checkRunId, Long installationId,
                                String conclusion, String title, String summary) {
+        updateCheckRun(repoFullName, checkRunId, installationId, conclusion, title, summary, Collections.emptyList());
+    }
+
+    /**
+     * GitHub Checks API를 호출하여 Check Run 결과 및 코드 라인별 Annotation을 'completed' 상태로 업데이트합니다.
+     */
+    public void updateCheckRun(String repoFullName, Long checkRunId, Long installationId,
+                               String conclusion, String title, String summary,
+                               List<CheckRunAnnotation> annotations) {
         if (checkRunId == null) {
             return;
         }
 
-        log.info("[GitHubBot] Check Run 결과 업데이트 시작 (ID: {}, Conclusion: {})", checkRunId, conclusion);
+        log.info("[GitHubBot] Check Run 결과 업데이트 시작 (ID: {}, Conclusion: {}, Annotations: {}개)",
+                checkRunId, conclusion, annotations != null ? annotations.size() : 0);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = "https://api.github.com/repos/" + repoFullName + "/check-runs/" + checkRunId;
@@ -598,15 +628,37 @@ public class GitHubBotService {
             headers.setBearerAuth(token);
             headers.setContentType(MediaType.APPLICATION_JSON);
 
+            Map<String, Object> outputMap = new LinkedHashMap<>();
+            outputMap.put("title", title);
+            outputMap.put("summary", summary);
+
+            if (annotations != null && !annotations.isEmpty()) {
+                // GitHub Checks API는 요청당 최대 50개의 annotations를 허용함
+                List<Map<String, Object>> annotationList = annotations.stream()
+                        .limit(50)
+                        .map(a -> {
+                            Map<String, Object> m = new LinkedHashMap<>();
+                            m.put("path", a.path());
+                            m.put("start_line", Math.max(1, a.startLine()));
+                            m.put("end_line", Math.max(1, a.endLine()));
+                            m.put("annotation_level", a.annotationLevel() != null ? a.annotationLevel() : "warning");
+                            m.put("title", a.title() != null ? a.title() : "보안 알림");
+                            m.put("message", a.message() != null ? a.message() : "보안 검증 주의 사항");
+                            if (a.rawDetails() != null) {
+                                m.put("raw_details", a.rawDetails());
+                            }
+                            return m;
+                        })
+                        .toList();
+                outputMap.put("annotations", annotationList);
+            }
+
             Map<String, Object> body = Map.of(
                     "name", "PR Guard / Security Scan",
                     "status", "completed",
                     "conclusion", conclusion,
                     "completed_at", Instant.now().toString(),
-                    "output", Map.of(
-                            "title", title,
-                            "summary", summary
-                    )
+                    "output", outputMap
             );
 
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
@@ -614,6 +666,88 @@ public class GitHubBotService {
             log.info("[GitHubBot] Check Run 결과 업데이트 완료 (ID: {})", checkRunId);
         } catch (Exception e) {
             log.warn("[GitHubBot] Check Run 결과 업데이트 실패: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * PR 변경 코드의 특정 파일 및 라인에 인라인 리뷰 코멘트(Inline Diff Comment)를 작성합니다.
+     * 1-Click 수정 제안(```suggestion) 블록을 지원하여 개발자가 버튼 하나로 취약점을 패치할 수 있도록 돕습니다.
+     */
+    public boolean postInlineReviewComment(String repoFullName, Integer prNumber, String commitSha,
+                                          Long installationId, String filePath, int line, String commentBody) {
+        if (prNumber == null || commitSha == null || filePath == null || filePath.isBlank() || line <= 0) {
+            return false;
+        }
+
+        log.info("[GitHubBot] PR #{} 인라인 리뷰 코멘트 작성 시도 (파일: {}:{}, SHA: {})", prNumber, filePath, line, commitSha);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber + "/comments";
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            String cleanPath = filePath.startsWith("./") ? filePath.substring(2) : filePath;
+            if (cleanPath.startsWith("/")) cleanPath = cleanPath.substring(1);
+
+            Map<String, Object> body = Map.of(
+                    "body", commentBody,
+                    "commit_id", commitSha,
+                    "path", cleanPath,
+                    "line", line,
+                    "side", "RIGHT"
+            );
+
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+            boolean success = response.getStatusCode().is2xxSuccessful();
+            if (success) {
+                log.info("[GitHubBot] PR #{} 인라인 리뷰 코멘트 작성 성공 ({}:{})", prNumber, cleanPath, line);
+            }
+            return success;
+        } catch (Exception e) {
+            log.warn("[GitHubBot] PR #{} 인라인 리뷰 코멘트 작성 스킵 또는 실패 ({}:{}): {}",
+                    prNumber, filePath, line, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 특정 커밋에 대해 GitHub Commit Status를 업데이트합니다. (엔터프라이즈 브랜치 보호 규칙 호환)
+     *
+     * @param state success, failure, pending, error
+     */
+    public void createCommitStatus(String repoFullName, String commitSha, Long installationId,
+                                   String state, String description, String targetUrl) {
+        if (commitSha == null || commitSha.isBlank() || repoFullName == null || repoFullName.isBlank()) {
+            return;
+        }
+
+        log.info("[GitHubBot] 커밋 Status 업데이트 시도 (SHA: {}, State: {})", commitSha, state);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/statuses/" + commitSha;
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, String> body = new HashMap<>();
+            body.put("state", state);
+            body.put("context", "pr-guard/security");
+            body.put("description", (description != null && description.length() > 140)
+                    ? description.substring(0, 137) + "..."
+                    : (description != null ? description : "PR Guard 보안 검증 결과"));
+            if (targetUrl != null && !targetUrl.isBlank()) {
+                body.put("target_url", targetUrl);
+            }
+
+            HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+            restTemplate.postForEntity(url, entity, String.class);
+            log.info("[GitHubBot] 커밋 Status 업데이트 성공 (SHA: {}, State: {})", commitSha, state);
+        } catch (Exception e) {
+            log.warn("[GitHubBot] 커밋 Status 업데이트 실패 (SHA: {}): {}", commitSha, e.getMessage());
         }
     }
 

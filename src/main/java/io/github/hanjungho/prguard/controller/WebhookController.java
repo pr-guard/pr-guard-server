@@ -2,6 +2,7 @@ package io.github.hanjungho.prguard.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hanjungho.prguard.dto.GithubWebhookPayload;
+import io.github.hanjungho.prguard.service.GitHubBotService;
 import io.github.hanjungho.prguard.service.SecurityScanPipeline;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,6 +29,7 @@ import java.util.HexFormat;
 public class WebhookController {
 
     private final SecurityScanPipeline securityScanPipeline;
+    private final GitHubBotService gitHubBotService;
     private final ObjectMapper objectMapper;
 
     @Value("${github.webhook.secret:}")
@@ -122,6 +124,29 @@ public class WebhookController {
                 }
 
                 String commentBody = payload.getComment().getBody() != null ? payload.getComment().getBody().trim().toLowerCase() : "";
+                if (commentBody.contains("@prguard help") || commentBody.startsWith("/help")) {
+                    Integer issuePrNumber = payload.getIssue().getNumber();
+                    Long installationId = payload.getInstallation() != null ? payload.getInstallation().getId() : null;
+                    log.info("[Webhook] ChatOps 도움말 명령어 감지! (Repo: {}, PR #{})", fullName, issuePrNumber);
+                    String helpGuide = """
+                            ### 🛡️ PR Guard 봇 사용 가이드
+                            
+                            PR Guard는 Pull Request에 대한 자동화된 보안 검증 및 취약점 통제를 수행합니다.
+                            
+                            **사용 가능한 명령어:**
+                            - `@prguard rescan` 또는 `/rescan`: 현재 PR의 소스코드 및 의존성에 대한 보안 재스캔을 즉시 실행합니다.
+                            - `@prguard help` 또는 `/help`: 이 도움말 메시지를 출력합니다.
+                            
+                            **제공 기능:**
+                            - 🔍 **오픈소스 CVE 취약점 분석**: 알려진 보안 취약점 전수 검사 및 SBOM 인벤토리 제공
+                            - 🔑 **하드코딩된 시크릿 노출 감지**: 코드 내 API 키/토큰 노출 시 해당 코드 라인에 인라인 경고 등록
+                            - ⚙️ **보안 설정 결함(Misconfiguration) 탐지**: Dockerfile, K8s, 환경 설정 오류 감지
+                            - 🤖 **Google Gemini AI 심층 판정**: 도달 가능성(Reachability) 분석 및 자동 PASS/WARN/BLOCK 판정
+                            """;
+                    gitHubBotService.postComment(fullName, issuePrNumber, installationId, helpGuide);
+                    return ResponseEntity.ok("Help comment posted successfully");
+                }
+
                 if (commentBody.contains("@prguard rescan") || commentBody.startsWith("/rescan") || commentBody.contains("@prguard /rescan")) {
                     Integer issuePrNumber = payload.getIssue().getNumber();
                     log.info("[Webhook] ChatOps 재스캔 명령어 감지! (Repo: {}, PR #{}, Comment: '{}')", fullName, issuePrNumber, commentBody);

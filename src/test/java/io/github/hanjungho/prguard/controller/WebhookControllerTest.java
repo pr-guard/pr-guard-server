@@ -2,6 +2,7 @@ package io.github.hanjungho.prguard.controller;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hanjungho.prguard.service.GitHubBotService;
 import io.github.hanjungho.prguard.service.SecurityScanPipeline;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -25,14 +26,16 @@ import static org.mockito.Mockito.verify;
 class WebhookControllerTest {
 
     private SecurityScanPipeline pipeline;
+    private GitHubBotService gitHubBotService;
     private ObjectMapper objectMapper;
     private WebhookController controller;
 
     @BeforeEach
     void setUp() {
         pipeline = mock(SecurityScanPipeline.class);
+        gitHubBotService = mock(GitHubBotService.class);
         objectMapper = new ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
-        controller = new WebhookController(pipeline, objectMapper);
+        controller = new WebhookController(pipeline, gitHubBotService, objectMapper);
     }
 
     private String calculateHmac(String secret, byte[] data) throws Exception {
@@ -215,5 +218,41 @@ class WebhookControllerTest {
 
         assertEquals(HttpStatus.OK, response.getStatusCode());
         verify(pipeline, never()).executePipelineAsync(any());
+    }
+
+    @Test
+    @DisplayName("PR 댓글에 '@prguard help' 입력 시 도움말 안내 코멘트를 등록해야 한다")
+    void shouldPostHelpCommentOnHelpCommand() {
+        String json = """
+                {
+                  "action": "created",
+                  "issue": {
+                    "number": 20,
+                    "pull_request": {}
+                  },
+                  "comment": {
+                    "body": "@prguard help",
+                    "user": { "login": "developer", "type": "User" }
+                  },
+                  "repository": {
+                    "full_name": "octocat/Hello-World"
+                  },
+                  "installation": {
+                    "id": 123456
+                  }
+                }
+                """;
+        byte[] payload = json.getBytes(StandardCharsets.UTF_8);
+
+        ResponseEntity<String> response = controller.receiveWebhook(null, payload);
+
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertEquals("Help comment posted successfully", response.getBody());
+        verify(gitHubBotService, times(1)).postComment(
+                org.mockito.ArgumentMatchers.eq("octocat/Hello-World"),
+                org.mockito.ArgumentMatchers.eq(20),
+                org.mockito.ArgumentMatchers.eq(123456L),
+                org.mockito.ArgumentMatchers.contains("PR Guard 봇 사용 가이드")
+        );
     }
 }
