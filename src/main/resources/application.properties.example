@@ -43,12 +43,3 @@ scanner.wrapper.enabled=${SCANNER_WRAPPER_ENABLED:false}
 diff.max-length=${DIFF_MAX_LENGTH:15000}
 pipeline.max-inline-comments=${MAX_INLINE_COMMENTS:5}
 pipeline.dedup-window-minutes=${DEDUP_WINDOW_MINUTES:10}
-
-# ===================================================================
-# 패키지 매니페스트 버전 추론용 Public / 사내 Private 레지스트리 URL
-# ===================================================================
-registry.pypi.url=${REGISTRY_PYPI_URL:https://pypi.org/pypi}
-registry.npm.url=${REGISTRY_NPM_URL:https://registry.npmjs.org}
-registry.cargo.url=${REGISTRY_CARGO_URL:https://crates.io/api/v1/crates}
-registry.go.url=${REGISTRY_GO_URL:https://proxy.golang.org}
-registry.nuget.url=${REGISTRY_NUGET_URL:https://azuresearch-usnc.nuget.org/query}

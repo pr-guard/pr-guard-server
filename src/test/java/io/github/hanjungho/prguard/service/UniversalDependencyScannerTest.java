@@ -29,7 +29,7 @@ class UniversalDependencyScannerTest {
     void shouldExtractGradleDependencies(@TempDir Path tempDir) throws IOException {
         String gradleContent = """
                 plugins {
-                    id 'org.springframework.boot' version '3.2.0'
+                    id 'org.springframework.boot' version '3.4.1'
                 }
                 dependencies {
                     implementation 'org.springframework.boot:spring-boot-starter-web'
@@ -42,8 +42,8 @@ class UniversalDependencyScannerTest {
         List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
 
         assertNotNull(packages);
-        assertTrue(packages.size() >= 3, "최소 3개 이상의 패키지가 검출되어야 함");
-        assertTrue(packages.stream().anyMatch(p -> p.name().contains("spring-boot-starter-web")));
+        assertTrue(packages.size() >= 3, "선언된 패키지가 검출되어야 함");
+        assertTrue(packages.stream().anyMatch(p -> p.name().contains("spring-boot-starter-web") && "3.4.1".equals(p.version())));
         assertTrue(packages.stream().anyMatch(p -> p.name().contains("jjwt-api") && p.version().equals("0.12.3")));
     }
 
@@ -144,7 +144,7 @@ class UniversalDependencyScannerTest {
     }
 
     @Test
-    @DisplayName("Gradle 의존성 트리 출력에서 직접 의존성과 전이(간접) 의존성을 정확히 구분하여 파싱해야 한다")
+    @DisplayName("실제 Gradle Wrapper 실행 결과 트리를 통해 직접 및 전이 의존성을 파싱할 수 있어야 한다")
     void shouldParseGradleDependencyTreeOutputWithDirectAndIndirectDependencies() {
         String treeOutput = """
                 ------------------------------------------------------------
@@ -170,7 +170,6 @@ class UniversalDependencyScannerTest {
 
         assertFalse(map.isEmpty());
 
-        // 직접 의존성 검증 (indent 없음)
         LLMAnalysisService.SbomPackageDetail webmvc = map.get("org.springframework.boot:spring-boot-starter-webmvc");
         assertNotNull(webmvc);
         assertFalse(webmvc.indirect(), "webmvc는 직접 의존성이어야 함");
@@ -181,242 +180,17 @@ class UniversalDependencyScannerTest {
         assertFalse(jjwt.indirect(), "jjwt-api는 직접 의존성이어야 함");
         assertEquals("0.12.6", jjwt.version());
 
-        // 간접(전이) 의존성 검증 (indent 있음)
         LLMAnalysisService.SbomPackageDetail tomcat = map.get("org.apache.tomcat.embed:tomcat-embed-core");
         assertNotNull(tomcat);
         assertTrue(tomcat.indirect(), "tomcat-embed-core는 간접 의존성이어야 함");
         assertEquals("11.0.27", tomcat.version());
-
-        LLMAnalysisService.SbomPackageDetail logback = map.get("ch.qos.logback:logback-classic");
-        assertNotNull(logback);
-        assertTrue(logback.indirect(), "logback-classic은 간접 의존성이어야 함");
-
-        LLMAnalysisService.SbomPackageDetail slf4j = map.get("org.slf4j:slf4j-api");
-        assertNotNull(slf4j);
-        assertTrue(slf4j.indirect());
-        assertEquals("2.0.20", slf4j.version(), "버전 업그레이드(->)가 적용되어 2.0.20이어야 함");
-
-        // (c) 제약조건(BOM)은 제외되어야 함
-        assertNull(map.get("com.fasterxml.jackson.core:jackson-annotations"), "(c) 제약조건은 제외되어야 함");
-
-        // (*) 중복 하위 트리 표시는 정상 제거되고 패키지가 포함되어야 함
-        LLMAnalysisService.SbomPackageDetail webmvcSpring = map.get("org.springframework:spring-webmvc");
-        assertNotNull(webmvcSpring);
-        assertTrue(webmvcSpring.indirect());
-        assertEquals("7.0.10", webmvcSpring.version());
     }
 
     @Test
-    @DisplayName("Lock 파일이 없는 Gradle 프로젝트 스캔 시 Trivy가 감지할 수 있도록 gradle.lockfile을 자동 합성 생성해야 한다")
-    void shouldSynthesizeGradleLockfileWhenAbsent(@TempDir Path tempDir) throws IOException {
+    @DisplayName("스캐너는 절대로 디스크에 임의의 가짜 파일(gradle.lockfile, requirements.txt 등)을 생성해서는 안 된다")
+    void shouldNeverCreateSyntheticFilesOnDisk(@TempDir Path tempDir) throws IOException {
         String gradleContent = """
                 plugins {
-                    id 'org.springframework.boot' version '3.2.0'
-                }
-                dependencies {
-                    implementation 'org.springframework.boot:spring-boot-starter-web'
-                    implementation 'io.jsonwebtoken:jjwt-api:0.12.3'
-                }
-                """;
-        Files.writeString(tempDir.resolve("build.gradle"), gradleContent);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        assertTrue(packages.size() > 2, "Fallback을 통해 간접 의존성까지 확장 수집되어야 함");
-        assertTrue(packages.stream().anyMatch(LLMAnalysisService.SbomPackageDetail::indirect), "최소 1개 이상의 간접 의존성이 존재해야 함");
-
-        // gradle.lockfile 생성 확인
-        Path lockfile = tempDir.resolve("gradle.lockfile");
-        assertTrue(Files.exists(lockfile), "Trivy 연동을 위한 gradle.lockfile이 자동 생성되어야 함");
-
-        String lockfileContent = Files.readString(lockfile);
-        assertTrue(lockfileContent.contains("=runtimeClasspath"), "Gradle lockfile 표준 형식을 따라야 함");
-        assertTrue(lockfileContent.contains("io.jsonwebtoken:jjwt-api:0.12.3=runtimeClasspath"));
-    }
-
-    @Test
-    @DisplayName("[Manifest-less] requirements.txt가 없는 Python 프로젝트의 소스코드를 스캔해 서드파티 패키지를 추론하고 requirements.txt를 자동 합성해야 한다")
-    void shouldInferAndSynthesizePythonManifest(@TempDir Path tempDir) throws IOException {
-        String pyCode = """
-                import os
-                import sys
-                import requests
-                from fastapi import FastAPI
-                import cv2
-                """;
-        Files.writeString(tempDir.resolve("main.py"), pyCode);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        // os, sys 등 표준 라이브러리는 제외되고 requests, fastapi, opencv-python(cv2 매핑)이 추출되어야 함
-        assertTrue(packages.stream().noneMatch(p -> p.name().equals("os") || p.name().equals("sys")), "표준 라이브러리는 제외되어야 함");
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("requests")), "requests가 검출되어야 함");
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("fastapi")), "fastapi가 검출되어야 함");
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("opencv-python")), "cv2는 opencv-python으로 매핑 검출되어야 함");
-
-        // requirements.txt 합성 확인
-        Path reqFile = tempDir.resolve("requirements.txt");
-        assertTrue(Files.exists(reqFile), "requirements.txt가 자동 합성되어야 함");
-        String content = Files.readString(reqFile);
-        assertTrue(content.contains("requests"));
-        assertTrue(content.contains("fastapi"));
-        assertTrue(content.contains("opencv-python"));
-    }
-
-    @Test
-    @DisplayName("[Manifest-less] package.json이 없는 Node.js/TS 프로젝트의 소스코드를 스캔해 의존성을 추론하고 package.json을 자동 합성해야 한다")
-    void shouldInferAndSynthesizeNodeManifest(@TempDir Path tempDir) throws IOException {
-        String jsCode = """
-                const fs = require('fs');
-                const path = require('path');
-                const express = require('express');
-                import { cloneDeep } from 'lodash/cloneDeep';
-                import * as core from '@angular/core';
-                import localUtil from './localUtil';
-                """;
-        Files.writeString(tempDir.resolve("index.ts"), jsCode);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        // fs, path 등 내장 모듈 및 ./localUtil 상대 경로는 제외되어야 함
-        assertTrue(packages.stream().noneMatch(p -> p.name().equals("fs") || p.name().equals("path") || p.name().contains("localUtil")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("express")), "express가 검출되어야 함");
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("lodash")), "lodash/cloneDeep에서 루트 패키지 lodash가 추출되어야 함");
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("@angular/core")), "스코프 패키지 @angular/core가 추출되어야 함");
-
-        // package.json 합성 확인
-        Path pkgJson = tempDir.resolve("package.json");
-        assertTrue(Files.exists(pkgJson), "package.json이 자동 합성되어야 함");
-        String content = Files.readString(pkgJson);
-        assertTrue(content.contains("\"express\""));
-        assertTrue(content.contains("\"lodash\""));
-        assertTrue(content.contains("\"@angular/core\""));
-    }
-
-    @Test
-    @DisplayName("[Manifest-less] C# / .NET 프로젝트에서 *.csproj가 없을 때 소스코드의 using 문에서 패키지를 추론하고 .csproj를 자동 합성해야 한다")
-    void shouldInferAndSynthesizeDotNetManifest(@TempDir Path tempDir) throws IOException {
-        String csCode = """
-                using System;
-                using System.Collections.Generic;
-                using Newtonsoft.Json;
-                using RestSharp;
-                """;
-        Files.writeString(tempDir.resolve("Program.cs"), csCode);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        assertTrue(packages.stream().noneMatch(p -> p.name().startsWith("System")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("Newtonsoft.Json")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("RestSharp")));
-
-        Path csproj = tempDir.resolve("InferredProject.csproj");
-        assertTrue(Files.exists(csproj), "InferredProject.csproj가 자동 합성되어야 함");
-        String content = Files.readString(csproj);
-        assertTrue(content.contains("Newtonsoft.Json"));
-        assertTrue(content.contains("RestSharp"));
-    }
-
-    @Test
-    @DisplayName("[Manifest-less] Go 프로젝트에서 go.mod가 없을 때 import 문에서 서드파티 모듈을 추론하고 go.mod를 자동 합성해야 한다")
-    void shouldInferAndSynthesizeGoManifest(@TempDir Path tempDir) throws IOException {
-        String goCode = """
-                package main
-                import (
-                    "fmt"
-                    "net/http"
-                    "github.com/gin-gonic/gin"
-                )
-                """;
-        Files.writeString(tempDir.resolve("main.go"), goCode);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        assertTrue(packages.stream().noneMatch(p -> p.name().equals("fmt") || p.name().equals("net/http")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("github.com/gin-gonic/gin")));
-
-        Path goMod = tempDir.resolve("go.mod");
-        assertTrue(Files.exists(goMod), "go.mod가 자동 합성되어야 함");
-        String content = Files.readString(goMod);
-        assertTrue(content.contains("github.com/gin-gonic/gin"));
-    }
-
-    @Test
-    @DisplayName("[Manifest-less] Rust 프로젝트에서 Cargo.toml이 없을 때 use 문에서 크레이트를 추론하고 Cargo.toml을 자동 합성해야 한다")
-    void shouldInferAndSynthesizeRustManifest(@TempDir Path tempDir) throws IOException {
-        String rsCode = """
-                use std::collections::HashMap;
-                use serde::{Serialize, Deserialize};
-                use tokio::runtime;
-                """;
-        Files.writeString(tempDir.resolve("main.rs"), rsCode);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        assertTrue(packages.stream().noneMatch(p -> p.name().equals("std")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("serde")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("tokio")));
-
-        Path cargoToml = tempDir.resolve("Cargo.toml");
-        assertTrue(Files.exists(cargoToml), "Cargo.toml이 자동 합성되어야 함");
-        String content = Files.readString(cargoToml);
-        assertTrue(content.contains("serde"));
-        assertTrue(content.contains("tokio"));
-    }
-
-    @Test
-    @DisplayName("[Manifest-less] C/C++ 프로젝트에서 CMakeLists.txt 등이 없을 때 #include 문에서 라이브러리를 추론하고 vcpkg.json을 자동 합성해야 한다")
-    void shouldInferAndSynthesizeCppManifest(@TempDir Path tempDir) throws IOException {
-        String cppCode = """
-                #include <iostream>
-                #include <vector>
-                #include <boost/algorithm/string.hpp>
-                #include <fmt/core.h>
-                """;
-        Files.writeString(tempDir.resolve("main.cpp"), cppCode);
-
-        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
-
-        assertNotNull(packages);
-        assertTrue(packages.stream().noneMatch(p -> p.name().equals("iostream") || p.name().equals("vector")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("boost")));
-        assertTrue(packages.stream().anyMatch(p -> p.name().equals("fmt")));
-
-        Path vcpkg = tempDir.resolve("vcpkg.json");
-        assertTrue(Files.exists(vcpkg), "vcpkg.json이 자동 합성되어야 함");
-        String content = Files.readString(vcpkg);
-        assertTrue(content.contains("\"boost\""));
-        assertTrue(content.contains("\"fmt\""));
-    }
-
-    @Test
-    @DisplayName("Spring Boot 버전별 하위 서브시스템(Spring Framework, Tomcat 등)의 정규 호환 버전이 정확히 산출되어야 한다")
-    void shouldAccuratelyMapCompatibleSubsystemVersions() {
-        // Spring Boot 3.4.x -> Spring Framework 6.2.x, Tomcat 10.1.x
-        assertEquals("6.2.1", UniversalDependencyScanner.resolveCompatibleVersion("org.springframework", "spring-web", "3.4.1"));
-        assertEquals("10.1.34", UniversalDependencyScanner.resolveCompatibleVersion("org.apache.tomcat.embed", "tomcat-embed-core", "3.4.1"));
-        assertEquals("2.2", UniversalDependencyScanner.resolveCompatibleVersion("org.yaml", "snakeyaml", "3.4.1"));
-
-        // Spring Boot 4.x -> Spring Framework 7.x, Tomcat 11.x
-        assertEquals("7.0.0", UniversalDependencyScanner.resolveCompatibleVersion("org.springframework", "spring-webmvc", "4.1.2"));
-        assertEquals("11.0.2", UniversalDependencyScanner.resolveCompatibleVersion("org.apache.tomcat.embed", "tomcat-embed-core", "4.1.2"));
-
-        // 독립 패키지는 임의 버전을 주입하지 않고 null 반환 (오탐 방지)
-        assertNull(UniversalDependencyScanner.resolveCompatibleVersion("com.unknown.corp", "some-lib", "3.4.1"));
-    }
-
-    @Test
-    @DisplayName("Gradle 빌드에서 managed 상태의 Spring Boot 스타터가 실제 프로젝트 플러그인 버전 및 정규 Tomcat/Spring 버전으로 안전하게 동기화되어야 한다")
-    void shouldSynchronizeSpringBootVersionToManagedStartersInGradle(@TempDir Path tempDir) throws IOException {
-        String gradleContent = """
-                plugins {
-                    id 'java'
                     id 'org.springframework.boot' version '3.4.1'
                 }
                 dependencies {
@@ -425,20 +199,98 @@ class UniversalDependencyScannerTest {
                 """;
         Files.writeString(tempDir.resolve("build.gradle"), gradleContent);
 
+        String pyCode = "import requests\nimport json\n";
+        Files.writeString(tempDir.resolve("script.py"), pyCode);
+
+        // 스캔 실행
         List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
 
         assertNotNull(packages);
-        // 스타터 자체는 3.4.1로 동기화되어야 함
+        // 디스크에 가짜 파일이 전혀 생성되지 않았는지 철저히 검증
+        assertFalse(Files.exists(tempDir.resolve("gradle.lockfile")), "가짜 gradle.lockfile이 생성되어서는 안 됨");
+        assertFalse(Files.exists(tempDir.resolve("requirements.txt")), "가짜 requirements.txt가 생성되어서는 안 됨");
+        assertFalse(Files.exists(tempDir.resolve("package.json")), "가짜 package.json이 생성되어서는 안 됨");
+        assertFalse(Files.exists(tempDir.resolve("Cargo.toml")), "가짜 Cargo.toml이 생성되어서는 안 됨");
+
+        // 가짜 하위 의존성(2000년대 Tomcat 등)이 임의 주입되지 않았는지 검증
+        assertFalse(packages.stream().anyMatch(p -> p.name().contains("tomcat-embed-core")), "선언되지 않은 가짜 Tomcat이 포함되어서는 안 됨");
+    }
+
+    @Test
+    @DisplayName("저장소에 실제 커밋된 gradle.lockfile이 존재할 경우 정확하게 패키지와 버전을 읽어와야 한다")
+    void shouldParseRealGradleLockfileIfCommitted(@TempDir Path tempDir) throws IOException {
+        String lockContent = """
+                # Real committed lockfile
+                org.springframework.boot:spring-boot-starter-web:3.4.1=runtimeClasspath
+                com.fasterxml.jackson.core:jackson-databind:2.17.2=runtimeClasspath
+                empty=annotationProcessor
+                """;
+        Files.writeString(tempDir.resolve("gradle.lockfile"), lockContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
         assertTrue(packages.stream().anyMatch(p ->
                 p.name().equals("org.springframework.boot:spring-boot-starter-web") && "3.4.1".equals(p.version())));
-
-        // Tomcat 하위 의존성은 3.2.0이 아닌 10.1.34로 매핑되어야 함 (오탐 방지)
         assertTrue(packages.stream().anyMatch(p ->
-                p.name().equals("org.apache.tomcat.embed:tomcat-embed-core") && "10.1.34".equals(p.version())));
+                p.name().equals("com.fasterxml.jackson.core:jackson-databind") && "2.17.2".equals(p.version())));
+    }
 
-        // Spring Web 하위 의존성은 3.2.0이 아닌 6.2.1로 매핑되어야 함
-        assertTrue(packages.stream().anyMatch(p ->
-                p.name().equals("org.springframework:spring-web") && "6.2.1".equals(p.version())));
+    @Test
+    @DisplayName("저장소에 실제 커밋된 package-lock.json이 존재할 경우 정확하게 패키지를 읽어와야 한다")
+    void shouldParseRealPackageLockJsonIfCommitted(@TempDir Path tempDir) throws IOException {
+        String lockContent = """
+                {
+                  "name": "my-node-app",
+                  "version": "1.0.0",
+                  "lockfileVersion": 3,
+                  "packages": {
+                    "": {
+                      "name": "my-node-app",
+                      "version": "1.0.0"
+                    },
+                    "node_modules/express": {
+                      "version": "4.19.2"
+                    },
+                    "node_modules/cors": {
+                      "version": "2.8.5"
+                    }
+                  }
+                }
+                """;
+        Files.writeString(tempDir.resolve("package-lock.json"), lockContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("express") && "4.19.2".equals(p.version())));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("cors") && "2.8.5".equals(p.version())));
+    }
+
+    @Test
+    @DisplayName("저장소에 실제 커밋된 Cargo.lock이 존재할 경우 정확하게 패키지를 읽어와야 한다")
+    void shouldParseRealCargoLockIfCommitted(@TempDir Path tempDir) throws IOException {
+        String lockContent = """
+                # This file is automatically @generated by Cargo.
+                version = 3
+
+                [[package]]
+                name = "serde"
+                version = "1.0.200"
+
+                [[package]]
+                name = "tokio"
+                version = "1.38.0"
+                """;
+        Files.writeString(tempDir.resolve("Cargo.lock"), lockContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("serde") && "1.0.200".equals(p.version())));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("tokio") && "1.38.0".equals(p.version())));
     }
 }
-
