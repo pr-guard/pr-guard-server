@@ -164,6 +164,10 @@ public class SecurityScanPipeline {
         Long checkRunId = null;
         try {
             checkRunId = gitHubBotService.createCheckRun(target.fullName(), target.headSha(), target.installationId());
+            if (target.headSha() != null && !target.headSha().isBlank()) {
+                gitHubBotService.createCommitStatus(target.fullName(), target.headSha(), target.installationId(),
+                        "pending", "PR Guard 보안 스캔 및 AI 분석 진행 중...", null);
+            }
             executePipelineStages(target, checkRunId);
         } catch (Exception e) {
             handlePipelineFailure(target, checkRunId, e);
@@ -266,6 +270,11 @@ public class SecurityScanPipeline {
                     "action_required",
                     "스캔 실패: 일시적 오류 발생",
                     "보안 분석 파이프라인 실행 중 오류가 발생했습니다: " + e.getMessage());
+        }
+
+        if (target.headSha() != null && !target.headSha().isBlank()) {
+            gitHubBotService.createCommitStatus(target.fullName(), target.headSha(), target.installationId(),
+                    "error", "스캔 실패: " + e.getMessage(), null);
         }
 
         if (target.prNumber() != null && !"N/A".equals(target.fullName())) {

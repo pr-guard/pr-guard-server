@@ -67,6 +67,9 @@ public class GitHubBotService {
     @Value("${github.status.context:pr-guard/security}")
     private String statusContext = "pr-guard/security";
 
+    @Value("${github.status.enabled:true}")
+    private boolean statusEnabled = true;
+
     @Value("${diff.max-length:15000}")
     private int maxDiffLength = 15000;
 
@@ -760,7 +763,7 @@ public class GitHubBotService {
      */
     public void createCommitStatus(String repoFullName, String commitSha, Long installationId,
                                    String state, String description, String targetUrl) {
-        if (commitSha == null || commitSha.isBlank() || repoFullName == null || repoFullName.isBlank()) {
+        if (!statusEnabled || commitSha == null || commitSha.isBlank() || repoFullName == null || repoFullName.isBlank()) {
             return;
         }
 
