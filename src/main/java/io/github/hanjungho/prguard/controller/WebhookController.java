@@ -24,13 +24,26 @@ import java.util.HexFormat;
 
 @Slf4j
 @RestController
-@RequiredArgsConstructor
 @RequestMapping("/api")
 public class WebhookController {
 
     private final SecurityScanPipeline securityScanPipeline;
     private final GitHubBotService gitHubBotService;
     private final ObjectMapper objectMapper;
+    private final io.github.hanjungho.prguard.service.CycloneDxSbomService cycloneDxSbomService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public WebhookController(SecurityScanPipeline securityScanPipeline, GitHubBotService gitHubBotService,
+                             ObjectMapper objectMapper, io.github.hanjungho.prguard.service.CycloneDxSbomService cycloneDxSbomService) {
+        this.securityScanPipeline = securityScanPipeline;
+        this.gitHubBotService = gitHubBotService;
+        this.objectMapper = objectMapper;
+        this.cycloneDxSbomService = cycloneDxSbomService;
+    }
+
+    public WebhookController(SecurityScanPipeline securityScanPipeline, GitHubBotService gitHubBotService, ObjectMapper objectMapper) {
+        this(securityScanPipeline, gitHubBotService, objectMapper, null);
+    }
 
     @Value("${github.webhook.secret:}")
     private String webhookSecret;
@@ -44,6 +57,26 @@ public class WebhookController {
     @GetMapping("/ping")
     public ResponseEntity<String> ping() {
         return ResponseEntity.ok("pong");
+    }
+
+    /**
+     * OWASP CycloneDX v1.5 표준 규격 기계 판독형 SBOM(Software Bill of Materials) JSON 다운로드 엔드포인트
+     */
+    @GetMapping(value = {"/sbom/{owner}/{repo}/{prNumber}", "/sbom/{owner}/{repo}/{prNumber}.json"},
+            produces = "application/vnd.cyclonedx+json;charset=UTF-8")
+    public ResponseEntity<String> getCycloneDxSbom(
+            @org.springframework.web.bind.annotation.PathVariable("owner") String owner,
+            @org.springframework.web.bind.annotation.PathVariable("repo") String repo,
+            @org.springframework.web.bind.annotation.PathVariable("prNumber") Integer prNumber
+    ) {
+        String repoFullName = owner + "/" + repo;
+        String sbomJson = (cycloneDxSbomService != null) ? cycloneDxSbomService.getSbom(repoFullName, prNumber) : null;
+        if (sbomJson == null || sbomJson.isBlank()) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                    .header("Content-Type", "application/json;charset=UTF-8")
+                    .body("{\"error\": \"SBOM not found for " + repoFullName + " PR #" + prNumber + ". 스캔이 아직 진행 중이거나 만료되었습니다.\"}");
+        }
+        return ResponseEntity.ok(sbomJson);
     }
 
     /**

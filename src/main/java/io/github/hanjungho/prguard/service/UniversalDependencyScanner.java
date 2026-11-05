@@ -337,15 +337,29 @@ public class UniversalDependencyScanner {
             else if (lowerName.equals("pom.xml")) {
                 parseMaven(file, packagesMap);
             }
-            // 3. Node.js: package.json & package-lock.json
+            // 3. Node.js: package.json & package-lock.json & yarn.lock & pnpm-lock.yaml
             else if (lowerName.equals("package.json") && !file.toString().contains("node_modules")) {
                 parsePackageJson(file, packagesMap);
             } else if (lowerName.equals("package-lock.json") && !file.toString().contains("node_modules")) {
                 parsePackageLockJson(file, packagesMap);
+            } else if (lowerName.equals("yarn.lock") && !file.toString().contains("node_modules")) {
+                parseYarnLock(file, packagesMap);
+            } else if (lowerName.equals("pnpm-lock.yaml") && !file.toString().contains("node_modules")) {
+                parsePnpmLock(file, packagesMap);
             }
-            // 4. Python: requirements.txt, pyproject.toml
+            // 4. Python: requirements.txt, pyproject.toml, poetry.lock, Pipfile.lock
             else if (lowerName.equals("requirements.txt") || lowerName.endsWith("-requirements.txt")) {
                 parsePythonReqs(file, packagesMap);
+            } else if (lowerName.equals("poetry.lock")) {
+                parsePoetryLock(file, packagesMap);
+            } else if (lowerName.equals("pipfile.lock")) {
+                parsePipfileLock(file, packagesMap);
+            }
+            // 4-1. PHP: composer.json & composer.lock
+            else if (lowerName.equals("composer.json")) {
+                parseComposerJson(file, packagesMap);
+            } else if (lowerName.equals("composer.lock")) {
+                parseComposerLock(file, packagesMap);
             }
             // 5. Rust: Cargo.toml & Cargo.lock
             else if (lowerName.equals("cargo.toml")) {
@@ -418,7 +432,7 @@ public class UniversalDependencyScanner {
                     && group.startsWith("org.springframework.boot") && bootVersion != null) {
                 version = bootVersion;
             } else if (version == null || version.isBlank()) {
-                version = "(managed)";
+                version = (bootVersion != null) ? bootVersion : "BOM-managed";
             }
 
             String fullName = group + ":" + name;
@@ -509,6 +523,68 @@ public class UniversalDependencyScanner {
         }
     }
 
+    private void parseYarnLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            String currentPkg = null;
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                if (!rawLine.startsWith(" ") && !rawLine.startsWith("\t") && line.endsWith(":")) {
+                    String firstDep = line.split(",")[0].trim().replace("\"", "").replace("'", "").replace(":", "");
+                    int atIdx = firstDep.lastIndexOf('@');
+                    if (atIdx > 0) {
+                        currentPkg = firstDep.substring(0, atIdx);
+                    }
+                } else if (currentPkg != null && line.startsWith("version ")) {
+                    String ver = line.substring("version ".length()).replace("\"", "").replace("'", "").trim();
+                    if (!currentPkg.isBlank() && !ver.isBlank()) {
+                        map.put(currentPkg, new LLMAnalysisService.SbomPackageDetail(currentPkg, ver, true, "yarn.lock"));
+                    }
+                    currentPkg = null;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] yarn.lock 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parsePnpmLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            boolean inPackages = false;
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.equals("packages:")) {
+                    inPackages = true;
+                    continue;
+                }
+                if (inPackages) {
+                    if (!rawLine.startsWith(" ") && !rawLine.startsWith("\t") && line.endsWith(":") && !line.equals("packages:")) {
+                        inPackages = false;
+                        continue;
+                    }
+                    if (line.startsWith("/") || line.startsWith("'") || line.startsWith("\"")) {
+                        String clean = line.replace("'", "").replace("\"", "").replace(":", "").trim();
+                        if (clean.startsWith("/")) clean = clean.substring(1);
+                        int atIdx = clean.lastIndexOf('@');
+                        if (atIdx > 0) {
+                            String name = clean.substring(0, atIdx);
+                            String ver = clean.substring(atIdx + 1);
+                            int parenIdx = ver.indexOf('(');
+                            if (parenIdx > 0) ver = ver.substring(0, parenIdx).trim();
+                            if (!name.isBlank() && !ver.isBlank()) {
+                                map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "pnpm-lock"));
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] pnpm-lock.yaml 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
     private void parsePythonReqs(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) throws IOException {
         String content = Files.readString(file, StandardCharsets.UTF_8);
         Matcher m = PYTHON_REQ_PATTERN.matcher(content);
@@ -516,6 +592,88 @@ public class UniversalDependencyScanner {
             String name = m.group(1).trim();
             String ver = m.group(2).trim();
             map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+        }
+    }
+
+    private void parsePoetryLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            String currentName = null;
+            for (String line : lines) {
+                String trimmed = line.trim();
+                if (trimmed.equals("[[package]]")) {
+                    currentName = null;
+                } else if (trimmed.startsWith("name = \"")) {
+                    currentName = trimmed.substring(8, trimmed.length() - 1);
+                } else if (trimmed.startsWith("version = \"") && currentName != null) {
+                    String ver = trimmed.substring(11, trimmed.length() - 1);
+                    if (!currentName.isBlank() && !ver.isBlank()) {
+                        map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, true, "poetry.lock"));
+                    }
+                    currentName = null;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] poetry.lock 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parsePipfileLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            JsonNode root = objectMapper.readTree(file.toFile());
+            for (String section : List.of("default", "develop")) {
+                JsonNode secNode = root.path(section);
+                if (secNode.isObject()) {
+                    secNode.fieldNames().forEachRemaining(pkgName -> {
+                        String ver = secNode.path(pkgName).path("version").asText("").replace("==", "").trim();
+                        if (!pkgName.isBlank() && !ver.isBlank()) {
+                            map.put(pkgName, new LLMAnalysisService.SbomPackageDetail(pkgName, ver, true, "Pipfile.lock"));
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] Pipfile.lock 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parseComposerJson(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            JsonNode root = objectMapper.readTree(file.toFile());
+            for (String section : List.of("require", "require-dev")) {
+                JsonNode secNode = root.path(section);
+                if (secNode.isObject()) {
+                    secNode.fieldNames().forEachRemaining(pkgName -> {
+                        if (!pkgName.equals("php")) {
+                            String ver = secNode.path(pkgName).asText("latest");
+                            map.putIfAbsent(pkgName, new LLMAnalysisService.SbomPackageDetail(pkgName, ver, false, "Composer(PHP)"));
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] composer.json 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parseComposerLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            JsonNode root = objectMapper.readTree(file.toFile());
+            for (String section : List.of("packages", "packages-dev")) {
+                JsonNode arr = root.path(section);
+                if (arr.isArray()) {
+                    for (JsonNode item : arr) {
+                        String name = item.path("name").asText("");
+                        String ver = item.path("version").asText("");
+                        if (ver.startsWith("v")) ver = ver.substring(1);
+                        if (!name.isBlank() && !ver.isBlank()) {
+                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "composer.lock"));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] composer.lock 파싱 스킵: {}", e.getMessage());
         }
     }
 
@@ -717,6 +875,7 @@ public class UniversalDependencyScanner {
             command.add("/c");
             command.add(wrapper.toAbsolutePath().toString());
         } else {
+            command.add("/bin/sh");
             command.add(wrapper.toAbsolutePath().toString());
         }
         command.add("-q");
@@ -724,11 +883,11 @@ public class UniversalDependencyScanner {
         command.add("--configuration");
         command.add("runtimeClasspath");
 
-        String output = runProcessWithTimeout(command, rootDir, 25, TimeUnit.SECONDS, "Gradle Wrapper");
+        String output = runProcessWithTimeout(command, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper");
         if (output == null || !output.contains("---")) {
             List<String> fallbackCmd = new ArrayList<>(command);
             fallbackCmd.set(fallbackCmd.size() - 1, "compileClasspath");
-            output = runProcessWithTimeout(fallbackCmd, rootDir, 20, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
+            output = runProcessWithTimeout(fallbackCmd, rootDir, 45, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
         }
 
         if (output != null && output.contains("---")) {
@@ -801,7 +960,7 @@ public class UniversalDependencyScanner {
 
             LLMAnalysisService.SbomPackageDetail existing = map.get(name);
             if (existing != null && !existing.indirect()) {
-                if (("(managed)".equals(existing.version()) || existing.version().isBlank()) && !"(managed)".equals(version)) {
+                if (("(managed)".equals(existing.version()) || "BOM-managed".equals(existing.version()) || existing.version().isBlank()) && !"(managed)".equals(version)) {
                     map.put(name, new LLMAnalysisService.SbomPackageDetail(name, version, false, "Maven/Gradle"));
                 }
             } else {
@@ -827,13 +986,14 @@ public class UniversalDependencyScanner {
             command.add("/c");
             command.add(wrapper.toAbsolutePath().toString());
         } else {
+            command.add("/bin/sh");
             command.add(wrapper.toAbsolutePath().toString());
         }
         command.add("-q");
         command.add("dependency:tree");
         command.add("-DoutputType=text");
 
-        String output = runProcessWithTimeout(command, rootDir, 25, TimeUnit.SECONDS, "Maven Wrapper");
+        String output = runProcessWithTimeout(command, rootDir, 60, TimeUnit.SECONDS, "Maven Wrapper");
         if (output != null && (output.contains("+-") || output.contains("\\-"))) {
             int beforeCount = packagesMap.size();
             parseMavenDependencyTreeOutput(output, packagesMap);

@@ -327,4 +327,78 @@ class UniversalDependencyScannerTest {
         assertEquals("React", env.framework());
         assertEquals("TypeScript (npm) / React", env.toSummaryString());
     }
+
+    @Test
+    @DisplayName("yarn.lock 파일에서 패키지명과 실제 버전을 간접 의존성으로 정확히 추출해야 한다")
+    void shouldExtractYarnLockDependencies(@TempDir Path tempDir) throws IOException {
+        String yarnContent = """
+                # yarn lockfile v1
+                "@babel/core@^7.0.0", "@babel/core@^7.1.0":
+                  version "7.22.5"
+                  resolved "https://registry.yarnpkg.com/@babel/core/-/core-7.22.5.tgz"
+                
+                "lodash@^4.17.21":
+                  version "4.17.21"
+                  resolved "https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz"
+                """;
+        Files.writeString(tempDir.resolve("yarn.lock"), yarnContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("@babel/core") && p.version().equals("7.22.5") && p.indirect()));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("lodash") && p.version().equals("4.17.21") && p.indirect()));
+    }
+
+    @Test
+    @DisplayName("Python poetry.lock 파일에서 패키지명과 버전을 추출해야 한다")
+    void shouldExtractPoetryLockDependencies(@TempDir Path tempDir) throws IOException {
+        String poetryContent = """
+                [[package]]
+                name = "requests"
+                version = "2.31.0"
+                description = "Python HTTP for Humans."
+                
+                [[package]]
+                name = "urllib3"
+                version = "2.0.7"
+                description = "HTTP library with thread-safe connection pooling."
+                """;
+        Files.writeString(tempDir.resolve("poetry.lock"), poetryContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("requests") && p.version().equals("2.31.0")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("urllib3") && p.version().equals("2.0.7")));
+    }
+
+    @Test
+    @DisplayName("PHP composer.lock 파일에서 패키지 목록을 추출해야 한다")
+    void shouldExtractComposerLockDependencies(@TempDir Path tempDir) throws IOException {
+        String composerContent = """
+                {
+                    "packages": [
+                        {
+                            "name": "guzzlehttp/guzzle",
+                            "version": "7.8.1"
+                        },
+                        {
+                            "name": "monolog/monolog",
+                            "version": "v3.5.0"
+                        }
+                    ]
+                }
+                """;
+        Files.writeString(tempDir.resolve("composer.lock"), composerContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("guzzlehttp/guzzle") && p.version().equals("7.8.1")));
+        assertTrue(packages.stream().anyMatch(p -> p.name().equals("monolog/monolog") && p.version().equals("3.5.0")));
+    }
 }

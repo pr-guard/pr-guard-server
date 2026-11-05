@@ -17,12 +17,25 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class SecurityScanPipeline {
 
     private final TrivyScannerService trivyScannerService;
     private final LLMAnalysisService llmAnalysisService;
     private final GitHubBotService gitHubBotService;
+    private final CycloneDxSbomService cycloneDxSbomService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public SecurityScanPipeline(TrivyScannerService trivyScannerService, LLMAnalysisService llmAnalysisService,
+                                GitHubBotService gitHubBotService, CycloneDxSbomService cycloneDxSbomService) {
+        this.trivyScannerService = trivyScannerService;
+        this.llmAnalysisService = llmAnalysisService;
+        this.gitHubBotService = gitHubBotService;
+        this.cycloneDxSbomService = cycloneDxSbomService;
+    }
+
+    public SecurityScanPipeline(TrivyScannerService trivyScannerService, LLMAnalysisService llmAnalysisService, GitHubBotService gitHubBotService) {
+        this(trivyScannerService, llmAnalysisService, gitHubBotService, null);
+    }
 
     /**
      * 현재 스캔이 진행 중인 PR 추적 맵 (연속 푸시로 인한 중복 스캔 방지)
@@ -217,6 +230,17 @@ public class SecurityScanPipeline {
         LLMAnalysisService.AnalysisOutcome outcome = llmAnalysisService.analyzeVulnerabilities(
                 scanResult.scanJson(), prDiff, scanResult.runtimeContext(), scanResult.config(),
                 scanResult.manifestPackages(), scanResult.projectEnvironment());
+
+        // CycloneDX v1.5 JSON 생성 및 캐싱 (REST API /api/sbom/{owner}/{repo}/{prNumber} 서빙용)
+        if (cycloneDxSbomService != null && outcome.summaryPayload() != null) {
+            cycloneDxSbomService.buildCycloneDxJson(
+                    target.fullName(),
+                    target.prNumber(),
+                    scanResult.projectEnvironment(),
+                    outcome.summaryPayload().sbomPackages(),
+                    outcome.summaryPayload().topVulnerabilities()
+            );
+        }
 
         log.info("[Pipeline] Step 4: GitHub PR #{} 에 통합 분석 리포트 코멘트 등록", target.prNumber());
         gitHubBotService.postComment(target.fullName(), target.prNumber(), target.installationId(), outcome.reportMarkdown().trim());

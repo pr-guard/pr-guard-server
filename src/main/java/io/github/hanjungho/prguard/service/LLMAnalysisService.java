@@ -86,10 +86,15 @@ public class LLMAnalysisService {
             String name,
             String version,
             boolean indirect,
-            String license) {
+            String license,
+            String purl) {
+
+        public SbomPackageDetail(String name, String version, boolean indirect, String license) {
+            this(name, version, indirect, license, CycloneDxSbomService.generatePurl(name, version, license));
+        }
 
         public SbomPackageDetail(String name, String version, boolean indirect) {
-            this(name, version, indirect, "-");
+            this(name, version, indirect, "-", CycloneDxSbomService.generatePurl(name, version, "-"));
         }
     }
 
@@ -258,14 +263,17 @@ public class LLMAnalysisService {
                 if (existing == null) {
                     mergedMap.put(pkg.name(), pkg);
                 } else {
-                    String version = (existing.version() != null && !"-".equals(existing.version()) && !"(managed)".equals(existing.version()))
+                    String version = (existing.version() != null && !"-".equals(existing.version()) && !"(managed)".equals(existing.version()) && !"BOM-managed".equals(existing.version()))
                             ? existing.version()
-                            : pkg.version();
+                            : (pkg.version() != null && !"(managed)".equals(pkg.version()) && !"BOM-managed".equals(pkg.version()) ? pkg.version() : "BOM-managed");
                     String license = (existing.license() != null && !"-".equals(existing.license()))
                             ? existing.license()
                             : pkg.license();
+                    String purl = (existing.purl() != null && !existing.purl().isBlank() && !existing.purl().contains("(managed)"))
+                            ? existing.purl()
+                            : CycloneDxSbomService.generatePurl(pkg.name(), version, license);
                     // manifestPackages의 direct/indirect 분류를 최우선 적용 (트리 기반 정확도 반영)
-                    mergedMap.put(pkg.name(), new SbomPackageDetail(pkg.name(), version, pkg.indirect(), license));
+                    mergedMap.put(pkg.name(), new SbomPackageDetail(pkg.name(), version, pkg.indirect(), license, purl));
                 }
             }
             List<SbomPackageDetail> combinedList = new ArrayList<>(mergedMap.values());
@@ -469,24 +477,27 @@ public class LLMAnalysisService {
         if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment) && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
             sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("\n");
         }
-        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개\n\n");
+        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개\n");
+        sb.append("> **의존성 구분 기준:** 직접 의존성(Direct)은 개발자가 매니페스트에 직접 선언한 라이브러리이며, 간접 의존성(Transitive)은 런타임 종속 패키지(취약점의 80% 이상 발생)입니다.\n");
+        sb.append("> **표준 규격:** OWASP CycloneDX v1.5 JSON 및 Package URL (purl) 지원\n\n");
 
         // 1. 직접 의존성 표 (Direct Dependencies)
         sb.append("#### 직접 의존성 (Direct Dependencies - ").append(directCount).append("개)\n\n");
         if (directPackages.isEmpty()) {
             sb.append("*(등록된 직접 의존성이 없습니다)*\n\n");
         } else {
-            sb.append("| 패키지명 | 설치된 버전 | 라이선스 |\n");
-            sb.append("| :--- | :--- | :--- |\n");
+            sb.append("| 패키지명 | 설치된 버전 | 라이선스 | 식별자 (PURL) |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
             int directLimit = Math.min(directPackages.size(), maxRender);
             for (int i = 0; i < directLimit; i++) {
                 SbomPackageDetail pkg = directPackages.get(i);
                 String versionDisplay = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
                 String licenseDisplay = pkg.license().isBlank() ? "-" : pkg.license();
-                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" |\n");
+                String purlDisplay = (pkg.purl() != null && !pkg.purl().isBlank()) ? "`" + pkg.purl() + "`" : "-";
+                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" | ").append(purlDisplay).append(" |\n");
             }
             if (directPackages.size() > maxRender) {
-                sb.append("| ... | 외 ").append(directPackages.size() - maxRender).append("개 패키지 생략됨 | ... |\n");
+                sb.append("| ... | 외 ").append(directPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
             }
             sb.append("\n");
         }
@@ -496,17 +507,18 @@ public class LLMAnalysisService {
         if (indirectPackages.isEmpty()) {
             sb.append("*(등록된 간접 의존성이 없습니다)*\n\n");
         } else {
-            sb.append("| 패키지명 | 설치된 버전 | 라이선스 |\n");
-            sb.append("| :--- | :--- | :--- |\n");
+            sb.append("| 패키지명 | 설치된 버전 | 라이선스 | 식별자 (PURL) |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
             int indirectLimit = Math.min(indirectPackages.size(), maxRender);
             for (int i = 0; i < indirectLimit; i++) {
                 SbomPackageDetail pkg = indirectPackages.get(i);
                 String versionDisplay = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
                 String licenseDisplay = pkg.license().isBlank() ? "-" : pkg.license();
-                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" |\n");
+                String purlDisplay = (pkg.purl() != null && !pkg.purl().isBlank()) ? "`" + pkg.purl() + "`" : "-";
+                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" | ").append(purlDisplay).append(" |\n");
             }
             if (indirectPackages.size() > maxRender) {
-                sb.append("| ... | 외 ").append(indirectPackages.size() - maxRender).append("개 패키지 생략됨 | ... |\n");
+                sb.append("| ... | 외 ").append(indirectPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
             }
             sb.append("\n");
         }
