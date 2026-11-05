@@ -60,6 +60,9 @@ public class UniversalDependencyScanner {
     @org.springframework.beans.factory.annotation.Value("${registry.nuget.url:https://azuresearch-usnc.nuget.org/query}")
     private String nugetRegistryUrl = "https://azuresearch-usnc.nuget.org/query";
 
+    @org.springframework.beans.factory.annotation.Value("${scanner.wrapper.enabled:false}")
+    private boolean wrapperExecutionEnabled = false;
+
     private String cleanRegistryUrl(String url, String fallback) {
         if (url == null || url.isBlank()) return fallback;
         return url.replaceAll("/+$", "");
@@ -714,6 +717,11 @@ public class UniversalDependencyScanner {
     }
 
     private boolean resolveGradleViaWrapper(Path rootDir, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        if (!wrapperExecutionEnabled) {
+            log.info("[UniversalScanner] ⚡ 저지연/경량 스캔 모드: Wrapper 프로세스 다운로드를 건너뛰고 정적 분석 및 Lockfile 자동 합성 엔진으로 즉시 복원합니다.");
+            return false;
+        }
+
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
         Path wrapper = rootDir.resolve(isWindows ? "gradlew.bat" : "gradlew");
         if (!Files.exists(wrapper)) {
@@ -927,6 +935,10 @@ public class UniversalDependencyScanner {
     }
 
     private boolean resolveMavenViaWrapper(Path rootDir, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
+        if (!wrapperExecutionEnabled) {
+            return false;
+        }
+
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
         Path wrapper = rootDir.resolve(isWindows ? "mvnw.cmd" : "mvnw");
         if (!Files.exists(wrapper)) {
@@ -1024,6 +1036,7 @@ public class UniversalDependencyScanner {
 
             boolean finished = process.waitFor(timeout, unit);
             if (!finished) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
                 process.destroyForcibly();
                 readFuture.cancel(true);
                 log.warn("[UniversalScanner] {} 프로세스 타임아웃 초과 ({} {})", processName, timeout, unit.name().toLowerCase());
