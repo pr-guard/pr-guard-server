@@ -57,3 +57,4 @@ jobs:
           echo "Checking $SERVER_URL ..."
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SERVER_URL" || echo "000")
           echo "Ping response: $HTTP_STATUS"
+
