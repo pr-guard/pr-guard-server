@@ -38,8 +38,22 @@ public class TrivyScannerService {
         this.universalDependencyScanner = new UniversalDependencyScanner(new ObjectMapper());
     }
 
-    private static final long PROCESS_TIMEOUT_MINUTES = 5;
-    private static final long DB_UPDATE_INTERVAL_MS = 12 * 60 * 60 * 1000L; // 12시간 주기
+    @org.springframework.beans.factory.annotation.Value("${trivy.process.timeout-minutes:5}")
+    private long processTimeoutMinutes = 5;
+
+    @org.springframework.beans.factory.annotation.Value("${trivy.db.update-interval-hours:12}")
+    private long dbUpdateIntervalHours = 12;
+
+    @org.springframework.beans.factory.annotation.Value("${trivy.executable:}")
+    private String configuredTrivyExecutable;
+
+    private long getDbUpdateIntervalMs() {
+        return Math.max(1, dbUpdateIntervalHours) * 60 * 60 * 1000L;
+    }
+
+    private long getProcessTimeoutMinutes() {
+        return Math.max(1, processTimeoutMinutes);
+    }
 
     /**
      * 저사양/무료 클라우드(512MB RAM)의 OOM(Out of Memory) 방지를 위한 동시 프로세스 제어 세마포어.
@@ -346,7 +360,7 @@ public class TrivyScannerService {
         processBuilder.environment().put("GCM_INTERACTIVE", "never");
         processBuilder.redirectErrorStream(true);
 
-        return runProcessWithTimeout(processBuilder, PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES, "Git Clone");
+        return runProcessWithTimeout(processBuilder, getProcessTimeoutMinutes(), TimeUnit.MINUTES, "Git Clone");
     }
 
     private String executeTrivyScan(Path scanTargetDir) throws IOException, InterruptedException {
@@ -367,16 +381,16 @@ public class TrivyScannerService {
         command.add("--skip-dirs");
         command.add(".git");
 
-        // 12시간 이내에 이미 최신 DB를 동기화했다면 네트워크 I/O 스킵하여 스캔 속도 3~5초 단축
+        // 설정된 시간 주기 이내에 이미 최신 DB를 동기화했다면 네트워크 I/O 스킵하여 스캔 속도 3~5초 단축
         long now = System.currentTimeMillis();
         long lastUpdate = lastDbUpdateTime.get();
-        boolean shouldSkipUpdate = (now - lastUpdate) < DB_UPDATE_INTERVAL_MS && lastUpdate > 0;
+        boolean shouldSkipUpdate = (now - lastUpdate) < getDbUpdateIntervalMs() && lastUpdate > 0;
 
         if (shouldSkipUpdate) {
-            log.info("[TrivyScanner] ⚡ 최근 12시간 내 DB 업데이트 완료됨 -> --skip-db-update 적용 (스캔 시간 대폭 단축)");
+            log.info("[TrivyScanner] ⚡ 최근 {}시간 내 DB 업데이트 완료됨 -> --skip-db-update 적용 (스캔 시간 대폭 단축)", dbUpdateIntervalHours);
             command.add("--skip-db-update");
         } else {
-            log.info("[TrivyScanner] 🔄 Trivy 취약점 DB 최신화 검사 수행 (12시간 주기 갱신)");
+            log.info("[TrivyScanner] 🔄 Trivy 취약점 DB 최신화 검사 수행 ({}시간 주기 갱신)", dbUpdateIntervalHours);
         }
 
         command.add(scanTargetDir.toAbsolutePath().toString());
@@ -384,7 +398,7 @@ public class TrivyScannerService {
         ProcessBuilder processBuilder = new ProcessBuilder(command);
         processBuilder.redirectErrorStream(true);
 
-        ProcessRunResult result = runProcessWithTimeout(processBuilder, PROCESS_TIMEOUT_MINUTES, TimeUnit.MINUTES, "Trivy Scan");
+        ProcessRunResult result = runProcessWithTimeout(processBuilder, getProcessTimeoutMinutes(), TimeUnit.MINUTES, "Trivy Scan");
         String output = result.output();
 
         if (result.exitCode() != 0) {
@@ -402,6 +416,10 @@ public class TrivyScannerService {
     }
 
     private String resolveTrivyCommand() {
+        if (configuredTrivyExecutable != null && !configuredTrivyExecutable.isBlank()) {
+            return configuredTrivyExecutable.trim();
+        }
+
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
         if (!isWindows) {
             return "trivy";

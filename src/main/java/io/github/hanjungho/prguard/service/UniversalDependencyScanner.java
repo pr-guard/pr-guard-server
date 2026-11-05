@@ -45,6 +45,26 @@ public class UniversalDependencyScanner {
 
     private final ObjectMapper objectMapper;
 
+    @org.springframework.beans.factory.annotation.Value("${registry.pypi.url:https://pypi.org/pypi}")
+    private String pypiRegistryUrl = "https://pypi.org/pypi";
+
+    @org.springframework.beans.factory.annotation.Value("${registry.npm.url:https://registry.npmjs.org}")
+    private String npmRegistryUrl = "https://registry.npmjs.org";
+
+    @org.springframework.beans.factory.annotation.Value("${registry.cargo.url:https://crates.io/api/v1/crates}")
+    private String cargoRegistryUrl = "https://crates.io/api/v1/crates";
+
+    @org.springframework.beans.factory.annotation.Value("${registry.go.url:https://proxy.golang.org}")
+    private String goProxyUrl = "https://proxy.golang.org";
+
+    @org.springframework.beans.factory.annotation.Value("${registry.nuget.url:https://azuresearch-usnc.nuget.org/query}")
+    private String nugetRegistryUrl = "https://azuresearch-usnc.nuget.org/query";
+
+    private String cleanRegistryUrl(String url, String fallback) {
+        if (url == null || url.isBlank()) return fallback;
+        return url.replaceAll("/+$", "");
+    }
+
     private static final Set<String> IGNORED_DIRS = Set.of(
             ".git", ".gradle", ".idea", "node_modules", "target", "build", "bin", "obj",
             ".vs", ".vscode", "vendor", "dist", "out", ".next", ".nuxt",
@@ -1486,12 +1506,18 @@ public class UniversalDependencyScanner {
                     .connectTimeout(Duration.ofMillis(1200))
                     .build();
 
+            String pypiBase = cleanRegistryUrl(pypiRegistryUrl, "https://pypi.org/pypi");
+            String npmBase = cleanRegistryUrl(npmRegistryUrl, "https://registry.npmjs.org");
+            String cargoBase = cleanRegistryUrl(cargoRegistryUrl, "https://crates.io/api/v1/crates");
+            String goBase = cleanRegistryUrl(goProxyUrl, "https://proxy.golang.org");
+            String nugetBase = cleanRegistryUrl(nugetRegistryUrl, "https://azuresearch-usnc.nuget.org/query");
+
             String urlStr = switch (ecosystem) {
-                case "pypi" -> "https://pypi.org/pypi/" + pkgName + "/json";
-                case "npm" -> "https://registry.npmjs.org/" + pkgName + "/latest";
-                case "cargo" -> "https://crates.io/api/v1/crates/" + pkgName;
-                case "go" -> "https://proxy.golang.org/" + pkgName.toLowerCase() + "/@latest";
-                case "nuget" -> "https://azuresearch-usnc.nuget.org/query?q=packageid:" + pkgName + "&take=1";
+                case "pypi" -> pypiBase + "/" + pkgName + "/json";
+                case "npm" -> npmBase + "/" + pkgName + "/latest";
+                case "cargo" -> cargoBase + "/" + pkgName;
+                case "go" -> goBase + "/" + pkgName.toLowerCase() + "/@latest";
+                case "nuget" -> nugetBase + "?q=packageid:" + pkgName + "&take=1";
                 default -> null;
             };
 
