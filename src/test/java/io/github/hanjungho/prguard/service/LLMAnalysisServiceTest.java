@@ -330,12 +330,15 @@ class LLMAnalysisServiceTest {
                 0
         );
 
-        String report = service.buildFallbackDeterministicReport(payload, io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig());
+        String report503 = service.buildFallbackDeterministicReport(payload, io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig(), "HTTP 503 Service Unavailable");
+        assertNotNull(report503);
+        assertTrue(report503.contains("승인 (PASS)"));
+        assertTrue(report503.contains("오픈소스 취약점 (CVE):** 총 0건 (안전)"));
+        assertTrue(report503.contains("Google 503"));
 
-        assertNotNull(report);
-        assertTrue(report.contains("승인 (PASS)"));
-        assertTrue(report.contains("오픈소스 취약점 (CVE):** 총 0건 (안전)"));
-        assertTrue(report.contains("Google 503"));
+        String report404 = service.buildFallbackDeterministicReport(payload, io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig(), "HTTP 404 Not Found");
+        assertNotNull(report404);
+        assertTrue(report404.contains("HTTP 404"));
     }
 }
 

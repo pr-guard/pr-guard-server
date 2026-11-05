@@ -80,12 +80,16 @@ public class UniversalDependencyScanner {
             "(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testCompileOnly)\\s*[(]?['\"]([^:'\"\\s]+):([^:'\"\\s]+)(?::([^:'\"\\s]+))?['\"][)]?"
     );
     private static final Pattern GRADLE_PLUGIN_PATTERN = Pattern.compile(
-            "id\\s+['\"]([^'\"\\s]+)['\"]\\s+version\\s+['\"]([^'\"\\s]+)['\"]"
+            "id\\s*[(]?['\"]([^'\"\\s]+)['\"][)]?\\s+version\\s+['\"]([^'\"\\s]+)['\"]"
     );
 
     // Maven Regex
     private static final Pattern MAVEN_DEP_PATTERN = Pattern.compile(
             "<dependency>\\s*<groupId>([^<]+)</groupId>\\s*<artifactId>([^<]+)</artifactId>(?:\\s*<version>([^<]+)</version>)?",
+            Pattern.DOTALL
+    );
+    private static final Pattern MAVEN_PARENT_PATTERN = Pattern.compile(
+            "<parent>\\s*<groupId>([^<]+)</groupId>\\s*<artifactId>([^<]+)</artifactId>\\s*<version>([^<]+)</version>",
             Pattern.DOTALL
     );
 
@@ -541,6 +545,14 @@ public class UniversalDependencyScanner {
 
     private void parseMaven(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) throws IOException {
         String content = Files.readString(file, StandardCharsets.UTF_8);
+        Matcher pm = MAVEN_PARENT_PATTERN.matcher(content);
+        if (pm.find()) {
+            String parentGroup = pm.group(1).trim();
+            String parentArtifact = pm.group(2).trim();
+            String parentVersion = pm.group(3).trim();
+            String parentFullName = parentGroup + ":" + parentArtifact;
+            map.putIfAbsent(parentFullName, new LLMAnalysisService.SbomPackageDetail(parentFullName, parentVersion, false, "Maven-Parent"));
+        }
         Matcher m = MAVEN_DEP_PATTERN.matcher(content);
         while (m.find()) {
             String group = m.group(1).trim();
@@ -873,26 +885,78 @@ public class UniversalDependencyScanner {
         }
     }
 
+    /**
+     * Spring Boot 버전에 호환되는 핵심 하위 서브시스템(Spring Framework, Tomcat 등)의 정규 버전을 산출합니다.
+     * 버전 체계가 다른 패키지에 Spring Boot 버전을 그대로 부여하여 발생하는 취약점 오탐(CVE False Positive)을 원천 방지합니다.
+     */
+    public static String resolveCompatibleVersion(String group, String artifact, String bootVersion) {
+        if (group.startsWith("org.springframework.boot")) {
+            return bootVersion;
+        }
+        if (group.startsWith("org.springframework")) {
+            if (bootVersion.startsWith("4.")) return "7.0.0";
+            if (bootVersion.startsWith("3.4")) return "6.2.1";
+            if (bootVersion.startsWith("3.3")) return "6.1.10";
+            if (bootVersion.startsWith("3.2")) return "6.1.2";
+            if (bootVersion.startsWith("3.1")) return "6.0.9";
+            if (bootVersion.startsWith("3.0")) return "6.0.2";
+            if (bootVersion.startsWith("2.7")) return "5.3.20";
+            return "6.2.1";
+        }
+        if (group.startsWith("org.apache.tomcat")) {
+            if (bootVersion.startsWith("4.")) return "11.0.2";
+            if (bootVersion.startsWith("3.")) return "10.1.34";
+            if (bootVersion.startsWith("2.")) return "9.0.63";
+            return "10.1.34";
+        }
+        if (group.equals("org.yaml") && artifact.equals("snakeyaml")) {
+            return (bootVersion.startsWith("2.")) ? "1.30" : "2.2";
+        }
+        if (group.startsWith("ch.qos.logback")) {
+            return (bootVersion.startsWith("2.")) ? "1.2.11" : "1.5.16";
+        }
+        if (group.startsWith("org.slf4j")) {
+            return (bootVersion.startsWith("2.")) ? "1.7.36" : "2.0.16";
+        }
+        return null; // 독립 버전 체계의 서브 패키지는 가짜 버전을 부여하지 않아 오탐 차단
+    }
+
     private void resolveGradleTransitiveFallback(Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
         boolean hasIndirect = packagesMap.values().stream().anyMatch(LLMAnalysisService.SbomPackageDetail::indirect);
         if (hasIndirect) {
             return;
         }
 
-        String bootVersion = "3.2.0";
+        String bootVersion = "3.4.1"; // 기본 안정화 Spring Boot 버전
         for (LLMAnalysisService.SbomPackageDetail p : packagesMap.values()) {
-            if (p.name().contains("spring-boot") && !"(managed)".equals(p.version()) && !p.version().isBlank()) {
+            if ((p.name().equals("org.springframework.boot") || p.name().contains("spring.boot") || p.name().contains("spring-boot"))
+                    && !"(managed)".equals(p.version()) && !p.version().isBlank() && !p.version().equals("latest")) {
                 bootVersion = p.version();
                 break;
             }
         }
 
+        // 1. (managed) 상태인 직접 의존성 중 Spring Boot 스타터 버전을 감지된 실제 bootVersion으로 동기화
+        for (Map.Entry<String, LLMAnalysisService.SbomPackageDetail> entry : new ArrayList<>(packagesMap.entrySet())) {
+            LLMAnalysisService.SbomPackageDetail p = entry.getValue();
+            if (p.name().startsWith("org.springframework.boot:") && "(managed)".equals(p.version())) {
+                packagesMap.put(p.name(), new LLMAnalysisService.SbomPackageDetail(p.name(), bootVersion, p.indirect(), p.license()));
+            }
+        }
+
+        // 2. 주요 스타터 하위 전이 의존성을 버전 체계에 맞게 호환되는 정규 버전으로 안전 매핑
         List<LLMAnalysisService.SbomPackageDetail> directs = new ArrayList<>(packagesMap.values());
         for (LLMAnalysisService.SbomPackageDetail direct : directs) {
             List<String> children = COMMON_STARTER_CHILDREN.get(direct.name());
             if (children != null) {
                 for (String child : children) {
-                    packagesMap.putIfAbsent(child, new LLMAnalysisService.SbomPackageDetail(child, bootVersion, true, "Maven/Gradle"));
+                    String[] parts = child.split(":");
+                    if (parts.length >= 2) {
+                        String childVer = resolveCompatibleVersion(parts[0], parts[1], bootVersion);
+                        if (childVer != null) {
+                            packagesMap.putIfAbsent(child, new LLMAnalysisService.SbomPackageDetail(child, childVer, true, "Maven/Gradle"));
+                        }
+                    }
                 }
             } else if (direct.name().startsWith("org.springframework.boot:spring-boot-starter-")) {
                 fetchPomFromMavenCentral(direct.name(), bootVersion, packagesMap);
@@ -924,9 +988,13 @@ public class UniversalDependencyScanner {
                 while (m.find()) {
                     String childGroup = m.group(1).trim();
                     String childArtifact = m.group(2).trim();
-                    String childVer = (m.group(3) != null && !m.group(3).isBlank()) ? m.group(3).trim() : version;
-                    String childFullName = childGroup + ":" + childArtifact;
-                    map.putIfAbsent(childFullName, new LLMAnalysisService.SbomPackageDetail(childFullName, childVer, true, "Maven/Gradle"));
+                    String childVer = (m.group(3) != null && !m.group(3).isBlank())
+                            ? m.group(3).trim()
+                            : resolveCompatibleVersion(childGroup, childArtifact, version);
+                    if (childVer != null) {
+                        String childFullName = childGroup + ":" + childArtifact;
+                        map.putIfAbsent(childFullName, new LLMAnalysisService.SbomPackageDetail(childFullName, childVer, true, "Maven/Gradle"));
+                    }
                 }
             }
         } catch (Exception e) {

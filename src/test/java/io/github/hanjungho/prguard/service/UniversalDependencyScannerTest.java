@@ -394,5 +394,51 @@ class UniversalDependencyScannerTest {
         assertTrue(content.contains("\"boost\""));
         assertTrue(content.contains("\"fmt\""));
     }
+
+    @Test
+    @DisplayName("Spring Boot 버전별 하위 서브시스템(Spring Framework, Tomcat 등)의 정규 호환 버전이 정확히 산출되어야 한다")
+    void shouldAccuratelyMapCompatibleSubsystemVersions() {
+        // Spring Boot 3.4.x -> Spring Framework 6.2.x, Tomcat 10.1.x
+        assertEquals("6.2.1", UniversalDependencyScanner.resolveCompatibleVersion("org.springframework", "spring-web", "3.4.1"));
+        assertEquals("10.1.34", UniversalDependencyScanner.resolveCompatibleVersion("org.apache.tomcat.embed", "tomcat-embed-core", "3.4.1"));
+        assertEquals("2.2", UniversalDependencyScanner.resolveCompatibleVersion("org.yaml", "snakeyaml", "3.4.1"));
+
+        // Spring Boot 4.x -> Spring Framework 7.x, Tomcat 11.x
+        assertEquals("7.0.0", UniversalDependencyScanner.resolveCompatibleVersion("org.springframework", "spring-webmvc", "4.1.2"));
+        assertEquals("11.0.2", UniversalDependencyScanner.resolveCompatibleVersion("org.apache.tomcat.embed", "tomcat-embed-core", "4.1.2"));
+
+        // 독립 패키지는 임의 버전을 주입하지 않고 null 반환 (오탐 방지)
+        assertNull(UniversalDependencyScanner.resolveCompatibleVersion("com.unknown.corp", "some-lib", "3.4.1"));
+    }
+
+    @Test
+    @DisplayName("Gradle 빌드에서 managed 상태의 Spring Boot 스타터가 실제 프로젝트 플러그인 버전 및 정규 Tomcat/Spring 버전으로 안전하게 동기화되어야 한다")
+    void shouldSynchronizeSpringBootVersionToManagedStartersInGradle(@TempDir Path tempDir) throws IOException {
+        String gradleContent = """
+                plugins {
+                    id 'java'
+                    id 'org.springframework.boot' version '3.4.1'
+                }
+                dependencies {
+                    implementation 'org.springframework.boot:spring-boot-starter-web'
+                }
+                """;
+        Files.writeString(tempDir.resolve("build.gradle"), gradleContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        // 스타터 자체는 3.4.1로 동기화되어야 함
+        assertTrue(packages.stream().anyMatch(p ->
+                p.name().equals("org.springframework.boot:spring-boot-starter-web") && "3.4.1".equals(p.version())));
+
+        // Tomcat 하위 의존성은 3.2.0이 아닌 10.1.34로 매핑되어야 함 (오탐 방지)
+        assertTrue(packages.stream().anyMatch(p ->
+                p.name().equals("org.apache.tomcat.embed:tomcat-embed-core") && "10.1.34".equals(p.version())));
+
+        // Spring Web 하위 의존성은 3.2.0이 아닌 6.2.1로 매핑되어야 함
+        assertTrue(packages.stream().anyMatch(p ->
+                p.name().equals("org.springframework:spring-web") && "6.2.1".equals(p.version())));
+    }
 }
 
