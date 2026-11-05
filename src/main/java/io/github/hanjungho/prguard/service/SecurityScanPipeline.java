@@ -35,7 +35,22 @@ public class SecurityScanPipeline {
      * Key: "repoFullName#prNumber@headSha", Value: 완료 타임스탬프
      */
     private final ConcurrentHashMap<String, Long> recentCompletedScans = new ConcurrentHashMap<>();
-    private static final long DEDUP_WINDOW_MS = 10 * 60 * 1000L; // 10분 이내 중복 스캔 차단
+
+    @org.springframework.beans.factory.annotation.Value("${pipeline.dedup-window-minutes:10}")
+    private int dedupWindowMinutes = 10;
+
+    @org.springframework.beans.factory.annotation.Value("${pipeline.max-inline-comments:5}")
+    private int maxInlineComments = 5;
+
+    @org.springframework.beans.factory.annotation.Value("${github.security-label:security-risk}")
+    private String securityLabel = "security-risk";
+
+    @org.springframework.beans.factory.annotation.Value("${github.bot.name:prguard}")
+    private String botName = "prguard";
+
+    private long getDedupWindowMs() {
+        return Math.max(1, dedupWindowMinutes) * 60 * 1000L;
+    }
 
     /**
      * PR opened 또는 synchronize(커밋 푸시) 이벤트 수신 시 비동기 스캔 실행
@@ -125,10 +140,10 @@ public class SecurityScanPipeline {
         String prKey = fullName + "#" + prNumber;
         String commitKey = (headSha != null) ? prKey + "@" + headSha : null;
 
-        // 1. 최근 10분 내 동일 커밋 스캔 완료 여부 검사 (중복 웹훅 차단)
+        // 1. 최근 설정 시간 내 동일 커밋 스캔 완료 여부 검사 (중복 웹훅 차단)
         if (commitKey != null) {
             Long lastCompletedTime = recentCompletedScans.get(commitKey);
-            if (lastCompletedTime != null && (System.currentTimeMillis() - lastCompletedTime) < DEDUP_WINDOW_MS) {
+            if (lastCompletedTime != null && (System.currentTimeMillis() - lastCompletedTime) < getDedupWindowMs()) {
                 log.info("[Pipeline] ⏭️ 동일 커밋(SHA: {})에 대한 스캔이 최근 이미 완료되었습니다. 중복 스캔 생략 (Repo: {}, PR #{})",
                         headSha, fullName, prNumber);
                 return;
@@ -218,7 +233,7 @@ public class SecurityScanPipeline {
 
     private void cleanupExpiredCompletedScans() {
         if (recentCompletedScans.size() > 200) {
-            long threshold = System.currentTimeMillis() - DEDUP_WINDOW_MS;
+            long threshold = System.currentTimeMillis() - getDedupWindowMs();
             recentCompletedScans.entrySet().removeIf(entry -> entry.getValue() < threshold);
         }
     }
@@ -232,6 +247,7 @@ public class SecurityScanPipeline {
                                               List<GitHubBotService.CheckRunAnnotation> annotations) {
         String statusState;
         String statusDesc;
+        String riskLabel = (securityLabel != null && !securityLabel.isBlank()) ? securityLabel.trim() : "security-risk";
         switch (verdict) {
             case BLOCK -> {
                 statusState = "failure";
@@ -241,7 +257,7 @@ public class SecurityScanPipeline {
                         statusDesc,
                         "고위험 취약점 또는 코드 내 보안 결함이 검출되어 병합(Merge)이 차단되었습니다. PR 코멘트 및 코드 라인별 안내를 확인해 주세요.",
                         annotations);
-                gitHubBotService.addLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.addLabel(fullName, prNumber, installationId, riskLabel);
                 gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "REQUEST_CHANGES",
                         "### 🛡️ PR Guard 차단 권고 (BLOCK)\n심각한 보안 취약점(CRITICAL/HIGH) 또는 시크릿 노출이 검출되었습니다. 머지 전 조치가 필요합니다.");
             }
@@ -253,7 +269,7 @@ public class SecurityScanPipeline {
                         statusDesc,
                         "경미한 취약점 또는 설정 주의 사항이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.",
                         annotations);
-                gitHubBotService.removeLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.removeLabel(fullName, prNumber, installationId, riskLabel);
                 gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "COMMENT",
                         "### 🛡️ PR Guard 주의 (WARN)\n주의가 필요한 보안 결함이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.");
             }
@@ -265,7 +281,7 @@ public class SecurityScanPipeline {
                         statusDesc,
                         "오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.",
                         annotations);
-                gitHubBotService.removeLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.removeLabel(fullName, prNumber, installationId, riskLabel);
                 gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "APPROVE",
                         "### 🛡️ PR Guard 승인 (PASS)\n오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다. 안전하게 병합할 수 있습니다.");
             }
@@ -293,7 +309,7 @@ public class SecurityScanPipeline {
 
         Map<String, Set<Integer>> diffHunkLines = parseDiffHunkLines(prDiff);
         int inlineCommentsPosted = 0;
-        final int MAX_INLINE_COMMENTS = 5;
+        final int maxAllowedComments = Math.max(1, maxInlineComments);
 
         // 1. 하드코딩된 시크릿 결함 처리
         if (summaryPayload.secrets() != null) {
@@ -306,7 +322,7 @@ public class SecurityScanPipeline {
 
                 annotations.add(new GitHubBotService.CheckRunAnnotation(cleanPath, line, "failure", title, message));
 
-                if (inlineCommentsPosted < MAX_INLINE_COMMENTS && isLineInDiff(diffHunkLines, cleanPath, line)) {
+                if (inlineCommentsPosted < maxAllowedComments && isLineInDiff(diffHunkLines, cleanPath, line)) {
                     String commentBody = """
                             ⚠️ **[PR Guard 보안 경고]** 하드코딩된 시크릿/토큰 감지 (`%s`)
                             > **위험도:** `CRITICAL` (규칙 ID: `%s`)
@@ -335,7 +351,7 @@ public class SecurityScanPipeline {
 
                 annotations.add(new GitHubBotService.CheckRunAnnotation(cleanPath, line, annotationLevel, title, message));
 
-                if (inlineCommentsPosted < MAX_INLINE_COMMENTS && isLineInDiff(diffHunkLines, cleanPath, line)) {
+                if (inlineCommentsPosted < maxAllowedComments && isLineInDiff(diffHunkLines, cleanPath, line)) {
                     String resolutionGuide = misconfig.resolution().isBlank() ? "안전한 기본 설정으로 변경하세요." : misconfig.resolution();
                     String commentBody = """
                             ⚠️ **[PR Guard 보안 경고]** 보안 설정 결함 감지 (`%s`)
@@ -423,7 +439,8 @@ public class SecurityScanPipeline {
     private void sendFailureFeedbackComment(String fullName, Integer prNumber, Long installationId, Exception e) {
         try {
             String failureMessage = e.getMessage() != null ? e.getMessage() : "상세 사유 미확인";
-            String actionAdvice = "일시적인 네트워크 지연 또는 외부 API 응답 오류일 수 있습니다. `@prguard rescan`을 입력하여 재시도하거나 잠시 후 커밋을 다시 푸시해 주세요.";
+            String rescanCmd = "@" + ((botName != null && !botName.isBlank()) ? botName.trim() : "prguard") + " rescan";
+            String actionAdvice = "일시적인 네트워크 지연 또는 외부 API 응답 오류일 수 있습니다. `" + rescanCmd + "`을 입력하여 재시도하거나 잠시 후 커밋을 다시 푸시해 주세요.";
 
             if (failureMessage.contains("Contents: Read") || failureMessage.contains("접근 권한 부족")
                     || failureMessage.contains("terminal prompts disabled") || failureMessage.contains("could not read Username")) {
@@ -431,8 +448,8 @@ public class SecurityScanPipeline {
                         **비공개(Private) 저장소의 소스코드를 분석하기 위해서는 GitHub App의 저장소 코드 접근 권한이 필요합니다.**
                         1. **GitHub App 권한 설정**: [GitHub App Settings](https://github.com/settings/apps) -> **Permissions & events** -> **Repository permissions** 에서 **`Contents` 권한을 `Access: Read-only` (또는 Read and write)** 로 변경 후 저장합니다.
                         2. **저장소 설치 승인(Update Permissions)**: 권한 변경 후 해당 계정(또는 조직)의 **Settings -> Applications -> Installed GitHub Apps -> PR Guard** 로 이동하여 **`Review permission update request`** (새 권한 승인) 버튼을 눌러 승인해 주세요.
-                        3. 승인 후 PR에서 `@prguard rescan`을 입력하면 정상적으로 분석이 진행됩니다.
-                        """;
+                        3. 승인 후 PR에서 `%s`을 입력하면 정상적으로 분석이 진행됩니다.
+                        """.formatted(rescanCmd);
             }
 
             String failureComment = """

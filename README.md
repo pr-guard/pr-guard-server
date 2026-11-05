@@ -293,11 +293,21 @@ GitHub App 생성 시 아래 권한을 부여해야 모든 기능이 정상 동�
 | 환경 변수명 | 필수 여부 | 기본값 | 설명 |
 |---|---|---|---|
 | `GEMINI_API_KEY` | **필수** | - | Google AI Studio에서 발급받은 Gemini API 키 |
-| `GEMINI_MODEL` | 선택 | `gemini-2.5-flash` | 사용할 Gemini 모델 (`gemini-2.5-flash`, `gemini-2.0-flash` 등) |
+| `GEMINI_MODEL` | 선택 | `gemini-2.0-flash` | 사용할 Gemini 모델 (`gemini-2.0-flash`, `gemini-1.5-flash` 등) |
+| `GEMINI_API_URL` | 선택 | `https://generativelanguage.googleapis.com/v1beta/models` | Gemini API 엔드포인트 URL |
 | `GITHUB_APP_ID` | **필수** | - | 등록한 GitHub App의 고유 ID |
-| `GITHUB_APP_PRIVATE_KEY` | **필수** | - | GitHub App의 RSA Private Key 원문 (`-----BEGIN RSA...`) |
-| `GITHUB_APP_PRIVATE_KEY_PATH` | 선택 | `pr-guard-pg.private-key.pem` | Private Key 파일 마운트 경로 |
+| `GITHUB_APP_PRIVATE_KEY` | 선택 | - | GitHub App의 RSA Private Key 원문 (`-----BEGIN RSA...`) |
+| `GITHUB_APP_PRIVATE_KEY_PATH` | 선택 | `(자동 탐색)` | Private Key 파일 마운트 경로 (미설정 시 `/etc/secrets`, classpath, 루트의 `*.pem` 자동 감지) |
 | `GITHUB_WEBHOOK_SECRET` | 선택 | - | Webhook HMAC SHA-256 서명 검증 시크릿 (설정 시 위조 요청 차단) |
+| `GITHUB_API_URL` | 선택 | `https://api.github.com` | GitHub API 엔드포인트 (GitHub Enterprise Server 호환) |
+| `GITHUB_CHECK_RUN_NAME` | 선택 | `PR Guard / Security Scan` | GitHub Checks 탭에 표시될 체크 런 이름 |
+| `GITHUB_STATUS_CONTEXT` | 선택 | `pr-guard/security` | GitHub Commit Status 컨텍스트 이름 |
+| `GITHUB_BOT_NAME` | 선택 | `prguard` | ChatOps 봇 호출 멘션 이름 (`@prguard rescan`, `@prguard help`) |
+| `GITHUB_SECURITY_LABEL` | 선택 | `security-risk` | 보안 결함 검출 시 PR에 부여할 라벨명 |
+| `TRIVY_PROCESS_TIMEOUT_MINUTES` | 선택 | `5` | Git Clone 및 Trivy 스캔 프로세스 타임아웃(분) |
+| `TRIVY_DB_UPDATE_INTERVAL_HOURS` | 선택 | `12` | Trivy 취약점 DB 업데이트 주기(시간) |
+| `DIFF_MAX_LENGTH` | 선택 | `15000` | 분석 대상 PR Diff 최대 길이(자) |
+| `MAX_INLINE_COMMENTS` | 선택 | `5` | PR 당 최대 등록할 취약점 인라인 코멘트 수 |
 | `PORT` | 선택 | `8080` | 서버 HTTP 포트 |
 
 ### 로컬 빌드 및 실행

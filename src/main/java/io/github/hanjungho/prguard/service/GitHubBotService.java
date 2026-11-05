@@ -21,7 +21,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.io.InputStreamReader;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.PrivateKey;
 import java.time.Instant;
 import java.util.Collections;
@@ -30,8 +33,10 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
 
 @Slf4j
 @Service
@@ -41,10 +46,10 @@ public class GitHubBotService {
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
 
-    @Value("${github.app.id}")
+    @Value("${github.app.id:}")
     private String appId;
 
-    @Value("${github.app.private-key-path}")
+    @Value("${github.app.private-key-path:}")
     private String privateKeyPath;
 
     @Value("${github.app.private-key:}")
@@ -53,7 +58,30 @@ public class GitHubBotService {
     @Value("${github.app.default-installation-id:}")
     private String defaultInstallationId;
 
+    @Value("${github.api.url:https://api.github.com}")
+    private String githubApiUrl = "https://api.github.com";
+
+    @Value("${github.check-run.name:PR Guard / Security Scan}")
+    private String checkRunName = "PR Guard / Security Scan";
+
+    @Value("${github.status.context:pr-guard/security}")
+    private String statusContext = "pr-guard/security";
+
+    @Value("${diff.max-length:15000}")
+    private int maxDiffLength = 15000;
+
     private PrivateKey privateKey;
+
+    /**
+     * GitHub API 엔드포인트 URL을 동적으로 조합합니다 (GitHub Enterprise Server 완벽 호환)
+     */
+    public String apiUrl(String path) {
+        String base = (githubApiUrl != null && !githubApiUrl.isBlank())
+                ? githubApiUrl.replaceAll("/+$", "")
+                : "https://api.github.com";
+        String p = path.startsWith("/") ? path : "/" + path;
+        return base + p;
+    }
 
     /**
      * Installation Access Token 캐시용 레코드 (만료 5분 전까지 재사용)
@@ -68,36 +96,17 @@ public class GitHubBotService {
 
     /**
      * 서버 기동 시 .pem 파일(또는 환경변수 원시 텍스트)에서 Private Key를 1회 파싱하여 메모리에 캐싱합니다.
-     * 외부 마운트 파일(/etc/secrets/...), 환경변수 직접 주입, 클래스패스 로드를 모두 지원합니다.
+     * 외부 마운트 파일(/etc/secrets/...), 환경변수 직접 주입, 클래스패스 로드 및 디렉토리 자동 탐색을 모두 지원합니다.
      */
     @PostConstruct
     public void initPrivateKey() {
         try {
-            java.io.Reader reader = null;
-
-            // 1. 환경 변수로 직접 PEM 문자열이 주입된 경우 (Render 등 클라우드 배포 시 가장 간편)
-            if (privateKeyContent != null && !privateKeyContent.isBlank() && privateKeyContent.contains("PRIVATE KEY")) {
-                log.info("[GitHubBot] 환경 변수(GITHUB_APP_PRIVATE_KEY)에서 Private Key 직접 로드");
-                reader = new java.io.StringReader(privateKeyContent.replace("\\n", "\n"));
-            }
-            // 2. 파일 경로가 지정된 경우
-            else if (privateKeyPath != null && !privateKeyPath.isBlank()) {
-                java.nio.file.Path filePath = java.nio.file.Path.of(privateKeyPath);
-                // 2-1. 외부 파일 시스템 경로 확인 (Render Secret File: /etc/secrets/...)
-                if (java.nio.file.Files.exists(filePath) && java.nio.file.Files.isRegularFile(filePath)) {
-                    log.info("[GitHubBot] 외부 파일 시스템({})에서 Private Key 로드", filePath.toAbsolutePath());
-                    reader = new InputStreamReader(java.nio.file.Files.newInputStream(filePath), StandardCharsets.UTF_8);
-                } else {
-                    // 2-2. 클래스패스 확인 (로컬 개발 환경)
-                    log.info("[GitHubBot] 클래스패스({})에서 Private Key 로드", privateKeyPath);
-                    ClassPathResource resource = new ClassPathResource(privateKeyPath);
-                    reader = new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8);
-                }
-            }
+            java.io.Reader reader = findPrivateKeyReader();
 
             if (reader == null) {
-                throw new IllegalStateException("GitHub App Private Key 설정이 누락되었습니다. " +
-                        "GITHUB_APP_PRIVATE_KEY 환경변수 또는 GITHUB_APP_PRIVATE_KEY_PATH를 설정하세요.");
+                log.warn("[GitHubBot] ⚠️ GitHub App Private Key를 찾을 수 없습니다. " +
+                        "GITHUB_APP_PRIVATE_KEY 환경변수, GITHUB_APP_PRIVATE_KEY_PATH 또는 *.pem 파일을 제공하세요.");
+                return;
             }
 
             try (PEMParser pemParser = new PEMParser(reader)) {
@@ -112,11 +121,85 @@ public class GitHubBotService {
                     throw new IllegalArgumentException("지원하지 않는 PEM 포맷입니다: " + (object != null ? object.getClass().getName() : "null"));
                 }
             }
-            log.info("[GitHubBot] GitHub App Private Key 로드 완료 (App ID: {})", appId);
+            log.info("[GitHubBot] GitHub App Private Key 로드 완료 (App ID: {})", (appId != null && !appId.isBlank()) ? appId : "미지정");
         } catch (Exception e) {
             log.error("[GitHubBot] Private Key 로드 실패: {}", e.getMessage(), e);
             throw new IllegalStateException("GitHub App Private Key 로드에 실패했습니다.", e);
         }
+    }
+
+    private java.io.Reader findPrivateKeyReader() {
+        // 1. 환경 변수로 직접 PEM 문자열이 주입된 경우 (Render 등 클라우드 배포 시 가장 간편)
+        if (privateKeyContent != null && !privateKeyContent.isBlank() && privateKeyContent.contains("PRIVATE KEY")) {
+            log.info("[GitHubBot] 환경 변수(GITHUB_APP_PRIVATE_KEY)에서 Private Key 직접 로드");
+            return new java.io.StringReader(privateKeyContent.replace("\\n", "\n"));
+        }
+
+        // 2. 명시된 파일 경로 확인
+        if (privateKeyPath != null && !privateKeyPath.isBlank()) {
+            Path filePath = Path.of(privateKeyPath.trim());
+            // 2-1. 외부 파일 시스템 경로 확인 (Render Secret File: /etc/secrets/...)
+            if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
+                log.info("[GitHubBot] 외부 파일 시스템({})에서 Private Key 로드", filePath.toAbsolutePath());
+                try {
+                    return new InputStreamReader(Files.newInputStream(filePath), StandardCharsets.UTF_8);
+                } catch (IOException e) {
+                    log.warn("[GitHubBot] 지정된 Private Key 파일 읽기 실패: {}", e.getMessage());
+                }
+            }
+
+            // 2-2. 클래스패스 확인 (로컬 개발 환경)
+            ClassPathResource resource = new ClassPathResource(privateKeyPath.trim());
+            if (resource.exists()) {
+                log.info("[GitHubBot] 클래스패스({})에서 Private Key 로드", privateKeyPath);
+                try {
+                    return new InputStreamReader(resource.getInputStream(), StandardCharsets.UTF_8);
+                } catch (IOException e) {
+                    log.warn("[GitHubBot] 지정된 클래스패스 리소스 읽기 실패: {}", e.getMessage());
+                }
+            }
+        }
+
+        // 3. 스마트 자동 감지 (Auto-Discovery): 파일명이 바뀌어도 *.pem / *.key를 탐색
+        // 3-1. 클라우드 시크릿 마운트 기본 경로 (/etc/secrets)
+        java.io.Reader cloudReader = scanDirectoryForPem(Path.of("/etc/secrets"));
+        if (cloudReader != null) return cloudReader;
+
+        // 3-2. 로컬 소스 리소스 디렉토리 (src/main/resources)
+        java.io.Reader srcReader = scanDirectoryForPem(Path.of("src/main/resources"));
+        if (srcReader != null) return srcReader;
+
+        // 3-3. 현재 작업 디렉토리 (.)
+        java.io.Reader localReader = scanDirectoryForPem(Path.of("."));
+        if (localReader != null) return localReader;
+
+        return null;
+    }
+
+    private java.io.Reader scanDirectoryForPem(Path dir) {
+        if (!Files.exists(dir) || !Files.isDirectory(dir)) {
+            return null;
+        }
+        try (Stream<Path> stream = Files.list(dir)) {
+            Optional<Path> pemFile = stream
+                    .filter(Files::isRegularFile)
+                    .filter(p -> {
+                        String name = p.getFileName().toString().toLowerCase();
+                        return (name.endsWith(".pem") || name.endsWith(".key"))
+                                && !name.contains("public")
+                                && !name.contains("cert");
+                    })
+                    .findFirst();
+
+            if (pemFile.isPresent()) {
+                Path found = pemFile.get();
+                log.info("[GitHubBot] 🔑 Private Key 파일 자동 감지 성공: {}", found.toAbsolutePath());
+                return new InputStreamReader(Files.newInputStream(found), StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            log.debug("[GitHubBot] 디렉토리 탐색 건너뜀 ({}): {}", dir, e.getMessage());
+        }
+        return null;
     }
 
     public static final String BOT_COMMENT_MARKER = "<!-- pr-guard-report-marker -->";
@@ -188,7 +271,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] PR #{} Diff 수집 시작 (Repo: {})", prNumber, repoFullName);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber;
+            String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber);
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -210,10 +293,10 @@ public class GitHubBotService {
                 return "";
             }
 
-            int maxLength = 15000;
+            int maxLength = Math.max(1000, maxDiffLength);
             if (filteredDiff.length() > maxLength) {
                 log.info("[GitHubBot] PR Diff 길이가 {}자이므로 최대 {}자로 잘라냅니다.", filteredDiff.length(), maxLength);
-                return filteredDiff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 15,000자 이후는 생략되었습니다)";
+                return filteredDiff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 " + maxLength + "자 이후는 생략되었습니다)";
             }
 
             return filteredDiff;
@@ -313,12 +396,20 @@ public class GitHubBotService {
      * GitHub App 인증용 JWT 토큰 생성 (RS256, 유효시간 10분)
      */
     public String createJwt() {
+        if (privateKey == null) {
+            throw new IllegalStateException("GitHub App Private Key가 로드되지 않았습니다. " +
+                    "GITHUB_APP_PRIVATE_KEY 환경변수, GITHUB_APP_PRIVATE_KEY_PATH 또는 *.pem 파일을 설정하세요.");
+        }
+        if (appId == null || appId.isBlank()) {
+            throw new IllegalStateException("GitHub App ID가 설정되지 않았습니다. GITHUB_APP_ID 환경변수를 설정하세요.");
+        }
+
         long nowMillis = System.currentTimeMillis();
         Date issuedAt = new Date(nowMillis - (60 * 1000)); // 클럭 오차 방어 (1분 전)
         Date expiration = new Date(nowMillis + (10 * 60 * 1000)); // 10분 후 만료
 
         return Jwts.builder()
-                .issuer(appId)
+                .issuer(appId.trim())
                 .issuedAt(issuedAt)
                 .expiration(expiration)
                 .signWith(privateKey, Jwts.SIG.RS256)
@@ -340,7 +431,7 @@ public class GitHubBotService {
         // 1. repoFullName이 유효한 경우, 특정 저장소의 설치 정보를 직접 조회 (다중 테넌트 지원)
         if (repoFullName != null && !repoFullName.isBlank() && !"N/A".equalsIgnoreCase(repoFullName) && repoFullName.contains("/")) {
             try {
-                String repoInstallUrl = "https://api.github.com/repos/" + repoFullName + "/installation";
+                String repoInstallUrl = apiUrl("/repos/" + repoFullName + "/installation");
                 HttpHeaders headers = createBaseHeaders();
                 headers.setBearerAuth(jwt);
 
@@ -363,7 +454,7 @@ public class GitHubBotService {
 
         log.info("[GitHubBot] Installation ID가 누락되어 GitHub API를 통해 설치 목록을 자동 조회합니다.");
         try {
-            String url = "https://api.github.com/app/installations";
+            String url = apiUrl("/app/installations");
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(jwt);
 
@@ -391,7 +482,7 @@ public class GitHubBotService {
      * JWT를 사용하여 특정 Installation의 Access Token을 발급받고 메모리에 캐싱합니다.
      */
     private String fetchAndCacheInstallationAccessToken(Long installationId, String jwt) {
-        String url = "https://api.github.com/app/installations/" + installationId + "/access_tokens";
+        String url = apiUrl("/app/installations/" + installationId + "/access_tokens");
 
         HttpHeaders headers = createBaseHeaders();
         headers.setBearerAuth(jwt);
@@ -427,7 +518,7 @@ public class GitHubBotService {
      * PR(Issue)에 코멘트를 등록합니다.
      */
     private void createIssueComment(String repoFullName, Integer prNumber, String accessToken, String commentBody) {
-        String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/comments";
+        String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/comments");
 
         HttpHeaders headers = createBaseHeaders();
         headers.setBearerAuth(accessToken);
@@ -456,7 +547,7 @@ public class GitHubBotService {
         }
 
         try {
-            String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/comments?per_page=100";
+            String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/comments?per_page=100");
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(accessToken);
 
@@ -483,7 +574,7 @@ public class GitHubBotService {
      * 기존 PR(Issue) 코멘트 내용을 갱신(PATCH)합니다.
      */
     private void updateIssueComment(String repoFullName, Long commentId, String accessToken, String commentBody) {
-        String url = "https://api.github.com/repos/" + repoFullName + "/issues/comments/" + commentId;
+        String url = apiUrl("/repos/" + repoFullName + "/issues/comments/" + commentId);
 
         HttpHeaders headers = createBaseHeaders();
         headers.setBearerAuth(accessToken);
@@ -515,7 +606,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] PR #{} 상세 정보 조회 시작 (Repo: {})", prNumber, repoFullName);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber;
+            String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber);
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -551,14 +642,14 @@ public class GitHubBotService {
         log.info("[GitHubBot] Check Run 생성 시작 (Repo: {}, SHA: {})", repoFullName, headSha);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/check-runs";
+            String url = apiUrl("/repos/" + repoFullName + "/check-runs");
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
             headers.setContentType(MediaType.APPLICATION_JSON);
 
             Map<String, Object> body = Map.of(
-                    "name", "PR Guard / Security Scan",
+                    "name", (checkRunName != null && !checkRunName.isBlank()) ? checkRunName : "PR Guard / Security Scan",
                     "head_sha", headSha,
                     "status", "in_progress",
                     "started_at", Instant.now().toString(),
@@ -622,7 +713,7 @@ public class GitHubBotService {
                 checkRunId, conclusion, annotations != null ? annotations.size() : 0);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/check-runs/" + checkRunId;
+            String url = apiUrl("/repos/" + repoFullName + "/check-runs/" + checkRunId);
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -654,7 +745,7 @@ public class GitHubBotService {
             }
 
             Map<String, Object> body = Map.of(
-                    "name", "PR Guard / Security Scan",
+                    "name", (checkRunName != null && !checkRunName.isBlank()) ? checkRunName : "PR Guard / Security Scan",
                     "status", "completed",
                     "conclusion", conclusion,
                     "completed_at", Instant.now().toString(),
@@ -682,7 +773,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] PR #{} 인라인 리뷰 코멘트 작성 시도 (파일: {}:{}, SHA: {})", prNumber, filePath, line, commitSha);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber + "/comments";
+            String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber + "/comments");
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -727,7 +818,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] 커밋 Status 업데이트 시도 (SHA: {}, State: {})", commitSha, state);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/statuses/" + commitSha;
+            String url = apiUrl("/repos/" + repoFullName + "/statuses/" + commitSha);
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -735,7 +826,7 @@ public class GitHubBotService {
 
             Map<String, String> body = new HashMap<>();
             body.put("state", state);
-            body.put("context", "pr-guard/security");
+            body.put("context", (statusContext != null && !statusContext.isBlank()) ? statusContext : "pr-guard/security");
             body.put("description", (description != null && description.length() > 140)
                     ? description.substring(0, 137) + "..."
                     : (description != null ? description : "PR Guard 보안 검증 결과"));
@@ -761,7 +852,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] PR #{} 에 레이블 추가 시도: {}", prNumber, label);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/labels";
+            String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/labels");
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -786,7 +877,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] PR #{} 에서 레이블 제거 시도: {}", prNumber, label);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/issues/" + prNumber + "/labels/" + label;
+            String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/labels/" + label);
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -809,7 +900,7 @@ public class GitHubBotService {
         }
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/issues/comments/" + commentId + "/reactions";
+            String url = apiUrl("/repos/" + repoFullName + "/issues/comments/" + commentId + "/reactions");
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);
@@ -837,7 +928,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] PR #{} 공식 리뷰 제출 시도 (이벤트: {}, SHA: {})", prNumber, event, commitSha);
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
-            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber + "/reviews";
+            String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber + "/reviews");
 
             HttpHeaders headers = createBaseHeaders();
             headers.setBearerAuth(token);

@@ -59,6 +59,9 @@ public class LLMAnalysisService {
     @Value("${gemini.model:gemini-2.0-flash}")
     private String geminiModel;
 
+    @Value("${gemini.api.url:https://generativelanguage.googleapis.com/v1beta/models}")
+    private String geminiApiUrl = "https://generativelanguage.googleapis.com/v1beta/models";
+
     private static final List<String> STABLE_GEMINI_MODELS = List.of(
             "gemini-2.0-flash",
             "gemini-1.5-flash",
@@ -926,8 +929,12 @@ public class LLMAnalysisService {
         HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestPayload, headers);
         Exception lastException = null;
 
+        String baseUrl = (geminiApiUrl != null && !geminiApiUrl.isBlank())
+                ? geminiApiUrl.replaceAll("/+$", "")
+                : "https://generativelanguage.googleapis.com/v1beta/models";
+
         for (String currentModel : modelsToTry) {
-            String url = "https://generativelanguage.googleapis.com/v1beta/models/" + currentModel + ":generateContent?key=" + geminiApiKey;
+            String url = baseUrl + "/" + currentModel + ":generateContent?key=" + geminiApiKey;
 
             // 모델당 최대 2회 시도 (503 High demand, 429 Rate limit 시 지수 백오프)
             for (int attempt = 1; attempt <= 2; attempt++) {
