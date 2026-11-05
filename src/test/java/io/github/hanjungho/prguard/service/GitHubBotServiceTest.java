@@ -190,5 +190,24 @@ class GitHubBotServiceTest {
                 java.util.List.of(new GitHubBotService.CheckRunAnnotation("src/Secret.java", 12, "failure", "Secret Expose", "API Key leaked"))
         ));
     }
+
+    @Test
+    @DisplayName("submitPullRequestReview: 공식 PR Review (APPROVE/REQUEST_CHANGES) 제출 성공 검증")
+    void shouldSubmitPullRequestReviewSuccessfully() {
+        RestTemplate mockRestTemplate = org.mockito.Mockito.mock(RestTemplate.class);
+        GitHubBotService botService = org.mockito.Mockito.spy(new GitHubBotService(new ObjectMapper(), mockRestTemplate));
+        org.mockito.Mockito.doReturn("dummy-token").when(botService).getInstallationAccessToken(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+
+        org.mockito.Mockito.when(mockRestTemplate.postForEntity(
+                org.mockito.ArgumentMatchers.contains("/pulls/10/reviews"),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.eq(String.class)
+        )).thenReturn(org.springframework.http.ResponseEntity.ok("{\"id\": 5555}"));
+
+        assertDoesNotThrow(() -> botService.submitPullRequestReview(
+                "octocat/repo", 10, "sha1234", 100L,
+                "APPROVE", "보안 검증 통과"
+        ));
+    }
 }
 

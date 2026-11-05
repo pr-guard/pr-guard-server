@@ -156,6 +156,23 @@ public class WebhookController {
             }
         }
 
+        // 5. GitHub UI Checks 'Re-run' 또는 'Re-run all checks' 이벤트 감지 (check_run / check_suite: rerequested)
+        if ("rerequested".equalsIgnoreCase(action)) {
+            Integer targetPrNumber = null;
+            if (payload.getCheckRun() != null && payload.getCheckRun().getPullRequests() != null && !payload.getCheckRun().getPullRequests().isEmpty()) {
+                targetPrNumber = payload.getCheckRun().getPullRequests().get(0).getNumber();
+            } else if (payload.getCheckSuite() != null && payload.getCheckSuite().getPullRequests() != null && !payload.getCheckSuite().getPullRequests().isEmpty()) {
+                targetPrNumber = payload.getCheckSuite().getPullRequests().get(0).getNumber();
+            }
+
+            if (targetPrNumber != null && !"N/A".equals(fullName)) {
+                Long installationId = payload.getInstallation() != null ? payload.getInstallation().getId() : null;
+                log.info("[Webhook] GitHub Checks UI Re-run 요청 감지! (Repo: {}, PR #{})", fullName, targetPrNumber);
+                securityScanPipeline.executeRescanForPr(fullName, targetPrNumber, installationId);
+                return ResponseEntity.accepted().body("Re-run scheduled successfully");
+            }
+        }
+
         log.info("[Webhook] 스캔 대상 이벤트가 아니므로 스킵합니다. (action={})", action);
         return ResponseEntity.ok("Ignored non-target action");
     }

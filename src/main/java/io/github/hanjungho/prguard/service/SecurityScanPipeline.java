@@ -92,6 +92,21 @@ public class SecurityScanPipeline {
     }
 
     /**
+     * GitHub UI에서 개발자가 'Re-run' 또는 'Re-run failed checks' 버튼을 클릭했을 때 비동기 재스캔 실행
+     */
+    @Async("scanTaskExecutor")
+    public void executeRescanForPr(String fullName, Integer prNumber, Long installationId) {
+        log.info("[Pipeline] GitHub Checks UI Re-run 요청 수신 (PR #{}, Repo: {})", prNumber, fullName);
+        try {
+            GitHubBotService.PullRequestDetails prDetails = gitHubBotService.getPullRequestDetails(fullName, prNumber, installationId);
+            runScanPipeline(fullName, prNumber, prDetails.cloneUrl(), prDetails.branch(), prDetails.headSha(), installationId);
+        } catch (Exception e) {
+            log.error("[Pipeline] Re-run 재스캔 준비 실패 (PR #{}, Repo: {}): {}", prNumber, fullName, e.getMessage(), e);
+            sendFailureFeedbackComment(fullName, prNumber, installationId, e);
+        }
+    }
+
+    /**
      * 전체 보안 분석, AI 평가, GitHub Checks 및 레이블 관리 파이프라인
      */
     private void runScanPipeline(String fullName, Integer prNumber, String cloneUrl, String branch, String headSha, Long installationId) {
@@ -227,6 +242,8 @@ public class SecurityScanPipeline {
                         "고위험 취약점 또는 코드 내 보안 결함이 검출되어 병합(Merge)이 차단되었습니다. PR 코멘트 및 코드 라인별 안내를 확인해 주세요.",
                         annotations);
                 gitHubBotService.addLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "REQUEST_CHANGES",
+                        "### 🛡️ PR Guard 차단 권고 (BLOCK)\n심각한 보안 취약점(CRITICAL/HIGH) 또는 시크릿 노출이 검출되었습니다. 머지 전 조치가 필요합니다.");
             }
             case WARN -> {
                 statusState = "success";
@@ -237,6 +254,8 @@ public class SecurityScanPipeline {
                         "경미한 취약점 또는 설정 주의 사항이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.",
                         annotations);
                 gitHubBotService.removeLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "COMMENT",
+                        "### 🛡️ PR Guard 주의 (WARN)\n주의가 필요한 보안 결함이 검출되었습니다. PR 코멘트 내용을 검토 후 병합을 결정하세요.");
             }
             case PASS -> {
                 statusState = "success";
@@ -247,6 +266,8 @@ public class SecurityScanPipeline {
                         "오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.",
                         annotations);
                 gitHubBotService.removeLabel(fullName, prNumber, installationId, "security-risk");
+                gitHubBotService.submitPullRequestReview(fullName, prNumber, headSha, installationId, "APPROVE",
+                        "### 🛡️ PR Guard 승인 (PASS)\n오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다. 안전하게 병합할 수 있습니다.");
             }
             default -> {
                 statusState = "success";

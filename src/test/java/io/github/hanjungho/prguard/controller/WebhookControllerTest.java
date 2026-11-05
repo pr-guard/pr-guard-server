@@ -255,4 +255,32 @@ class WebhookControllerTest {
                 org.mockito.ArgumentMatchers.contains("PR Guard 봇 사용 가이드")
         );
     }
+
+    @Test
+    @DisplayName("GitHub Checks UI에서 'Re-run' 클릭 시(check_run rerequested) 재스캔을 트리거해야 한다")
+    void shouldTriggerRescanOnCheckRunRerequested() {
+        String json = """
+                {
+                  "action": "rerequested",
+                  "check_run": {
+                    "id": 99999,
+                    "pull_requests": [
+                      { "number": 33 }
+                    ]
+                  },
+                  "repository": {
+                    "full_name": "octocat/Hello-World"
+                  },
+                  "installation": {
+                    "id": 78910
+                  }
+                }
+                """;
+        byte[] payload = json.getBytes(StandardCharsets.UTF_8);
+
+        ResponseEntity<String> response = controller.receiveWebhook(null, payload);
+
+        assertEquals(HttpStatus.ACCEPTED, response.getStatusCode());
+        verify(pipeline, times(1)).executeRescanForPr("octocat/Hello-World", 33, 78910L);
+    }
 }

@@ -824,6 +824,40 @@ public class GitHubBotService {
         }
     }
 
+    /**
+     * GitHub PR Review를 공식 제출합니다 (APPROVE, REQUEST_CHANGES, COMMENT).
+     * 브랜치 보호 규칙의 'Require review from Pull Request' 정책과 완벽 연동됩니다.
+     */
+    public void submitPullRequestReview(String repoFullName, Integer prNumber, String commitSha,
+                                       Long installationId, String event, String bodyText) {
+        if (prNumber == null || commitSha == null || repoFullName == null) {
+            return;
+        }
+
+        log.info("[GitHubBot] PR #{} 공식 리뷰 제출 시도 (이벤트: {}, SHA: {})", prNumber, event, commitSha);
+        try {
+            String token = getInstallationAccessToken(repoFullName, installationId);
+            String url = "https://api.github.com/repos/" + repoFullName + "/pulls/" + prNumber + "/reviews";
+
+            HttpHeaders headers = createBaseHeaders();
+            headers.setBearerAuth(token);
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            Map<String, String> body = Map.of(
+                    "commit_id", commitSha,
+                    "event", event,
+                    "body", bodyText != null ? bodyText : "PR Guard 보안 검증 완료"
+            );
+
+            HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+            restTemplate.postForEntity(url, entity, String.class);
+            log.info("[GitHubBot] PR #{} 공식 리뷰 제출 성공 (이벤트: {})", prNumber, event);
+        } catch (Exception e) {
+            // 자신의 PR을 리뷰할 수 없거나 이미 닫힌 경우(422) 안전하게 로깅 후 통과
+            log.warn("[GitHubBot] PR #{} 공식 리뷰 제출 스킵/실패 (이벤트: {}): {}", prNumber, event, e.getMessage());
+        }
+    }
+
     private HttpHeaders createBaseHeaders() {
         HttpHeaders headers = new HttpHeaders();
         headers.set("Accept", "application/vnd.github+json");
