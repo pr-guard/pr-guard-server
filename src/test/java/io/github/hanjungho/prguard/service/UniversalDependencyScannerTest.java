@@ -311,6 +311,32 @@ class UniversalDependencyScannerTest {
     }
 
     @Test
+    @DisplayName("build.gradle 또는 pom.xml에 Java 버전(17, 21 등)이 명시된 경우 언어 항목에 버전이 함께 감지되어야 한다")
+    void shouldDetectJavaVersionWhenSpecifiedInManifest(@TempDir Path tempDir) throws IOException {
+        String gradleWithToolchain = """
+                plugins {
+                    id 'java'
+                    id 'org.springframework.boot' version '4.1.2'
+                }
+                java {
+                    toolchain {
+                        languageVersion = JavaLanguageVersion.of(17)
+                    }
+                }
+                """;
+        Files.writeString(tempDir.resolve("build.gradle"), gradleWithToolchain);
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("org.springframework.boot:spring-boot", "4.1.2", false)
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertEquals("Java 17", env.language(), "toolchain languageVersion 17을 감지하여 Java 17로 표현되어야 함");
+        assertEquals("Gradle", env.buildTool());
+        assertEquals("Java 17 (Gradle) / Spring Boot 4.1.2", env.toSummaryString());
+    }
+
+    @Test
     @DisplayName("TypeScript Node.js React 환경이 정확하게 감지되어야 한다")
     void shouldDetectProjectEnvironmentForNodeTypeScriptReact(@TempDir Path tempDir) throws IOException {
         Files.writeString(tempDir.resolve("package.json"), "{\"name\": \"my-app\"}");

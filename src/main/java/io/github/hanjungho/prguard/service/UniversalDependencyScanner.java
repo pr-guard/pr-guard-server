@@ -92,6 +92,14 @@ public class UniversalDependencyScanner {
             Pattern.DOTALL
     );
 
+    // Java Version Regex (Gradle / Maven)
+    private static final Pattern GRADLE_JAVA_VERSION_PATTERN = Pattern.compile(
+            "(?:JavaLanguageVersion\\.of\\((\\d+)\\)|jvmToolchain\\((\\d+)\\)|(?:sourceCompatibility|targetCompatibility)\\s*=\\s*['\"]?(?:1\\.)?(\\d+)['\"]?|VERSION_1_(\\d+)|VERSION_(\\d+))"
+    );
+    private static final Pattern MAVEN_JAVA_VERSION_PATTERN = Pattern.compile(
+            "<(?:java\\.version|maven\\.compiler\\.source|maven\\.compiler\\.release|maven\\.compiler\\.target)>(?:1\\.)?(\\d+)</"
+    );
+
     // C# / .NET / Unity Regex
     private static final Pattern CSPROJ_PACKAGE_PATTERN = Pattern.compile(
             "<PackageReference\\s+(?:Include=\"([^\"]+)\"\\s+Version=\"([^\"]+)\"|Version=\"([^\"]+)\"\\s+Include=\"([^\"]+)\")"
@@ -211,7 +219,33 @@ public class UniversalDependencyScanner {
         boolean hasMaven = Files.exists(rootDir.resolve("pom.xml"));
 
         if (hasGradle || hasMaven) {
-            String language = hasGradleKts ? "Kotlin / Java" : "Java";
+            String javaVersion = null;
+            if (hasGradle) {
+                Path gFile = hasGradleKts ? rootDir.resolve("build.gradle.kts") : rootDir.resolve("build.gradle");
+                try {
+                    String gContent = Files.readString(gFile, StandardCharsets.UTF_8);
+                    Matcher jm = GRADLE_JAVA_VERSION_PATTERN.matcher(gContent);
+                    if (jm.find()) {
+                        for (int i = 1; i <= jm.groupCount(); i++) {
+                            if (jm.group(i) != null) {
+                                javaVersion = jm.group(i);
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            } else {
+                try {
+                    String mContent = Files.readString(rootDir.resolve("pom.xml"), StandardCharsets.UTF_8);
+                    Matcher jm = MAVEN_JAVA_VERSION_PATTERN.matcher(mContent);
+                    if (jm.find()) {
+                        javaVersion = jm.group(1);
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            String langSuffix = (javaVersion != null && !javaVersion.isBlank()) ? " " + javaVersion : "";
+            String language = hasGradleKts ? ("Kotlin / Java" + langSuffix) : ("Java" + langSuffix);
             String buildTool = hasGradle ? "Gradle" : "Maven";
             String framework = "미지정";
 
@@ -886,16 +920,29 @@ public class UniversalDependencyScanner {
         command.add("--no-daemon");
         command.add("--console=plain");
         command.add("-Dorg.gradle.daemon=false");
-        command.add("-Dorg.gradle.jvmargs=-Xmx256m -XX:MaxMetaspaceSize=128m");
+        command.add("-Dorg.gradle.parallel=false");
+        command.add("-Dorg.gradle.welcome=never");
+        command.add("-Dorg.gradle.jvmargs=-Xmx128m -XX:MaxMetaspaceSize=64m");
 
-        String output = runProcessWithTimeout(command, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper");
+        String output = runProcessWithTimeout(command, rootDir, 90, TimeUnit.SECONDS, "Gradle Wrapper");
         if (output == null || !output.contains("---")) {
             List<String> fallbackCmd = new ArrayList<>(command);
             int idx = fallbackCmd.indexOf("runtimeClasspath");
             if (idx >= 0) {
                 fallbackCmd.set(idx, "compileClasspath");
             }
-            output = runProcessWithTimeout(fallbackCmd, rootDir, 45, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
+            output = runProcessWithTimeout(fallbackCmd, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
+        }
+
+        if (output == null || !output.contains("---")) {
+            // 3차 폴백: 특정 configuration 지정 없이 전체 의존성 트리 출력
+            List<String> allConfigCmd = new ArrayList<>(command);
+            int cfgIdx = allConfigCmd.indexOf("--configuration");
+            if (cfgIdx >= 0) {
+                allConfigCmd.remove(cfgIdx + 1);
+                allConfigCmd.remove(cfgIdx);
+            }
+            output = runProcessWithTimeout(allConfigCmd, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper (all configurations)");
         }
 
         if (output != null && output.contains("---")) {
@@ -1053,11 +1100,13 @@ public class UniversalDependencyScanner {
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.directory(rootDir.toFile());
         pb.redirectErrorStream(true);
-        pb.environment().put("GRADLE_OPTS", "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false");
+        // Render 512MB RAM 컨테이너 환경에서 Fork된 JVM 프로세스가 cgroup OOM Kill(코드 137)되지 않도록 엄격한 힙/메타스페이스 상한 지정
+        pb.environment().put("GRADLE_OPTS", "-Xmx128m -XX:MaxMetaspaceSize=64m -Dorg.gradle.daemon=false -Dorg.gradle.parallel=false");
+        pb.environment().put("JAVA_TOOL_OPTIONS", "-Xmx128m -XX:MaxMetaspaceSize=64m");
+        pb.environment().put("MAVEN_OPTS", "-Xmx128m -XX:MaxMetaspaceSize=64m");
         String userHome = System.getProperty("user.home");
-        if (userHome != null && !userHome.isBlank()) {
-            pb.environment().put("GRADLE_USER_HOME", userHome + "/.gradle");
-        }
+        String gradleUserHome = (userHome != null && !userHome.isBlank()) ? (userHome + "/.gradle") : "/home/appuser/.gradle";
+        pb.environment().put("GRADLE_USER_HOME", gradleUserHome);
 
         try {
             Process process = pb.start();
@@ -1085,8 +1134,11 @@ public class UniversalDependencyScanner {
 
             if (process.exitValue() != 0) {
                 String errOutput = readFuture.get(2, TimeUnit.SECONDS);
+                String preview = (errOutput != null && errOutput.length() > 400)
+                        ? errOutput.substring(errOutput.length() - 400)
+                        : (errOutput != null ? errOutput : "");
                 log.warn("[UniversalScanner] {} 프로세스 비정상 종료 (Exit code: {}): {}",
-                        processName, process.exitValue(), errOutput.length() > 300 ? errOutput.substring(0, 300) : errOutput);
+                        processName, process.exitValue(), preview);
                 return null;
             }
 

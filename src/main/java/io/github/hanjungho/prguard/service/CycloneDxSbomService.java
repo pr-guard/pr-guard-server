@@ -74,9 +74,10 @@ public class CycloneDxSbomService {
             return "";
         }
 
-        String safeVersion = (version != null && !version.isBlank() && !"(managed)".equals(version) && !"BOM-managed".equals(version))
+        String safeVersion = (version != null && !version.isBlank() && !"(managed)".equals(version) && !"BOM-managed".equals(version) && !"unknown".equalsIgnoreCase(version))
                 ? version.trim()
-                : "unknown";
+                : null;
+        String vSuffix = (safeVersion != null) ? "@" + safeVersion : "";
 
         String trimmedName = name.trim();
         if (trimmedName.startsWith("pkg:")) {
@@ -90,9 +91,9 @@ public class CycloneDxSbomService {
             String[] parts = trimmedName.split(":", 2);
             String group = parts[0].trim();
             String artifact = parts[1].trim();
-            return String.format("pkg:maven/%s/%s@%s", group, artifact, safeVersion);
+            return String.format("pkg:maven/%s/%s%s", group, artifact, vSuffix);
         } else if (!trimmedName.contains(":") && (hint.contains("gradle") || hint.contains("maven"))) {
-            return String.format("pkg:gradle/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:gradle/%s%s", trimmedName, vSuffix);
         }
 
         // 2. npm / Node.js
@@ -101,48 +102,48 @@ public class CycloneDxSbomService {
                 String[] parts = trimmedName.split("/", 2);
                 String scope = URLEncoder.encode(parts[0], StandardCharsets.UTF_8);
                 String pkg = parts[1];
-                return String.format("pkg:npm/%s/%s@%s", scope, pkg, safeVersion);
+                return String.format("pkg:npm/%s/%s%s", scope, pkg, vSuffix);
             }
-            return String.format("pkg:npm/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:npm/%s%s", trimmedName, vSuffix);
         }
 
         // 3. PyPI (Python)
         if (hint.contains("pypi") || hint.contains("python") || hint.contains("pip") || hint.contains("poetry")) {
-            return String.format("pkg:pypi/%s@%s", trimmedName.toLowerCase(), safeVersion);
+            return String.format("pkg:pypi/%s%s", trimmedName.toLowerCase(), vSuffix);
         }
 
         // 4. Cargo (Rust)
         if (hint.contains("cargo") || hint.contains("rust") || hint.contains("crates")) {
-            return String.format("pkg:cargo/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:cargo/%s%s", trimmedName, vSuffix);
         }
 
         // 5. Go (Golang)
         if (hint.contains("go") || hint.contains("golang") || trimmedName.startsWith("github.com/") || trimmedName.startsWith("golang.org/")) {
-            return String.format("pkg:golang/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:golang/%s%s", trimmedName, vSuffix);
         }
 
         // 6. NuGet (C# / .NET)
         if (hint.contains("nuget") || hint.contains(".net") || hint.contains("csharp")) {
-            return String.format("pkg:nuget/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:nuget/%s%s", trimmedName, vSuffix);
         }
 
         // 7. CocoaPods / Swift (iOS / macOS)
         if (hint.contains("cocoapods") || hint.contains("swift") || hint.contains("pod")) {
-            return String.format("pkg:cocoapods/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:cocoapods/%s%s", trimmedName, vSuffix);
         }
 
         // 8. Pub (Dart / Flutter)
         if (hint.contains("pub") || hint.contains("flutter") || hint.contains("dart")) {
-            return String.format("pkg:pub/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:pub/%s%s", trimmedName, vSuffix);
         }
 
         // 9. Composer (PHP)
         if (hint.contains("composer") || hint.contains("php")) {
-            return String.format("pkg:composer/%s@%s", trimmedName, safeVersion);
+            return String.format("pkg:composer/%s%s", trimmedName, vSuffix);
         }
 
         // 10. 기타 범용 패키지
-        return String.format("pkg:generic/%s@%s", trimmedName, safeVersion);
+        return String.format("pkg:generic/%s%s", trimmedName, vSuffix);
     }
 
     /**
@@ -644,11 +645,28 @@ public class CycloneDxSbomService {
         if (runtimeContext == null || runtimeContext.isBlank()) {
             return "클라우드 네이티브 / Bare Metal";
         }
+        String lastFromImage = null;
         for (String line : runtimeContext.split("\\r?\\n")) {
             String trimmed = line.trim();
-            if (trimmed.startsWith("FROM ")) {
-                return "Docker (" + trimmed.substring(5).trim() + ")";
+            if (trimmed.regionMatches(true, 0, "FROM ", 0, 5)) {
+                String imgPart = trimmed.substring(5).trim();
+                // --platform 플래그 제거 (예: --platform=linux/amd64 node:20 -> node:20)
+                if (imgPart.startsWith("--platform=")) {
+                    int spaceIdx = imgPart.indexOf(' ');
+                    if (spaceIdx > 0) {
+                        imgPart = imgPart.substring(spaceIdx + 1).trim();
+                    }
+                }
+                // 다단계 빌드 스테이지 별칭 제거 (예: eclipse-temurin:17-jdk-jammy AS builder -> eclipse-temurin:17-jdk-jammy)
+                int asIdx = imgPart.toUpperCase().indexOf(" AS ");
+                if (asIdx > 0) {
+                    imgPart = imgPart.substring(0, asIdx).trim();
+                }
+                lastFromImage = imgPart;
             }
+        }
+        if (lastFromImage != null && !lastFromImage.isBlank()) {
+            return "Docker (" + lastFromImage + ")";
         }
         if (runtimeContext.contains("node:")) {
             return "Node Container";

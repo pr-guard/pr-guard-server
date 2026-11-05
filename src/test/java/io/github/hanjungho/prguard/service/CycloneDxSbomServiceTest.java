@@ -58,6 +58,14 @@ class CycloneDxSbomServiceTest {
         // Pub (Dart / Flutter)
         assertEquals("pkg:pub/flutter_bloc@8.1.3",
                 CycloneDxSbomService.generatePurl("flutter_bloc", "8.1.3", "Pub(Flutter/Dart)"));
+
+        // 버전 미지정(managed 또는 null/unknown)일 경우 RFC purl-spec 표준에 따라 @unknown 대신 깔끔하게 버전 생략
+        assertEquals("pkg:maven/com.fasterxml.jackson.core/jackson-databind",
+                CycloneDxSbomService.generatePurl("com.fasterxml.jackson.core:jackson-databind", "(managed)", "Maven/Gradle"));
+        assertEquals("pkg:maven/org.springframework.boot/spring-boot-starter",
+                CycloneDxSbomService.generatePurl("org.springframework.boot:spring-boot-starter", "BOM-managed", "Maven"));
+        assertEquals("pkg:gradle/org.springframework.boot",
+                CycloneDxSbomService.generatePurl("org.springframework.boot", null, "gradle"));
     }
 
     @Test
@@ -246,6 +254,39 @@ class CycloneDxSbomServiceTest {
         assertTrue(markdown.contains("https://prguard.onrender.com/api/sbom/owner/my-web/42"));
         assertTrue(markdown.contains("SHA-256 무결성 해시:"));
         assertTrue(markdown.contains("</details>"));
+    }
+
+    @Test
+    @DisplayName("다단계(Multi-stage) Dockerfile에서 빌더 단계가 아닌 실제 최종 런타임 베이스 이미지를 정확히 추출해야 한다")
+    void shouldExtractRuntimeBaseImageFromMultiStageDockerfile() {
+        String multiStageDocker = """
+                # Stage 1: Build JAR
+                FROM eclipse-temurin:17-jdk-jammy AS builder
+                WORKDIR /app
+                COPY . .
+                RUN ./gradlew bootJar
+                
+                # Stage 2: Runtime image
+                FROM eclipse-temurin:17-jre-jammy
+                WORKDIR /app
+                COPY --from=builder /app/build/libs/app.jar app.jar
+                """;
+
+        String report = service.renderSbomMarkdownReport(
+                "pr-guard/sample",
+                1,
+                "Java 17 (Gradle) / Spring Boot 4.1.2",
+                multiStageDocker,
+                List.of(new LLMAnalysisService.SbomPackageDetail("io.jsonwebtoken:jjwt-api", "0.12.6", false, "Apache-2.0")),
+                List.of(),
+                "{}"
+        );
+
+        assertNotNull(report);
+        // 빌더 단계 AS builder가 아닌 최종 런타임 이미지 eclipse-temurin:17-jre-jammy가 추출되어야 함
+        assertTrue(report.contains("Docker (eclipse-temurin:17-jre-jammy)"),
+                "다단계 빌드에서는 최종 런타임 베이스 이미지가 추출되어야 함 (실제 리포트: " + report + ")");
+        assertFalse(report.contains("AS builder"), "빌더 별칭(AS builder)이 리포트에 노출되지 않아야 함");
     }
 }
 
