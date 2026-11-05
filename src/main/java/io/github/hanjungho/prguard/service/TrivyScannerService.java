@@ -260,6 +260,7 @@ public class TrivyScannerService {
 
         boolean finished = process.waitFor(timeout, unit);
         if (!finished) {
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
             process.destroyForcibly();
             outputFuture.cancel(true);
             throw new RuntimeException(processName + " 타임아웃 초과 (" + timeout + " " + unit.name().toLowerCase() + ")");
@@ -379,7 +380,12 @@ public class TrivyScannerService {
         command.add("--list-all-pkgs");
         command.add("-q");
         command.add("--skip-dirs");
-        command.add(".git");
+        command.add(".git,.gradle,gradle,build,target,bin,obj,node_modules,venv,__pycache__,.idea,.vscode");
+        command.add("--timeout");
+        command.add("2m");
+
+        // Docker 이미지 빌드 시 Java DB가 이미 사전 내장되어 있으므로 런타임 100MB 재다운로드 원천 차단
+        command.add("--skip-java-db-update");
 
         // 설정된 시간 주기 이내에 이미 최신 DB를 동기화했다면 네트워크 I/O 스킵하여 스캔 속도 3~5초 단축
         long now = System.currentTimeMillis();
@@ -387,7 +393,7 @@ public class TrivyScannerService {
         boolean shouldSkipUpdate = (now - lastUpdate) < getDbUpdateIntervalMs() && lastUpdate > 0;
 
         if (shouldSkipUpdate) {
-            log.info("[TrivyScanner] ⚡ 최근 {}시간 내 DB 업데이트 완료됨 -> --skip-db-update 적용 (스캔 시간 대폭 단축)", dbUpdateIntervalHours);
+            log.info("[TrivyScanner] ⚡ 최근 {}시간 내 DB 업데이트 완료됨 -> --skip-db-update 및 --skip-java-db-update 적용 (스캔 시간 대폭 단축)", dbUpdateIntervalHours);
             command.add("--skip-db-update");
         } else {
             log.info("[TrivyScanner] 🔄 Trivy 취약점 DB 최신화 검사 수행 ({}시간 주기 갱신)", dbUpdateIntervalHours);

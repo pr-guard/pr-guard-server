@@ -56,17 +56,18 @@ public class LLMAnalysisService {
     @Value("${gemini.api.key:YOUR_GEMINI_API_KEY_HERE}")
     private String geminiApiKey;
 
-    @Value("${gemini.model:gemini-2.0-flash}")
+    @Value("${gemini.model:gemini-3.5-flash-lite}")
     private String geminiModel;
 
     @Value("${gemini.api.url:https://generativelanguage.googleapis.com/v1beta/models}")
     private String geminiApiUrl = "https://generativelanguage.googleapis.com/v1beta/models";
 
     private static final List<String> STABLE_GEMINI_MODELS = List.of(
-            "gemini-2.0-flash",
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-8b",
-            "gemini-1.5-pro"
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "gemini-3.8-flash",
+            "gemini-flash-latest"
     );
 
     /**
@@ -342,7 +343,7 @@ public class LLMAnalysisService {
                     reportText = callGeminiApi(prompt);
                 } catch (Exception llmEx) {
                     log.warn("[LLMAnalysis] ⚠️ 모든 Gemini 모델 호출 일시 장애 발생({}). Trivy 정적 전수 검사 결과 기반으로 자가 복구 리포트를 생성합니다.", llmEx.getMessage());
-                    reportText = buildFallbackDeterministicReport(summaryPayload, config);
+                    reportText = buildFallbackDeterministicReport(summaryPayload, config, llmEx.getMessage());
                 }
 
                 // 7. SecurityVerdict 종합 판정
@@ -1005,6 +1006,10 @@ public class LLMAnalysisService {
      * 파이프라인 중단 없이 안전하게 자동 판정하는 자가 복구 리포트 생성기.
      */
     public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config) {
+        return buildFallbackDeterministicReport(payload, config, null);
+    }
+
+    public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config, String errorReason) {
         StringBuilder sb = new StringBuilder();
 
         if (hasBlockingVulnerabilities(payload, config)) {
@@ -1035,8 +1040,19 @@ public class LLMAnalysisService {
             sb.append("\n");
         }
 
+        String statusNotice;
+        if (errorReason != null && (errorReason.contains("503") || errorReason.contains("UNAVAILABLE") || errorReason.contains("high demand"))) {
+            statusNotice = "AI 심층 분석 서비스(Gemini)가 일시적 트래픽 집중(Google 503) 상태이므로";
+        } else if (errorReason != null && (errorReason.contains("429") || errorReason.contains("RESOURCE_EXHAUSTED") || errorReason.contains("Too Many Requests"))) {
+            statusNotice = "AI 심층 분석 서비스(Gemini)의 호출 한도(Google 429)에 도달하였으므로";
+        } else if (errorReason != null && errorReason.contains("404")) {
+            statusNotice = "AI 심층 분석 서비스(Gemini) 모델 엔드포인트 응답 지연(HTTP 404)으로 인해";
+        } else {
+            statusNotice = "AI 심층 분석 서비스(Gemini)와의 일시적 통신 지연으로 인해";
+        }
+
         sb.append("\n> [!NOTE]\n");
-        sb.append("> AI 심층 분석 서비스(Gemini)가 일시적 트래픽 폭주(Google 503) 상태이므로, Trivy 정적 보안 엔진의 전수 분석 결과를 기반으로 안전하게 자동 판정되었습니다.\n");
+        sb.append("> ").append(statusNotice).append(", Trivy 정적 보안 엔진의 전수 분석 결과를 기반으로 안전하게 자동 판정되었습니다.\n");
 
         if (payload.totalVulnerabilitiesCount() > 0) {
             sb.append("\n---\n\n### 1. 오픈소스 취약점 (CVE) — 총 ").append(payload.totalVulnerabilitiesCount()).append("건\n\n");
