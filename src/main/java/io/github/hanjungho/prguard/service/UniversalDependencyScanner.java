@@ -145,6 +145,38 @@ public class UniversalDependencyScanner {
             "^\\s*([a-zA-Z0-9_\\-\\./]+)\\s+v([0-9a-zA-Z.\\-]+)", Pattern.MULTILINE
     );
 
+    // HTML CDN Script / Link Tag Regex
+    private static final Pattern HTML_CDN_SRC_PATTERN = Pattern.compile(
+            "<(?:script[^>]+src|link[^>]+href)=[\"'](https?://[^\"']+)[\"'][^>]*>",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Python Standard Library modules (Built-in standard packages to ignore during standalone script import scanning)
+    private static final Set<String> PYTHON_STDLIB = Set.of(
+            "abc", "argparse", "array", "ast", "asyncio", "base64", "binascii", "bisect", "builtins",
+            "bz2", "calendar", "cmath", "cmd", "code", "codecs", "collections", "colorsys", "compileall",
+            "concurrent", "configparser", "contextlib", "contextvars", "copy", "copyreg", "cprofile", "csv",
+            "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal", "difflib", "dis", "distutils",
+            "doctest", "email", "encodings", "ensurepip", "enum", "errno", "faulthandler", "fcntl", "filecmp",
+            "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc", "getopt", "getpass", "gettext",
+            "glob", "graphlib", "gzip", "hashlib", "heapq", "hmac", "html", "http", "idlelib", "imaplib",
+            "imghdr", "imp", "importlib", "inspect", "io", "ipaddress", "itertools", "json", "keyword",
+            "lib2to3", "linecache", "locale", "logging", "lzma", "mailbox", "mailcap", "marshal", "math",
+            "mimetypes", "mmap", "modulefinder", "msilib", "msvcrt", "multiprocessing", "netrc", "nis",
+            "nntplib", "numbers", "operator", "optparse", "os", "ossaudiodev", "pathlib", "pdb", "pickle",
+            "pickletools", "pipes", "pkgutil", "platform", "plistlib", "poplib", "posix", "pprint",
+            "profile", "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc", "queue", "quopri", "random",
+            "re", "readline", "reprlib", "resource", "rlcompleter", "runpy", "sched", "secrets", "select",
+            "selectors", "shelve", "shlex", "shutil", "signal", "site", "smtpd", "smtplib", "sndhdr",
+            "socket", "socketserver", "spwd", "sqlite3", "ssl", "stat", "statistics", "string", "stringprep",
+            "struct", "subprocess", "sunau", "symtable", "sys", "sysconfig", "syslog", "tabnanny", "tarfile",
+            "telnetlib", "tempfile", "termios", "test", "textwrap", "threading", "time", "timeit", "tkinter",
+            "token", "tokenize", "tomllib", "trace", "traceback", "tracemalloc", "tty", "turtle", "turtledemo",
+            "types", "typing", "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings", "wave",
+            "weakref", "webbrowser", "winreg", "winsound", "wsgiref", "xdrlib", "xml", "xmlrpc", "zipapp",
+            "zipfile", "zipimport", "zlib", "zoneinfo", "setuptools", "wheel", "pip"
+    );
+
     /**
      * 저장소 디렉토리를 순회하여 실제 존재하는 매니페스트 및 Lock 파일의 패키지만 파싱합니다.
      * 디스크에 임의의 가짜 파일을 생성하거나 목(Mock) 데이터를 주입하지 않습니다.
@@ -157,6 +189,7 @@ public class UniversalDependencyScanner {
         Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap = new LinkedHashMap<>();
         boolean[] hasGradle = new boolean[1];
         boolean[] hasMaven = new boolean[1];
+        List<Path> standalonePythonFiles = new ArrayList<>();
 
         try {
             Files.walkFileTree(rootDir, new SimpleFileVisitor<>() {
@@ -178,6 +211,8 @@ public class UniversalDependencyScanner {
                         hasGradle[0] = true;
                     } else if (fileName.equals("pom.xml")) {
                         hasMaven[0] = true;
+                    } else if (fileName.endsWith(".py") && !fileName.equals("setup.py")) {
+                        standalonePythonFiles.add(file);
                     }
                     parseManifestFile(file, packagesMap);
                     return FileVisitResult.CONTINUE;
@@ -185,6 +220,11 @@ public class UniversalDependencyScanner {
             });
         } catch (IOException e) {
             log.warn("[UniversalScanner] 매니페스트 탐색 중 I/O 경고: {}", e.getMessage());
+        }
+
+        // Python 단독 스크립트(.py) 및 모듈에서 3rd-party 임포트 동적 스캔 (requirements.txt 없는 스크립트도 전수 감지)
+        if (!standalonePythonFiles.isEmpty()) {
+            parseStandalonePythonImports(standalonePythonFiles, packagesMap);
         }
 
         // 사용자가 명시적으로 Wrapper 실행을 허용한 경우에만 실제 Gradle/Maven CLI 트리 보강
@@ -309,19 +349,52 @@ public class UniversalDependencyScanner {
             detectedList.add(new ProjectEnvironment(language, buildTool, framework));
         }
 
+        // 2-1. Static Web / Pure Frontend (HTML5 / CSS3 / Vanilla JS)
+        // package.json이 없는 순수 정적 웹 프로젝트 또는 CDN 기반 프런트엔드 감지
+        boolean hasNodeStack = detectedList.stream().anyMatch(e -> e.language().contains("JavaScript") || e.language().contains("TypeScript"));
+        boolean hasHtml = hasFileWithExtension(rootDir, ".html") || hasFileWithExtension(rootDir, ".htm");
+        if (!hasNodeStack && hasHtml) {
+            boolean hasCss = hasFileWithExtension(rootDir, ".css") || hasFileWithExtension(rootDir, ".scss") || hasFileWithExtension(rootDir, ".sass");
+            boolean hasJs = hasFileWithExtension(rootDir, ".js") || hasFileWithExtension(rootDir, ".mjs");
+
+            String lang;
+            if (hasCss && hasJs) lang = "HTML5 / CSS3 / JavaScript";
+            else if (hasCss) lang = "HTML5 / CSS3";
+            else if (hasJs) lang = "HTML5 / JavaScript";
+            else lang = "HTML5";
+
+            String framework = "Vanilla Web";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("tailwindcss")) { framework = "Tailwind CSS"; break; }
+                if (n.equals("bootstrap")) { framework = "Bootstrap"; break; }
+                if (n.equals("jquery")) { framework = "jQuery"; break; }
+                if (n.equals("vue")) { framework = "Vue.js (CDN)"; break; }
+                if (n.equals("react")) { framework = "React (CDN)"; break; }
+                if (n.equals("htmx.org") || n.equals("htmx")) { framework = "HTMX"; break; }
+                if (n.equals("alpinejs") || n.equals("alpine")) { framework = "Alpine.js"; break; }
+            }
+            if ("Vanilla Web".equals(framework) && (hasFile(rootDir, "tailwind.config.js") || hasFile(rootDir, "tailwind.config.ts"))) {
+                framework = "Tailwind CSS";
+            }
+            detectedList.add(new ProjectEnvironment(lang, "Static Web", framework));
+        }
+
         // 3. Python
         boolean hasPythonManifest = hasFile(rootDir, "requirements.txt") || hasFile(rootDir, "pyproject.toml")
                 || hasFile(rootDir, "Pipfile") || hasFile(rootDir, "setup.py") || hasFile(rootDir, "setup.cfg");
+        boolean hasPythonFiles = hasFileWithExtension(rootDir, ".py");
         boolean hasPythonPackages = safePackages.stream().anyMatch(p -> {
             String lic = p.license() != null ? p.license().toLowerCase() : "";
             return lic.contains("pypi") || lic.contains("python") || lic.contains("poetry") || lic.contains("pip");
         });
 
-        if (hasPythonManifest || hasPythonPackages) {
+        if (hasPythonManifest || hasPythonPackages || hasPythonFiles) {
             String buildTool;
             if (hasFile(rootDir, "poetry.lock")) buildTool = "Poetry";
             else if (hasFile(rootDir, "Pipfile.lock")) buildTool = "Pipenv";
-            else buildTool = "pip";
+            else if (hasPythonManifest) buildTool = "pip";
+            else buildTool = "Standalone Scripts";
 
             String framework = "미지정";
             for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
@@ -329,6 +402,9 @@ public class UniversalDependencyScanner {
                 if (n.equals("django")) { framework = "Django"; break; }
                 if (n.equals("fastapi")) { framework = "FastAPI"; break; }
                 if (n.equals("flask")) { framework = "Flask"; break; }
+            }
+            if ("미지정".equals(framework) && "Standalone Scripts".equals(buildTool)) {
+                framework = "Automation Scripts";
             }
             detectedList.add(new ProjectEnvironment("Python", buildTool, framework));
         }
@@ -520,6 +596,10 @@ public class UniversalDependencyScanner {
             // 11. Mobile (Flutter / Dart): pubspec.yaml
             else if (lowerName.equals("pubspec.yaml")) {
                 parsePubspec(file, packagesMap);
+            }
+            // 12. Static Web: HTML CDN scripts/styles (*.html, *.htm)
+            else if (lowerName.endsWith(".html") || lowerName.endsWith(".htm")) {
+                parseHtmlCdnDependencies(file, packagesMap);
             }
         } catch (Exception e) {
             log.debug("[UniversalScanner] 파일 파싱 스킵 ({}): {}", fileName, e.getMessage());
@@ -1217,6 +1297,160 @@ public class UniversalDependencyScanner {
                     }
                 }
             }
+        }
+    }
+
+    private void parseHtmlCdnDependencies(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            String content = Files.readString(file, StandardCharsets.UTF_8);
+            Matcher matcher = HTML_CDN_SRC_PATTERN.matcher(content);
+            while (matcher.find()) {
+                String url = matcher.group(1).trim();
+                extractCdnPackage(url, map);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void extractCdnPackage(String url, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        if (url == null || url.isBlank()) return;
+
+        // 1. jsdelivr: cdn.jsdelivr.net/npm/<pkg>@<ver>/... or cdn.jsdelivr.net/npm/<pkg>/...
+        if (url.contains("cdn.jsdelivr.net/npm/")) {
+            int npmIdx = url.indexOf("cdn.jsdelivr.net/npm/");
+            String path = url.substring(npmIdx + "cdn.jsdelivr.net/npm/".length());
+            String pkgAndVer;
+            if (path.startsWith("@")) {
+                int secondSlash = path.indexOf('/', path.indexOf('/') + 1);
+                pkgAndVer = (secondSlash != -1) ? path.substring(0, secondSlash) : path;
+            } else {
+                int firstSlash = path.indexOf('/');
+                pkgAndVer = (firstSlash != -1) ? path.substring(0, firstSlash) : path;
+            }
+
+            int atIdx = pkgAndVer.lastIndexOf('@');
+            if (atIdx > 0) {
+                String name = pkgAndVer.substring(0, atIdx).trim();
+                String ver = pkgAndVer.substring(atIdx + 1).trim();
+                map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "CDN(HTML)"));
+            } else if (!pkgAndVer.isBlank()) {
+                map.putIfAbsent(pkgAndVer, new LLMAnalysisService.SbomPackageDetail(pkgAndVer, "latest", false, "CDN(HTML)"));
+            }
+            return;
+        }
+
+        // 2. cdnjs: cdnjs.cloudflare.com/ajax/libs/<pkg>/<ver>/...
+        if (url.contains("cdnjs.cloudflare.com/ajax/libs/")) {
+            int cdnIdx = url.indexOf("cdnjs.cloudflare.com/ajax/libs/");
+            String path = url.substring(cdnIdx + "cdnjs.cloudflare.com/ajax/libs/".length());
+            String[] parts = path.split("/");
+            if (parts.length >= 2) {
+                String name = parts[0].trim();
+                String ver = parts[1].trim();
+                map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "CDN(HTML)"));
+            }
+            return;
+        }
+
+        // 3. unpkg: unpkg.com/<pkg>@<ver>/...
+        if (url.contains("unpkg.com/")) {
+            int unpkgIdx = url.indexOf("unpkg.com/");
+            String path = url.substring(unpkgIdx + "unpkg.com/".length());
+            String pkgAndVer;
+            if (path.startsWith("@")) {
+                int secondSlash = path.indexOf('/', path.indexOf('/') + 1);
+                pkgAndVer = (secondSlash != -1) ? path.substring(0, secondSlash) : path;
+            } else {
+                int firstSlash = path.indexOf('/');
+                pkgAndVer = (firstSlash != -1) ? path.substring(0, firstSlash) : path;
+            }
+
+            int atIdx = pkgAndVer.lastIndexOf('@');
+            if (atIdx > 0) {
+                String name = pkgAndVer.substring(0, atIdx).trim();
+                String ver = pkgAndVer.substring(atIdx + 1).trim();
+                map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "CDN(HTML)"));
+            } else if (!pkgAndVer.isBlank()) {
+                map.putIfAbsent(pkgAndVer, new LLMAnalysisService.SbomPackageDetail(pkgAndVer, "latest", false, "CDN(HTML)"));
+            }
+            return;
+        }
+
+        // 4. code.jquery.com/jquery-<ver>.min.js
+        if (url.contains("code.jquery.com/jquery-")) {
+            int jqIdx = url.indexOf("code.jquery.com/jquery-");
+            String verPart = url.substring(jqIdx + "code.jquery.com/jquery-".length());
+            int endIdx = verPart.indexOf(".js");
+            if (endIdx != -1) {
+                verPart = verPart.substring(0, endIdx).replace(".min", "").replace(".slim", "");
+                map.putIfAbsent("jquery", new LLMAnalysisService.SbomPackageDetail("jquery", verPart, false, "CDN(HTML)"));
+            }
+            return;
+        }
+
+        // 5. Tailwind Play CDN: cdn.tailwindcss.com
+        if (url.contains("cdn.tailwindcss.com")) {
+            map.putIfAbsent("tailwindcss", new LLMAnalysisService.SbomPackageDetail("tailwindcss", "3.x", false, "CDN(HTML)"));
+            return;
+        }
+
+        // 6. Bootstrap CDN: stackpath.bootstrapcdn.com/bootstrap/<ver>/
+        if (url.contains("bootstrapcdn.com/bootstrap/")) {
+            int bIdx = url.indexOf("bootstrapcdn.com/bootstrap/");
+            String path = url.substring(bIdx + "bootstrapcdn.com/bootstrap/".length());
+            int slashIdx = path.indexOf('/');
+            String ver = (slashIdx != -1) ? path.substring(0, slashIdx) : "latest";
+            map.putIfAbsent("bootstrap", new LLMAnalysisService.SbomPackageDetail("bootstrap", ver, false, "CDN(HTML)"));
+        }
+    }
+
+    private void parseStandalonePythonImports(List<Path> pyFiles, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        int scannedCount = 0;
+        for (Path pyFile : pyFiles) {
+            if (scannedCount++ > 100) break;
+            try {
+                List<String> lines = Files.readAllLines(pyFile, StandardCharsets.UTF_8);
+                for (String rawLine : lines) {
+                    String line = rawLine.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+
+                    String module = null;
+                    if (line.startsWith("import ")) {
+                        String rest = line.substring(7).trim();
+                        int commaIdx = rest.indexOf(',');
+                        if (commaIdx != -1) rest = rest.substring(0, commaIdx).trim();
+                        int asIdx = rest.indexOf(" as ");
+                        if (asIdx != -1) rest = rest.substring(0, asIdx).trim();
+                        int dotIdx = rest.indexOf('.');
+                        module = (dotIdx != -1) ? rest.substring(0, dotIdx).trim() : rest.trim();
+                    } else if (line.startsWith("from ")) {
+                        String rest = line.substring(5).trim();
+                        int importIdx = rest.indexOf(" import ");
+                        if (importIdx != -1) {
+                            String modPart = rest.substring(0, importIdx).trim();
+                            if (!modPart.startsWith(".")) {
+                                int dotIdx = modPart.indexOf('.');
+                                module = (dotIdx != -1) ? modPart.substring(0, dotIdx).trim() : modPart.trim();
+                            }
+                        }
+                    }
+
+                    if (module != null && !module.isBlank() && !PYTHON_STDLIB.contains(module.toLowerCase())) {
+                        String normMod = module.toLowerCase();
+                        if (normMod.equals("bs4")) {
+                            normMod = "beautifulsoup4";
+                        } else if (normMod.equals("pil")) {
+                            normMod = "pillow";
+                        } else if (normMod.equals("cv2")) {
+                            normMod = "opencv-python";
+                        } else if (normMod.equals("yaml")) {
+                            normMod = "pyyaml";
+                        } else if (normMod.equals("dotenv")) {
+                            normMod = "python-dotenv";
+                        }
+                        map.putIfAbsent(normMod, new LLMAnalysisService.SbomPackageDetail(normMod, "latest (inferred)", false, "Python(Script-Import)"));
+                    }
+                }
+            } catch (Exception ignored) {}
         }
     }
 

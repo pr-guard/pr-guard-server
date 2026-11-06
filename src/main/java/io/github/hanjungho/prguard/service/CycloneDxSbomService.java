@@ -28,7 +28,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * OWASP CycloneDX v1.5 표준 규격을 완벽히 준수하는 기계 판독형 SBOM(Software Bill of Materials) 엔진.
+ * OWASP CycloneDX v1.5 표준 규격을 완벽히 준수하는 기계 판독형 SBOM(Software Bill of Materials)
+ * 엔진.
  * 미국 백악관 행정명령(EO 14028) 및 NTIA Minimum Elements for SBOM 규격에 따라
  * 고유 PURL(Package URL), SPDX 라이선스, SHA-256 무결성 해시, 프로젝트 환경 메타데이터 및
  * 직접/간접(전이) 의존성 관계 트리, 외부 SaaS 연동 서비스를 국제 표준 JSON 형식으로 생성하고 REST API로 제공합니다.
@@ -49,8 +50,8 @@ public class CycloneDxSbomService {
             String name,
             String provider,
             String endpoint,
-            String dataClassification
-    ) {}
+            String dataClassification) {
+    }
 
     /**
      * 최근 생성된 CycloneDX SBOM JSON 메모이제이션 캐시 (REST API 조회용)
@@ -62,21 +63,22 @@ public class CycloneDxSbomService {
                 protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
                     return size() > MAX_CACHE_SIZE;
                 }
-            }
-    );
+            });
 
     /**
      * 패키지명, 설치 버전 및 생태계 힌트를 기반으로 글로벌 표준 Package URL (purl) 식별자를 생성합니다.
-     * 규격: RFC / Package URL Specification (https://github.com/package-url/purl-spec)
+     * 규격: RFC / Package URL Specification
+     * (https://github.com/package-url/purl-spec)
      */
     public static String generatePurl(String name, String version, String ecosystemHint) {
         if (name == null || name.isBlank()) {
             return "";
         }
 
-        String safeVersion = (version != null && !version.isBlank() && !"(managed)".equals(version) && !"BOM-managed".equals(version) && !"unknown".equalsIgnoreCase(version))
-                ? version.trim()
-                : null;
+        String safeVersion = (version != null && !version.isBlank() && !"(managed)".equals(version)
+                && !"BOM-managed".equals(version) && !"unknown".equalsIgnoreCase(version))
+                        ? version.trim()
+                        : null;
         String vSuffix = (safeVersion != null) ? "@" + safeVersion : "";
 
         String trimmedName = name.trim();
@@ -96,8 +98,10 @@ public class CycloneDxSbomService {
             return String.format("pkg:gradle/%s%s", trimmedName, vSuffix);
         }
 
-        // 2. npm / Node.js
-        if (hint.contains("npm") || hint.contains("node") || hint.contains("yarn") || hint.contains("pnpm") || trimmedName.startsWith("@")) {
+        // 2. npm / Node.js & Static Web CDN Libraries
+        if (hint.contains("npm") || hint.contains("node") || hint.contains("yarn") || hint.contains("pnpm")
+                || hint.contains("cdn") || hint.contains("html")
+                || trimmedName.startsWith("@")) {
             if (trimmedName.startsWith("@") && trimmedName.contains("/")) {
                 String[] parts = trimmedName.split("/", 2);
                 String scope = URLEncoder.encode(parts[0], StandardCharsets.UTF_8);
@@ -118,7 +122,8 @@ public class CycloneDxSbomService {
         }
 
         // 5. Go (Golang)
-        if (hint.contains("go") || hint.contains("golang") || trimmedName.startsWith("github.com/") || trimmedName.startsWith("golang.org/")) {
+        if (hint.contains("go") || hint.contains("golang") || trimmedName.startsWith("github.com/")
+                || trimmedName.startsWith("golang.org/")) {
             return String.format("pkg:golang/%s%s", trimmedName, vSuffix);
         }
 
@@ -151,13 +156,11 @@ public class CycloneDxSbomService {
      * 통신 중인 외부 SaaS 및 타사 서비스 엔드포인트를 자동 감지합니다.
      */
     private static final Pattern EXTERNAL_URL_PATTERN = Pattern.compile(
-            "https?://([a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\\s\"'<>#`]*)?"
-    );
+            "https?://([a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\\s\"'<>#`]*)?");
 
     private static final Pattern DB_PROTOCOL_PATTERN = Pattern.compile(
             "(postgresql|postgres|redis|rediss|mongodb|mongodb\\+srv|mysql|amqp|amqps)://([^\\s\"'<>#`]+)",
-            Pattern.CASE_INSENSITIVE
-    );
+            Pattern.CASE_INSENSITIVE);
 
     /**
      * 프로젝트 설정 파일(application.properties, YAML, .env 등)을 실제 검사하여
@@ -172,26 +175,33 @@ public class CycloneDxSbomService {
      * 저장소 내 실제 설정 파일 및 선언된 패키지(Supabase, Notion, PostgreSQL, Playwright 등)를 정밀 분석하여
      * 외부 SaaS 및 인프라 연동 엔드포인트를 식별합니다.
      */
-    public List<ExternalServiceDetail> detectExternalServices(Path rootDir, List<LLMAnalysisService.SbomPackageDetail> packages) {
+    public List<ExternalServiceDetail> detectExternalServices(Path rootDir,
+            List<LLMAnalysisService.SbomPackageDetail> packages) {
         Map<String, ExternalServiceDetail> detected = new LinkedHashMap<>();
 
         // 1. 패키지 의존성 기반 명시적 외부 SaaS 및 데이터베이스 자산 감지
         if (packages != null) {
             for (LLMAnalysisService.SbomPackageDetail pkg : packages) {
                 String n = pkg.name().toLowerCase();
-                if (n.equals("supabase") || n.contains("@supabase/") || n.contains("gotrue") || n.contains("postgrest")) {
+                if (n.equals("supabase") || n.contains("@supabase/") || n.contains("gotrue")
+                        || n.contains("postgrest")) {
                     detected.putIfAbsent("Supabase", new ExternalServiceDetail(
-                            "Supabase", "Supabase Inc.", "https://*.supabase.co", "클라우드 BaaS, 사용자 인증(Auth) 및 관리형 데이터베이스"));
+                            "Supabase", "Supabase Inc.", "https://*.supabase.co",
+                            "클라우드 BaaS, 사용자 인증(Auth) 및 관리형 데이터베이스"));
                 } else if (n.startsWith("psycopg") || n.equals("asyncpg") || n.equals("pg") || n.equals("postgres")) {
                     detected.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
-                            "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
-                } else if (n.equals("redis") || n.equals("ioredis") || n.equals("aioredis") || n.contains("redis-py") || n.contains("spring-boot-starter-data-redis")) {
+                            "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://",
+                            "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+                } else if (n.equals("redis") || n.equals("ioredis") || n.equals("aioredis") || n.contains("redis-py")
+                        || n.contains("spring-boot-starter-data-redis")) {
                     detected.putIfAbsent("Redis", new ExternalServiceDetail(
                             "Redis", "Redis Ltd.", "redis://", "인메모리 캐시, 세션 저장소 및 NoSQL 키-값 데이터베이스"));
-                } else if (n.equals("pymongo") || n.equals("mongodb") || n.equals("mongoose") || n.equals("motor") || n.contains("spring-boot-starter-data-mongodb")) {
+                } else if (n.equals("pymongo") || n.equals("mongodb") || n.equals("mongoose") || n.equals("motor")
+                        || n.contains("spring-boot-starter-data-mongodb")) {
                     detected.putIfAbsent("MongoDB", new ExternalServiceDetail(
                             "MongoDB", "MongoDB Inc.", "mongodb://", "NoSQL 도큐먼트 지향 데이터베이스"));
-                } else if (n.equals("mysql") || n.equals("mysql2") || n.equals("mysqlclient") || n.equals("pymysql") || n.equals("mariadb") || n.contains("mysql-connector")) {
+                } else if (n.equals("mysql") || n.equals("mysql2") || n.equals("mysqlclient") || n.equals("pymysql")
+                        || n.equals("mariadb") || n.contains("mysql-connector")) {
                     detected.putIfAbsent("MySQL / MariaDB", new ExternalServiceDetail(
                             "MySQL / MariaDB", "Oracle / MariaDB Corp", "mysql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
                 } else if (n.contains("pterodactyl") || n.contains("pydactyl")) {
@@ -199,28 +209,36 @@ public class CycloneDxSbomService {
                             "Pterodactyl API", "Pterodactyl", "https://*", "게임 및 도커 컨테이너 원격 인프라 제어 관리 API"));
                 } else if (n.contains("cloudflare")) {
                     detected.putIfAbsent("Cloudflare Services", new ExternalServiceDetail(
-                            "Cloudflare Services", "Cloudflare Inc.", "https://api.cloudflare.com", "네트워크 터널링, 프록시, CDN 및 DNS 보안 연동"));
-                } else if (n.contains("kafka") || n.equals("pika") || n.equals("amqplib") || n.contains("spring-kafka") || n.contains("spring-rabbit") || n.equals("kafkajs")) {
+                            "Cloudflare Services", "Cloudflare Inc.", "https://api.cloudflare.com",
+                            "네트워크 터널링, 프록시, CDN 및 DNS 보안 연동"));
+                } else if (n.contains("kafka") || n.equals("pika") || n.equals("amqplib") || n.contains("spring-kafka")
+                        || n.contains("spring-rabbit") || n.equals("kafkajs")) {
                     detected.putIfAbsent("Message Broker (Kafka / RabbitMQ)", new ExternalServiceDetail(
-                            "Message Broker (Kafka / RabbitMQ)", "Apache / VMware", "amqp:// / kafka://", "분산 이벤트 스트리밍 및 비동기 메시지 큐"));
+                            "Message Broker (Kafka / RabbitMQ)", "Apache / VMware", "amqp:// / kafka://",
+                            "분산 이벤트 스트리밍 및 비동기 메시지 큐"));
                 } else if (n.contains("elasticsearch") || n.contains("opensearch")) {
                     detected.putIfAbsent("Elasticsearch / OpenSearch", new ExternalServiceDetail(
                             "Elasticsearch / OpenSearch", "Elastic / AWS", "https://*", "분산 실시간 검색 엔진 및 로그 분석 인덱스"));
-                } else if (n.equals("boto3") || n.equals("botocore") || n.startsWith("@aws-sdk/") || n.startsWith("aws-sdk") || n.contains("aws-java-sdk")) {
+                } else if (n.equals("boto3") || n.equals("botocore") || n.startsWith("@aws-sdk/")
+                        || n.startsWith("aws-sdk") || n.contains("aws-java-sdk")) {
                     detected.putIfAbsent("AWS", new ExternalServiceDetail(
-                            "Amazon Web Services (AWS)", "Amazon", "https://*.amazonaws.com", "클라우드 스토리지(S3), DynamoDB 및 백엔드 인프라 자원"));
+                            "Amazon Web Services (AWS)", "Amazon", "https://*.amazonaws.com",
+                            "클라우드 스토리지(S3), DynamoDB 및 백엔드 인프라 자원"));
                 } else if (n.equals("firebase-admin") || n.startsWith("@firebase/") || n.equals("firebase")) {
                     detected.putIfAbsent("Firebase", new ExternalServiceDetail(
                             "Firebase", "Google Cloud", "https://*.firebaseio.com", "실시간 데이터베이스, 푸시 알림 및 모바일 백엔드 서비스"));
                 } else if (n.equals("notion-client") || n.contains("@notionhq/client")) {
                     detected.putIfAbsent("Notion API", new ExternalServiceDetail(
                             "Notion API", "Notion Labs Inc.", "https://api.notion.com", "워크스페이스 문서 및 데이터베이스 연동"));
-                } else if (n.contains("google-generativeai") || n.contains("@google/generative-ai") || n.contains("@google/genai")) {
+                } else if (n.contains("google-generativeai") || n.contains("@google/generative-ai")
+                        || n.contains("@google/genai")) {
                     detected.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
-                            "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+                            "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com",
+                            "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
                 } else if (n.contains("playwright")) {
                     detected.putIfAbsent("Playwright", new ExternalServiceDetail(
-                            "Playwright", "Microsoft", "Headless Chromium/Firefox/WebKit", "엔드투엔드(E2E) 브라우저 자동화 및 웹 크롤링"));
+                            "Playwright", "Microsoft", "Headless Chromium/Firefox/WebKit",
+                            "엔드투엔드(E2E) 브라우저 자동화 및 웹 크롤링"));
                 }
             }
         }
@@ -238,7 +256,8 @@ public class CycloneDxSbomService {
                     String name = dir.getFileName() != null ? dir.getFileName().toString() : "";
                     if (name.startsWith(".") || name.equals("node_modules") || name.equals("build")
                             || name.equals("target") || name.equals(".git") || name.equals("gradle")) {
-                        if (!name.equals(".")) return FileVisitResult.SKIP_SUBTREE;
+                        if (!name.equals("."))
+                            return FileVisitResult.SKIP_SUBTREE;
                     }
                     return FileVisitResult.CONTINUE;
                 }
@@ -252,14 +271,17 @@ public class CycloneDxSbomService {
                     // 오직 실제 외부 환경/설정이 기술되는 설정 파일 및 배포 매니페스트만 검사 (소스코드 오탐 방지)
                     if (lower.endsWith(".properties") || lower.endsWith(".yml") || lower.endsWith(".yaml")
                             || lower.startsWith(".env") || lower.equals("dockerfile") || lower.endsWith("compose.yml")
-                            || lower.endsWith("compose.yaml") || lower.equals("settings.py") || lower.equals("config.py")
+                            || lower.endsWith("compose.yaml") || lower.equals("settings.py")
+                            || lower.equals("config.py")
                             || lower.endsWith(".ini")
-                            || (lower.endsWith(".json") && !lower.contains("package") && !lower.contains("lock") && !lower.contains("tsconfig"))
+                            || (lower.endsWith(".json") && !lower.contains("package") && !lower.contains("lock")
+                                    && !lower.contains("tsconfig"))
                             || lower.contains("config") || lower.contains("setting") || lower.contains("database")) {
                         try {
                             String content = Files.readString(file, StandardCharsets.UTF_8);
                             checkContentForConfiguredUrls(content, detected);
-                        } catch (Exception ignored) {}
+                        } catch (Exception ignored) {
+                        }
                     }
                     return FileVisitResult.CONTINUE;
                 }
@@ -276,13 +298,15 @@ public class CycloneDxSbomService {
             return;
         }
 
-        // 1. 데이터베이스 및 큐 프로토콜 엔드포인트 감지 (postgresql://, redis://, mongodb://, mysql://, amqp://)
+        // 1. 데이터베이스 및 큐 프로토콜 엔드포인트 감지 (postgresql://, redis://, mongodb://, mysql://,
+        // amqp://)
         Matcher dbm = DB_PROTOCOL_PATTERN.matcher(content);
         while (dbm.find()) {
             String proto = dbm.group(1).toLowerCase();
             if (proto.startsWith("postgres")) {
                 map.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
-                        "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+                        "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://",
+                        "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
             } else if (proto.startsWith("redis")) {
                 map.putIfAbsent("Redis", new ExternalServiceDetail(
                         "Redis", "Redis Ltd.", "redis://", "인메모리 캐시, 세션 저장소 및 NoSQL 키-값 데이터베이스"));
@@ -299,7 +323,8 @@ public class CycloneDxSbomService {
         }
 
         // 2. 환경변수 및 설정 키워드 감지 (.env, application.yml, config.py 등)
-        if (content.contains("SUPABASE_URL") || content.contains("SUPABASE_KEY") || content.contains("NEXT_PUBLIC_SUPABASE")) {
+        if (content.contains("SUPABASE_URL") || content.contains("SUPABASE_KEY")
+                || content.contains("NEXT_PUBLIC_SUPABASE")) {
             map.putIfAbsent("Supabase", new ExternalServiceDetail(
                     "Supabase", "Supabase Inc.", "https://*.supabase.co", "클라우드 BaaS, 사용자 인증(Auth) 및 관리형 데이터베이스"));
         }
@@ -313,15 +338,18 @@ public class CycloneDxSbomService {
         }
         if (content.contains("GEMINI_API_KEY") || content.contains("GOOGLE_API_KEY")) {
             map.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
-                    "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+                    "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com",
+                    "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
         }
         if (content.contains("REDIS_URL") || content.contains("REDIS_HOST")) {
             map.putIfAbsent("Redis", new ExternalServiceDetail(
                     "Redis", "Redis Ltd.", "redis://", "인메모리 캐시 및 세션 저장소"));
         }
-        if (content.contains("POSTGRES_") || (content.contains("DATABASE_URL") && content.toLowerCase().contains("postgres"))) {
+        if (content.contains("POSTGRES_")
+                || (content.contains("DATABASE_URL") && content.toLowerCase().contains("postgres"))) {
             map.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
-                    "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+                    "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://",
+                    "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
         }
         if (content.contains("PLAYWRIGHT") || content.contains("BROWSER_WS_ENDPOINT")) {
             map.putIfAbsent("Playwright", new ExternalServiceDetail(
@@ -349,12 +377,15 @@ public class CycloneDxSbomService {
             }
 
             // 실제 설정에 존재하는 호스트별 표준 서비스 매핑
-            if (host.equals("generativelanguage.googleapis.com") || (host.contains("googleapis.com") && fullUrl.contains("gemini"))) {
+            if (host.equals("generativelanguage.googleapis.com")
+                    || (host.contains("googleapis.com") && fullUrl.contains("gemini"))) {
                 map.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
-                        "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+                        "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com",
+                        "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
             } else if (host.equals("api.github.com") || fullUrl.contains("github.com/api")) {
                 map.putIfAbsent("GitHub API", new ExternalServiceDetail(
-                        "GitHub REST & Checks API", "GitHub / Microsoft", "https://api.github.com", "Check Run 상태 동기화 및 PR 코멘트 등록"));
+                        "GitHub REST & Checks API", "GitHub / Microsoft", "https://api.github.com",
+                        "Check Run 상태 동기화 및 PR 코멘트 등록"));
             } else if (host.equals("api.openai.com")) {
                 map.putIfAbsent("OpenAI API", new ExternalServiceDetail(
                         "OpenAI API", "OpenAI", "https://api.openai.com", "LLM 인퍼런스 프롬프트 및 완성 데이터"));
@@ -393,7 +424,8 @@ public class CycloneDxSbomService {
                         "Slack Webhook", "Salesforce", "https://hooks.slack.com", "CI/CD 빌드 알림 메시지"));
             } else {
                 // 그 외 설정 파일에 등록된 실제 외부 통신 API 엔드포인트 동적 등록
-                String serviceName = host.replace("api.", "").replace(".com", "").replace(".io", "").toUpperCase() + " API";
+                String serviceName = host.replace("api.", "").replace(".com", "").replace(".io", "").toUpperCase()
+                        + " API";
                 map.putIfAbsent(host, new ExternalServiceDetail(
                         serviceName, host, "https://" + host, "외부 연동 웹 서비스 API"));
             }
@@ -405,9 +437,9 @@ public class CycloneDxSbomService {
             Integer prNumber,
             String projectEnvironment,
             List<LLMAnalysisService.SbomPackageDetail> packages,
-            List<LLMAnalysisService.VulnerabilityDetail> vulnerabilities
-    ) {
-        return buildCycloneDxJson(repoFullName, prNumber, projectEnvironment, packages, vulnerabilities, Collections.emptyList());
+            List<LLMAnalysisService.VulnerabilityDetail> vulnerabilities) {
+        return buildCycloneDxJson(repoFullName, prNumber, projectEnvironment, packages, vulnerabilities,
+                Collections.emptyList());
     }
 
     /**
@@ -419,8 +451,7 @@ public class CycloneDxSbomService {
             String projectEnvironment,
             List<LLMAnalysisService.SbomPackageDetail> packages,
             List<LLMAnalysisService.VulnerabilityDetail> vulnerabilities,
-            List<ExternalServiceDetail> externalServices
-    ) {
+            List<ExternalServiceDetail> externalServices) {
         ObjectNode root = objectMapper.createObjectNode();
 
         // 1. CycloneDX v1.5 Header
@@ -443,7 +474,8 @@ public class CycloneDxSbomService {
 
         ObjectNode appComponent = metadata.putObject("component");
         appComponent.put("type", "application");
-        appComponent.put("name", (repoFullName != null && !repoFullName.isBlank()) ? repoFullName : "pr-guard-target-app");
+        appComponent.put("name",
+                (repoFullName != null && !repoFullName.isBlank()) ? repoFullName : "pr-guard-target-app");
         if (prNumber != null) {
             appComponent.put("version", "PR #" + prNumber);
         }
@@ -474,14 +506,17 @@ public class CycloneDxSbomService {
 
                 String purl = (pkg.purl() != null && !pkg.purl().isBlank() && !pkg.purl().startsWith("pkg:generic/"))
                         ? pkg.purl()
-                        : generatePurl(pkg.name(), pkg.version(), (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : pkg.license());
+                        : generatePurl(pkg.name(), pkg.version(),
+                                (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment
+                                        : pkg.license());
 
                 comp.put("bom-ref", purl);
                 comp.put("name", pkg.name());
 
-                String ver = (pkg.version() != null && !pkg.version().isBlank() && !"(managed)".equals(pkg.version()) && !"BOM-managed".equals(pkg.version()))
-                        ? pkg.version()
-                        : "unknown";
+                String ver = (pkg.version() != null && !pkg.version().isBlank() && !"(managed)".equals(pkg.version())
+                        && !"BOM-managed".equals(pkg.version()))
+                                ? pkg.version()
+                                : "unknown";
                 comp.put("version", ver);
                 comp.put("purl", purl);
                 comp.put("scope", pkg.indirect() ? "optional" : "required");
@@ -584,8 +619,7 @@ public class CycloneDxSbomService {
             String runtimeContext,
             List<LLMAnalysisService.SbomPackageDetail> packages,
             List<ExternalServiceDetail> externalServices,
-            String cycloneDxJson
-    ) {
+            String cycloneDxJson) {
         int totalPackages = (packages != null) ? packages.size() : 0;
         int totalServices = (externalServices != null) ? externalServices.size() : 0;
         int totalCount = totalPackages + totalServices;
@@ -613,7 +647,8 @@ public class CycloneDxSbomService {
             }
         }
 
-        String nowIso = DateTimeFormatter.ISO_INSTANT.format(Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS));
+        String nowIso = DateTimeFormatter.ISO_INSTANT
+                .format(Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS));
         String sha256 = (cycloneDxJson != null && !cycloneDxJson.isBlank())
                 ? computeSha256(cycloneDxJson)
                 : computeSha256(packages.toString());
@@ -622,13 +657,15 @@ public class CycloneDxSbomService {
         sb.append("<details>\n");
         sb.append("<summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 ").append(totalCount).append("개)</b></summary>\n\n");
 
-        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directPackages.size()).append("개 / 간접 의존성 ").append(indirectPackages.size()).append("개");
+        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directPackages.size()).append("개 / 간접 의존성 ")
+                .append(indirectPackages.size()).append("개");
         if (totalServices > 0) {
             sb.append(" / 외부 연동 서비스 ").append(totalServices).append("개");
         }
         sb.append("<br>\n");
 
-        if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment) && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
+        if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment)
+                && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
             sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("<br>\n");
         }
         sb.append("> **표준 규격:** OWASP CycloneDX v1.5 JSON (Package URL `purl` 매핑)<br>\n");
@@ -671,11 +708,13 @@ public class CycloneDxSbomService {
                 LLMAnalysisService.SbomPackageDetail pkg = directPackages.get(i);
                 String ver = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
                 String lic = pkg.license().isBlank() ? "-" : pkg.license();
-                String resolvedPurl = (pkg.purl() != null && !pkg.purl().isBlank() && !pkg.purl().startsWith("pkg:generic/"))
-                        ? pkg.purl()
-                        : generatePurl(pkg.name(), pkg.version(), projectEnvironment);
+                String resolvedPurl = (pkg.purl() != null && !pkg.purl().isBlank()
+                        && !pkg.purl().startsWith("pkg:generic/"))
+                                ? pkg.purl()
+                                : generatePurl(pkg.name(), pkg.version(), projectEnvironment);
                 String purl = (resolvedPurl != null && !resolvedPurl.isBlank()) ? "`" + resolvedPurl + "`" : "-";
-                sb.append("| `").append(pkg.name()).append("` | ").append(ver).append(" | ").append(lic).append(" | ").append(purl).append(" |\n");
+                sb.append("| `").append(pkg.name()).append("` | ").append(ver).append(" | ").append(lic).append(" | ")
+                        .append(purl).append(" |\n");
             }
             if (directPackages.size() > maxRender) {
                 sb.append("| ... | 외 ").append(directPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
@@ -696,11 +735,13 @@ public class CycloneDxSbomService {
                 LLMAnalysisService.SbomPackageDetail pkg = indirectPackages.get(i);
                 String ver = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
                 String lic = pkg.license().isBlank() ? "-" : pkg.license();
-                String resolvedPurl = (pkg.purl() != null && !pkg.purl().isBlank() && !pkg.purl().startsWith("pkg:generic/"))
-                        ? pkg.purl()
-                        : generatePurl(pkg.name(), pkg.version(), projectEnvironment);
+                String resolvedPurl = (pkg.purl() != null && !pkg.purl().isBlank()
+                        && !pkg.purl().startsWith("pkg:generic/"))
+                                ? pkg.purl()
+                                : generatePurl(pkg.name(), pkg.version(), projectEnvironment);
                 String purl = (resolvedPurl != null && !resolvedPurl.isBlank()) ? "`" + resolvedPurl + "`" : "-";
-                sb.append("| `").append(pkg.name()).append("` | ").append(ver).append(" | ").append(lic).append(" | ").append(purl).append(" |\n");
+                sb.append("| `").append(pkg.name()).append("` | ").append(ver).append(" | ").append(lic).append(" | ")
+                        .append(purl).append(" |\n");
             }
             if (indirectPackages.size() > maxRender) {
                 sb.append("| ... | 외 ").append(indirectPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
@@ -718,7 +759,8 @@ public class CycloneDxSbomService {
             sb.append("| 서비스명 | 제공자 (Provider) | 통신 엔드포인트 | 데이터 성격 / 민감도 |\n");
             sb.append("| :--- | :--- | :--- | :--- |\n");
             for (ExternalServiceDetail s : externalServices) {
-                sb.append("| `").append(s.name()).append("` | ").append(s.provider()).append(" | `").append(s.endpoint()).append("` | ").append(s.dataClassification()).append(" |\n");
+                sb.append("| `").append(s.name()).append("` | ").append(s.provider()).append(" | `")
+                        .append(s.endpoint()).append("` | ").append(s.dataClassification()).append(" |\n");
             }
             sb.append("\n");
         }
@@ -754,7 +796,8 @@ public class CycloneDxSbomService {
     }
 
     private String extractBuildTool(String projectEnv) {
-        if (projectEnv == null) return "미지정";
+        if (projectEnv == null)
+            return "미지정";
         int start = projectEnv.indexOf('(');
         int end = projectEnv.indexOf(')');
         if (start >= 0 && end > start) {
@@ -764,7 +807,8 @@ public class CycloneDxSbomService {
     }
 
     private String extractFramework(String projectEnv) {
-        if (projectEnv == null) return "미지정";
+        if (projectEnv == null)
+            return "미지정";
         int slashIdx = projectEnv.indexOf('/');
         if (slashIdx > 0 && slashIdx + 1 < projectEnv.length()) {
             return projectEnv.substring(slashIdx + 1).trim();
@@ -788,7 +832,8 @@ public class CycloneDxSbomService {
                         imgPart = imgPart.substring(spaceIdx + 1).trim();
                     }
                 }
-                // 다단계 빌드 스테이지 별칭 제거 (예: eclipse-temurin:17-jdk-jammy AS builder -> eclipse-temurin:17-jdk-jammy)
+                // 다단계 빌드 스테이지 별칭 제거 (예: eclipse-temurin:17-jdk-jammy AS builder ->
+                // eclipse-temurin:17-jdk-jammy)
                 int asIdx = imgPart.toUpperCase().indexOf(" AS ");
                 if (asIdx > 0) {
                     imgPart = imgPart.substring(0, asIdx).trim();
@@ -840,7 +885,8 @@ public class CycloneDxSbomService {
             StringBuilder hexString = new StringBuilder();
             for (byte b : hash) {
                 String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) hexString.append('0');
+                if (hex.length() == 1)
+                    hexString.append('0');
                 hexString.append(hex);
             }
             return hexString.toString();

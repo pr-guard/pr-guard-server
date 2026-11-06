@@ -455,5 +455,35 @@ class LLMAnalysisServiceTest {
         assertTrue(patched.contains("```diff"));
         assertTrue(patched.contains("- ignore_https_errors=True"));
     }
+
+    @Test
+    @DisplayName("HTML/JS 웹 프런트엔드 보안 위협(DOM XSS, CDN SRI 누락, 평문 HTTP 자산)을 사전 감지해야 한다")
+    void shouldDetectWebFrontendSecurityVulnerabilities() {
+        String diff = """
+                diff --git a/index.html b/index.html
+                index 1234..5678 100644
+                --- a/index.html
+                +++ b/index.html
+                @@ -10,6 +10,12 @@
+                 <head>
+                +    <script src="http://insecure-cdn.com/legacy.js"></script>
+                +    <script src="https://cdn.jsdelivr.net/npm/axios@1.6.8/dist/axios.min.js"></script>
+                 </head>
+                 <body>
+                +    <div id="content"></div>
+                +    <script>
+                +        document.getElementById('content').innerHTML = location.search;
+                +    </script>
+                 </body>
+                """;
+
+        List<LLMAnalysisService.PreScreeningFinding> findings = service.scanDiffForHighRiskPatterns(diff);
+
+        assertNotNull(findings);
+        assertEquals(3, findings.size(), "DOM XSS, CDN SRI 누락, 평문 HTTP 3건이 검출되어야 함");
+        assertTrue(findings.stream().anyMatch(f -> "CWE-79".equals(f.cweId())), "DOM XSS (CWE-79)가 감지되어야 함");
+        assertTrue(findings.stream().anyMatch(f -> "CWE-353".equals(f.cweId())), "CDN SRI 누락 (CWE-353)이 감지되어야 함");
+        assertTrue(findings.stream().anyMatch(f -> "CWE-319".equals(f.cweId())), "평문 HTTP 자산 (CWE-319)이 감지되어야 함");
+    }
 }
 

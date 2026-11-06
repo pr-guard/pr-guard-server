@@ -647,4 +647,111 @@ class UniversalDependencyScannerTest {
         assertTrue(summary.contains("FastAPI") || summary.contains("Python"), "FastAPI 또는 Python이 포함되어야 함");
         assertTrue(summary.contains(" + "), "Polyglot 환경이 '+' 기호로 결합되어야 함");
     }
+
+    @Test
+    @DisplayName("정적 웹(HTML) 파일 내 CDN script 및 link 태그에서 패키지를 자동 추출해야 한다")
+    void shouldExtractHtmlCdnDependencies(@TempDir Path tempDir) throws IOException {
+        String html = """
+                <!DOCTYPE html>
+                <html lang="ko">
+                <head>
+                    <meta charset="UTF-8">
+                    <title>CDN Web</title>
+                    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+                    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+                    <script src="https://cdn.jsdelivr.net/npm/axios@1.6.8/dist/axios.min.js"></script>
+                    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+                    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+                    <script src="https://cdn.tailwindcss.com"></script>
+                </head>
+                <body>
+                    <h1>Test</h1>
+                </body>
+                </html>
+                """;
+        Files.writeString(tempDir.resolve("index.html"), html);
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("bootstrap") && p.version().equals("5.3.3")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("font-awesome") && p.version().equals("6.5.1")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("axios") && p.version().equals("1.6.8")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("jquery") && p.version().equals("3.7.1")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("htmx.org") && p.version().equals("1.9.10")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("tailwindcss")));
+    }
+
+    @Test
+    @DisplayName("requirements.txt가 없는 단독 Python 스크립트에서도 3rd-party 임포트를 정확히 추출해야 한다")
+    void shouldExtractStandalonePythonScriptDependencies(@TempDir Path tempDir) throws IOException {
+        Path scriptsDir = tempDir.resolve("scripts");
+        Files.createDirectories(scriptsDir);
+
+        String pythonScript = """
+                import os
+                import sys
+                import json
+                import requests
+                from fastapi import FastAPI, Depends
+                from bs4 import BeautifulSoup
+                import pandas as pd
+                import boto3
+                """;
+        Files.writeString(scriptsDir.resolve("data_collector.py"), pythonScript);
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("requests")), "requests 모듈이 검출되어야 함");
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("fastapi")), "fastapi 모듈이 검출되어야 함");
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("beautifulsoup4")), "bs4가 beautifulsoup4로 정규화되어 검출되어야 함");
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("pandas")), "pandas 모듈이 검출되어야 함");
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("boto3")), "boto3 모듈이 검출되어야 함");
+        // 표준 라이브러리는 제외되어야 함
+        assertFalse(pkgs.stream().anyMatch(p -> p.name().equals("os")), "표준 라이브러리 os는 제외되어야 함");
+        assertFalse(pkgs.stream().anyMatch(p -> p.name().equals("sys")), "표준 라이브러리 sys는 제외되어야 함");
+        assertFalse(pkgs.stream().anyMatch(p -> p.name().equals("json")), "표준 라이브러리 json은 제외되어야 함");
+    }
+
+    @Test
+    @DisplayName("순수 HTML/CSS/JS 정적 웹 프로젝트의 환경을 정확히 식별해야 한다")
+    void shouldDetectPureStaticWebEnvironment(@TempDir Path tempDir) throws IOException {
+        Files.writeString(tempDir.resolve("index.html"), "<html><body><h1>Hello</h1></body></html>");
+        Files.writeString(tempDir.resolve("style.css"), "body { margin: 0; }");
+        Files.writeString(tempDir.resolve("app.js"), "console.log('web');");
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("tailwindcss", "3.x", false, "CDN(HTML)")
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertNotNull(env);
+        assertEquals("HTML5 / CSS3 / JavaScript", env.language());
+        assertEquals("Static Web", env.buildTool());
+        assertEquals("Tailwind CSS", env.framework());
+    }
+
+    @Test
+    @DisplayName("React 프로젝트 내부에 매니페스트 없는 파이썬 자동화 스크립트가 혼합된 경우 복합 환경으로 감지해야 한다")
+    void shouldDetectMixedReactAndStandalonePythonScript(@TempDir Path tempDir) throws IOException {
+        Files.writeString(tempDir.resolve("package.json"), "{\"name\": \"my-react-app\"}");
+        Path scriptsDir = tempDir.resolve("scripts");
+        Files.createDirectories(scriptsDir);
+        Files.writeString(scriptsDir.resolve("worker.py"), "from fastapi import FastAPI\napp = FastAPI()");
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("react", "18.2.0", false, "npm/Node.js"),
+                new LLMAnalysisService.SbomPackageDetail("fastapi", "latest (inferred)", false, "Python(Script-Import)")
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertNotNull(env);
+        String summary = env.toSummaryString();
+        assertTrue(summary.contains("React") || summary.contains("Node.js"));
+        assertTrue(summary.contains("Python"));
+        assertTrue(summary.contains(" + "));
+    }
 }

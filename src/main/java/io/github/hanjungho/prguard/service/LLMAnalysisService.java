@@ -199,6 +199,24 @@ public class LLMAnalysisService {
             "(?i)(?:api_key|secret_key|private_key|auth_token|jwt_secret)\\s*=\\s*['\"]([a-zA-Z0-9_\\-\\.]{20,})['\"]"
     );
 
+    // 6. CWE-79: DOM XSS 취약점 (innerHTML, outerHTML, document.write, dangerouslySetInnerHTML)
+    private static final java.util.regex.Pattern DOM_XSS_PATTERN = java.util.regex.Pattern.compile(
+            "(?:\\.innerHTML\\s*=|\\.outerHTML\\s*=|document\\.write\\s*\\(|dangerouslySetInnerHTML\\s*=\\s*\\{\\s*\\{\\s*__html\\s*:)",
+            java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
+    // 7. CWE-353: 공급망 무결성 결함 (무결성 해시 integrity가 누락된 외부 CDN 스크립트)
+    private static final java.util.regex.Pattern CDN_MISSING_SRI_PATTERN = java.util.regex.Pattern.compile(
+            "<script[^>]+src=[\"'](https?://(?:cdn\\.jsdelivr\\.net|cdnjs\\.cloudflare\\.com|unpkg\\.com|code\\.jquery\\.com|stackpath\\.bootstrapcdn\\.com)[^\"']+)[\"'](?![^>]*integrity=)[^>]*>",
+            java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
+    // 8. CWE-319: 평문 HTTP 외부 자산 참조 (Mixed Content)
+    private static final java.util.regex.Pattern CLEARTEXT_HTTP_ASSET_PATTERN = java.util.regex.Pattern.compile(
+            "(?:<script[^>]+src=[\"']http://|<link[^>]+href=[\"']http://|@import\\s+url\\s*\\([\"']?http://)",
+            java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
     /**
      * 대용량 Trivy JSON을 경량화한 종합 스캔 요약 페이로드
      * (sbomPackages는 토큰 비용 절감을 위해 LLM 전송 시 @JsonIgnore로 제외)
@@ -1190,6 +1208,48 @@ public class LLMAnalysisService {
                                 "환경 변수(`.env`, `os.environ`) 또는 Vault 시크릿 매니저를 통해 외부에서 주입하십시오."
                         ));
                     }
+                }
+
+                // 6. CWE-79: DOM XSS 취약점
+                if (DOM_XSS_PATTERN.matcher(codeLine).find()) {
+                    findings.add(new PreScreeningFinding(
+                            "DOM 기반 XSS 취약점",
+                            "CWE-79",
+                            "HIGH",
+                            currentFile,
+                            currentLine,
+                            codeLine,
+                            "검증되지 않은 사용자 입력이 innerHTML 또는 dangerouslySetInnerHTML에 직접 삽입되어 클라이언트 XSS 공격에 노출됩니다.",
+                            "textContent, DOMPurify.sanitize(), 또는 안전한 React/Vue 템플릿 바인딩을 사용하십시오."
+                    ));
+                }
+
+                // 7. CWE-353: 공급망 무결성 결함 (무결성 해시 SRI 누락)
+                if (CDN_MISSING_SRI_PATTERN.matcher(codeLine).find()) {
+                    findings.add(new PreScreeningFinding(
+                            "CDN 무결성 검증(SRI) 누락",
+                            "CWE-353",
+                            "MEDIUM",
+                            currentFile,
+                            currentLine,
+                            codeLine,
+                            "외부 CDN 스크립트에 Subresource Integrity(integrity 해시)가 지정되지 않아 CDN 서버 침해 시 악성 스크립트 변조 공급망 공격에 노출됩니다.",
+                            "CDN script 태그에 `integrity=\"sha384-...\" crossorigin=\"anonymous\"` 속성을 필수로 적용하십시오."
+                    ));
+                }
+
+                // 8. CWE-319: 평문 HTTP 외부 자산 로드 (Mixed Content)
+                if (CLEARTEXT_HTTP_ASSET_PATTERN.matcher(codeLine).find()) {
+                    findings.add(new PreScreeningFinding(
+                            "평문 HTTP 자산 참조 (Mixed Content)",
+                            "CWE-319",
+                            "HIGH",
+                            currentFile,
+                            currentLine,
+                            codeLine,
+                            "HTTPS 페이지에서 암호화되지 않은 평문 HTTP(http://) 외부 스크립트 또는 스타일을 로드하여 중간자(MITM) 변조 위협이 발생합니다.",
+                            "모든 외부 CDN 및 스타일 URL을 안전한 HTTPS(`https://`) 프로토콜로 수정하십시오."
+                    ));
                 }
 
                 currentLine++;
