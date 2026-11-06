@@ -355,6 +355,61 @@ class UniversalDependencyScannerTest {
     }
 
     @Test
+    @DisplayName("npm package-lock.json v3에서 root packages['']의 직접 의존성과 하위 간접 의존성을 정확히 구분해야 한다")
+    void shouldClassifyDirectAndIndirectInPackageLockJsonV3(@TempDir Path tempDir) throws IOException {
+        String lockContent = """
+                {
+                  "name": "unt-work-hub",
+                  "version": "1.0.0",
+                  "lockfileVersion": 3,
+                  "packages": {
+                    "": {
+                      "name": "unt-work-hub",
+                      "dependencies": {
+                        "react": "^18.2.0"
+                      }
+                    },
+                    "node_modules/react": {
+                      "version": "18.2.0"
+                    },
+                    "node_modules/loose-envify": {
+                      "version": "1.4.0"
+                    }
+                  }
+                }
+                """;
+        Files.writeString(tempDir.resolve("package-lock.json"), lockContent);
+
+        List<LLMAnalysisService.SbomPackageDetail> packages = scanner.scan(tempDir);
+
+        assertNotNull(packages);
+        assertEquals(2, packages.size());
+
+        LLMAnalysisService.SbomPackageDetail react = packages.stream().filter(p -> p.name().equals("react")).findFirst().orElseThrow();
+        assertFalse(react.indirect(), "packages['']에 선언된 react는 직접 의존성(indirect=false)");
+
+        LLMAnalysisService.SbomPackageDetail looseEnvify = packages.stream().filter(p -> p.name().equals("loose-envify")).findFirst().orElseThrow();
+        assertTrue(looseEnvify.indirect(), "전이 의존성 loose-envify는 간접 의존성(indirect=true)");
+    }
+
+    @Test
+    @DisplayName("루트에 package.json이 없더라도 하위 패키지 목록(safePackages)을 역추론하여 언어와 프레임워크를 식별해야 한다")
+    void shouldDetectEnvironmentFromPackagesWhenRootManifestInSubdir(@TempDir Path tempDir) throws IOException {
+        Files.writeString(tempDir.resolve("App.tsx"), "export const App = () => <div>Hello</div>;");
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("react", "18.2.0", false, "npm-lockfile"),
+                new LLMAnalysisService.SbomPackageDetail("loose-envify", "1.4.0", true, "npm-lockfile")
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertEquals("TypeScript", env.language());
+        assertEquals("npm", env.buildTool());
+        assertEquals("React", env.framework());
+        assertEquals("TypeScript (npm) / React", env.toSummaryString());
+    }
+
+    @Test
     @DisplayName("yarn.lock 파일에서 패키지명과 실제 버전을 간접 의존성으로 정확히 추출해야 한다")
     void shouldExtractYarnLockDependencies(@TempDir Path tempDir) throws IOException {
         String yarnContent = """

@@ -17,6 +17,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -353,7 +354,78 @@ public class UniversalDependencyScanner {
             return new ProjectEnvironment("Swift", "SPM / CocoaPods", "iOS / Apple");
         }
 
+        // 9. 루트 매니페스트 부재 시, 검출된 패키지들의 생태계 메타데이터(safePackages)로부터 언어/도구 역추론 (서브폴더/모노레포 지원)
+        if (!safePackages.isEmpty()) {
+            int npmCount = 0;
+            int javaCount = 0;
+            int pythonCount = 0;
+            int rustCount = 0;
+            int goCount = 0;
+            int nugetCount = 0;
+
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String lic = p.license() != null ? p.license().toLowerCase() : "";
+                if (lic.contains("npm") || lic.contains("yarn") || lic.contains("pnpm") || lic.contains("node")) npmCount++;
+                else if (lic.contains("maven") || lic.contains("gradle")) javaCount++;
+                else if (lic.contains("pypi") || lic.contains("python") || lic.contains("poetry") || lic.contains("pip")) pythonCount++;
+                else if (lic.contains("cargo") || lic.contains("rust") || lic.contains("crates")) rustCount++;
+                else if (lic.contains("go")) goCount++;
+                else if (lic.contains("nuget")) nugetCount++;
+            }
+
+            if (npmCount > 0 && npmCount >= javaCount && npmCount >= pythonCount) {
+                boolean hasTs = hasFileExtension(rootDir, ".ts") || hasFileExtension(rootDir, ".tsx");
+                String language = hasTs ? "TypeScript" : "JavaScript";
+                String framework = "Node.js";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    String n = p.name().toLowerCase();
+                    if (n.equals("next")) { framework = "Next.js"; break; }
+                    if (n.equals("react")) { framework = "React"; break; }
+                    if (n.equals("vue")) { framework = "Vue.js"; break; }
+                    if (n.equals("express")) { framework = "Express"; break; }
+                    if (n.equals("@nestjs/core")) { framework = "NestJS"; break; }
+                }
+                String buildTool = "npm";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    String lic = p.license() != null ? p.license().toLowerCase() : "";
+                    if (lic.contains("pnpm")) { buildTool = "pnpm"; break; }
+                    if (lic.contains("yarn")) { buildTool = "Yarn"; break; }
+                }
+                return new ProjectEnvironment(language, buildTool, framework);
+            } else if (javaCount > 0) {
+                String framework = "JVM";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    if (p.name().contains("spring-boot")) { framework = "Spring Boot"; break; }
+                }
+                return new ProjectEnvironment("Java", "Gradle/Maven", framework);
+            } else if (pythonCount > 0) {
+                String framework = "Python";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    String n = p.name().toLowerCase();
+                    if (n.equals("django")) { framework = "Django"; break; }
+                    if (n.equals("fastapi")) { framework = "FastAPI"; break; }
+                    if (n.equals("flask")) { framework = "Flask"; break; }
+                }
+                return new ProjectEnvironment("Python", "pip", framework);
+            } else if (rustCount > 0) {
+                return new ProjectEnvironment("Rust", "Cargo", "Native");
+            } else if (goCount > 0) {
+                return new ProjectEnvironment("Go", "Go Modules", "Native");
+            } else if (nugetCount > 0) {
+                return new ProjectEnvironment("C# (.NET)", "NuGet", ".NET");
+            }
+        }
+
         return ProjectEnvironment.unknown();
+    }
+
+    private boolean hasFileExtension(Path rootDir, String ext) {
+        if (rootDir == null || !Files.exists(rootDir)) return false;
+        try (var stream = Files.walk(rootDir, 3)) {
+            return stream.anyMatch(p -> p.getFileName() != null && p.getFileName().toString().toLowerCase().endsWith(ext));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void parseManifestFile(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
@@ -532,14 +604,31 @@ public class UniversalDependencyScanner {
     private void parsePackageLockJson(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
         try {
             JsonNode root = objectMapper.readTree(file.toFile());
+            Set<String> directNames = new HashSet<>();
+
             JsonNode packagesNode = root.path("packages");
             if (packagesNode.isObject()) {
+                // npm lockfile v3: packages[""] represents the root project manifest
+                JsonNode rootPkg = packagesNode.path("");
+                if (rootPkg.isObject()) {
+                    for (String depField : List.of("dependencies", "devDependencies")) {
+                        JsonNode deps = rootPkg.path(depField);
+                        if (deps.isObject()) {
+                            deps.fieldNames().forEachRemaining(directNames::add);
+                        }
+                    }
+                }
+
                 packagesNode.fieldNames().forEachRemaining(key -> {
                     if (!key.isBlank()) {
                         String name = key.startsWith("node_modules/") ? key.substring("node_modules/".length()) : key;
                         String ver = packagesNode.path(key).path("version").asText("");
                         if (!name.isBlank() && !ver.isBlank() && !name.contains("node_modules/")) {
-                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "npm-lockfile"));
+                            LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                            boolean isIndirect = (existing != null)
+                                    ? existing.indirect()
+                                    : !directNames.contains(name);
+                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "npm-lockfile"));
                         }
                     }
                 });
@@ -549,7 +638,11 @@ public class UniversalDependencyScanner {
                 depsNode.fieldNames().forEachRemaining(name -> {
                     String ver = depsNode.path(name).path("version").asText("");
                     if (!name.isBlank() && !ver.isBlank()) {
-                        map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "npm-lockfile"));
+                        LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                        boolean isIndirect = (existing != null)
+                                ? existing.indirect()
+                                : !directNames.contains(name);
+                        map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "npm-lockfile"));
                     }
                 });
             }
@@ -574,7 +667,9 @@ public class UniversalDependencyScanner {
                 } else if (currentPkg != null && line.startsWith("version ")) {
                     String ver = line.substring("version ".length()).replace("\"", "").replace("'", "").trim();
                     if (!currentPkg.isBlank() && !ver.isBlank()) {
-                        map.put(currentPkg, new LLMAnalysisService.SbomPackageDetail(currentPkg, ver, true, "yarn.lock"));
+                        LLMAnalysisService.SbomPackageDetail existing = map.get(currentPkg);
+                        boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                        map.put(currentPkg, new LLMAnalysisService.SbomPackageDetail(currentPkg, ver, isIndirect, "yarn.lock"));
                     }
                     currentPkg = null;
                 }
@@ -609,7 +704,9 @@ public class UniversalDependencyScanner {
                             int parenIdx = ver.indexOf('(');
                             if (parenIdx > 0) ver = ver.substring(0, parenIdx).trim();
                             if (!name.isBlank() && !ver.isBlank()) {
-                                map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "pnpm-lock"));
+                                LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                                boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                                map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "pnpm-lock"));
                             }
                         }
                     }
@@ -643,7 +740,9 @@ public class UniversalDependencyScanner {
                 } else if (trimmed.startsWith("version = \"") && currentName != null) {
                     String ver = trimmed.substring(11, trimmed.length() - 1);
                     if (!currentName.isBlank() && !ver.isBlank()) {
-                        map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, true, "poetry.lock"));
+                        LLMAnalysisService.SbomPackageDetail existing = map.get(currentName);
+                        boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                        map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, isIndirect, "poetry.lock"));
                     }
                     currentName = null;
                 }
@@ -662,7 +761,9 @@ public class UniversalDependencyScanner {
                     secNode.fieldNames().forEachRemaining(pkgName -> {
                         String ver = secNode.path(pkgName).path("version").asText("").replace("==", "").trim();
                         if (!pkgName.isBlank() && !ver.isBlank()) {
-                            map.put(pkgName, new LLMAnalysisService.SbomPackageDetail(pkgName, ver, true, "Pipfile.lock"));
+                            LLMAnalysisService.SbomPackageDetail existing = map.get(pkgName);
+                            boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                            map.put(pkgName, new LLMAnalysisService.SbomPackageDetail(pkgName, ver, isIndirect, "Pipfile.lock"));
                         }
                     });
                 }
@@ -702,7 +803,9 @@ public class UniversalDependencyScanner {
                         String ver = item.path("version").asText("");
                         if (ver.startsWith("v")) ver = ver.substring(1);
                         if (!name.isBlank() && !ver.isBlank()) {
-                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "composer.lock"));
+                            LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                            boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "composer.lock"));
                         }
                     }
                 }
@@ -732,7 +835,9 @@ public class UniversalDependencyScanner {
                     currentName = trimmed.substring(8, trimmed.length() - 1);
                 } else if (trimmed.startsWith("version = \"") && currentName != null) {
                     String ver = trimmed.substring(11, trimmed.length() - 1);
-                    map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, true, "Cargo.lock"));
+                    LLMAnalysisService.SbomPackageDetail existing = map.get(currentName);
+                    boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                    map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, isIndirect, "Cargo.lock"));
                     currentName = null;
                 }
             }
