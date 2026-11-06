@@ -340,5 +340,120 @@ class LLMAnalysisServiceTest {
         assertNotNull(report404);
         assertTrue(report404.contains("HTTP 404"));
     }
+
+    @Test
+    @DisplayName("PR Diff에서 TLS 인증서 검증 무력화(CWE-295) 및 미인증 엔드포인트(CWE-306) 정적 패턴을 정확히 검출해야 한다")
+    void shouldDetectTlsBypassAndUnauthenticatedEndpointsInPreScreening() {
+        String prDiff = """
+                diff --git a/scraper.py b/scraper.py
+                index 1111111..2222222 100644
+                --- a/scraper.py
+                +++ b/scraper.py
+                @@ -40,3 +40,5 @@
+                 async def run():
+                +    browser = await p.chromium.launch(args=["--ignore-certificate-errors"])
+                +    context = await browser.new_context(ignore_https_errors=True)
+                diff --git a/main.py b/main.py
+                index 3333333..4444444 100644
+                --- a/main.py
+                +++ b/main.py
+                @@ -80,3 +80,5 @@
+                +@app.post("/api/v1/system/reboot")
+                +async def reboot_server():
+                +    pass
+                """;
+
+        List<LLMAnalysisService.PreScreeningFinding> findings = service.scanDiffForHighRiskPatterns(prDiff);
+
+        assertNotNull(findings);
+        assertEquals(3, findings.size(), "CWE-295 2건과 CWE-306 1건이 검출되어야 함");
+        assertTrue(findings.stream().anyMatch(f -> "CWE-295".equals(f.cweId()) && f.snippet().contains("ignore_https_errors")));
+        assertTrue(findings.stream().anyMatch(f -> "CWE-295".equals(f.cweId()) && f.snippet().contains("--ignore-certificate-errors")));
+        assertTrue(findings.stream().anyMatch(f -> "CWE-306".equals(f.cweId()) && f.snippet().contains("/api/v1/system/reboot")));
+    }
+
+    @Test
+    @DisplayName("Trivy 취약점(CVE)이 0건이더라도 PR Diff에 TLS 검증 무력화가 있으면 절대로 PASS 판정을 내리지 않고 WARN으로 통제해야 한다")
+    void shouldBlockOrWarnDiffWithHighRiskPatternsEvenIfTrivyHasZeroCves() {
+        String cleanTrivyJson = """
+                {
+                  "SchemaVersion": 2,
+                  "Results": [
+                    {
+                      "Target": "requirements.txt",
+                      "Class": "lang-pkgs",
+                      "Packages": [
+                        { "Name": "fastapi", "Version": "0.100.0", "Indirect": false },
+                        { "Name": "playwright", "Version": "1.40.0", "Indirect": false }
+                      ]
+                    }
+                  ]
+                }
+                """;
+
+        String prDiff = """
+                diff --git a/crawler.py b/crawler.py
+                index 1234567..89abcdef 100644
+                --- a/crawler.py
+                +++ b/crawler.py
+                @@ -10,3 +10,4 @@
+                +context = await browser.new_context(ignore_https_errors=True)
+                """;
+
+        LLMAnalysisService.AnalysisOutcome outcome = service.analyzeVulnerabilities(
+                cleanTrivyJson, prDiff, "", io.github.hanjungho.prguard.dto.PrguardConfig.defaultConfig());
+
+        assertNotNull(outcome);
+        assertNotEquals(LLMAnalysisService.SecurityVerdict.PASS, outcome.verdict(),
+                "Diff에 CWE-295 결함이 포함되어 있으므로 Trivy 0건이라도 PASS가 되면 안 됨");
+        assertEquals(LLMAnalysisService.SecurityVerdict.WARN, outcome.verdict());
+        assertTrue(outcome.reportMarkdown().contains("주의 (WARN)") || outcome.reportMarkdown().contains("차단 권고 (BLOCK)"));
+        assertTrue(outcome.reportMarkdown().contains("### 2. 코드 로직 및 설정 결함"));
+        assertTrue(outcome.reportMarkdown().contains("TLS"));
+    }
+
+    @Test
+    @DisplayName("LLM이 착오로 PASS를 반환하더라도 Fail-Safe Guard가 즉시 WARN 배너와 수정 제안 diff로 리포트를 강제 패치해야 한다")
+    void shouldPatchReportWhenLlmReturnsPassDespitePreScreeningFindings() {
+        String fakePassReport = """
+                > [!TIP]
+                > ### 승인 (PASS)
+                > 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.
+                >
+                > - **프로젝트 환경:** Python (pip) / FastAPI
+                > - **오픈소스 취약점 (CVE):** 0건 (안전)
+                > - **코드 로직 및 설정 결함:** 0건 (안전)
+
+                ---
+
+                <details>
+                <summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 1개)</b></summary>
+                ...
+                </details>
+                """;
+
+        List<LLMAnalysisService.PreScreeningFinding> findings = List.of(
+                new LLMAnalysisService.PreScreeningFinding(
+                        "TLS 인증서 검증 무력화",
+                        "CWE-295",
+                        "HIGH",
+                        "scraper.py",
+                        42,
+                        "ignore_https_errors=True",
+                        "중간자 공격에 취약",
+                        "ignore_https_errors=False 설정"
+                )
+        );
+
+        String patched = service.patchReportForPreScreeningFindings(fakePassReport, findings, "Python (pip) / FastAPI");
+
+        assertNotNull(patched);
+        assertFalse(patched.contains("### 승인 (PASS)"), "승인 배너가 제거되어야 함");
+        assertTrue(patched.contains("[!WARNING]"), "주의 배너로 교체되어야 함");
+        assertTrue(patched.contains("### 주의 (WARN)"));
+        assertTrue(patched.contains("### 2. 코드 로직 및 설정 결함 — 총 1건"));
+        assertTrue(patched.contains("```diff"));
+        assertTrue(patched.contains("- ignore_https_errors=True"));
+    }
 }
 

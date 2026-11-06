@@ -154,6 +154,11 @@ public class CycloneDxSbomService {
             "https?://([a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})(?::[0-9]+)?(/[^\\s\"'<>#`]*)?"
     );
 
+    private static final Pattern DB_PROTOCOL_PATTERN = Pattern.compile(
+            "(postgresql|postgres|redis|rediss|mongodb|mongodb\\+srv|mysql|amqp|amqps)://([^\\s\"'<>#`]+)",
+            Pattern.CASE_INSENSITIVE
+    );
+
     /**
      * 프로젝트 설정 파일(application.properties, YAML, .env 등)을 실제 검사하여
      * 외부로 통신하는 실제 SaaS 및 API 서비스 엔드포인트를 동적으로 감지합니다.
@@ -180,6 +185,33 @@ public class CycloneDxSbomService {
                 } else if (n.startsWith("psycopg") || n.equals("asyncpg") || n.equals("pg") || n.equals("postgres")) {
                     detected.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
                             "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+                } else if (n.equals("redis") || n.equals("ioredis") || n.equals("aioredis") || n.contains("redis-py") || n.contains("spring-boot-starter-data-redis")) {
+                    detected.putIfAbsent("Redis", new ExternalServiceDetail(
+                            "Redis", "Redis Ltd.", "redis://", "인메모리 캐시, 세션 저장소 및 NoSQL 키-값 데이터베이스"));
+                } else if (n.equals("pymongo") || n.equals("mongodb") || n.equals("mongoose") || n.equals("motor") || n.contains("spring-boot-starter-data-mongodb")) {
+                    detected.putIfAbsent("MongoDB", new ExternalServiceDetail(
+                            "MongoDB", "MongoDB Inc.", "mongodb://", "NoSQL 도큐먼트 지향 데이터베이스"));
+                } else if (n.equals("mysql") || n.equals("mysql2") || n.equals("mysqlclient") || n.equals("pymysql") || n.equals("mariadb") || n.contains("mysql-connector")) {
+                    detected.putIfAbsent("MySQL / MariaDB", new ExternalServiceDetail(
+                            "MySQL / MariaDB", "Oracle / MariaDB Corp", "mysql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+                } else if (n.contains("pterodactyl") || n.contains("pydactyl")) {
+                    detected.putIfAbsent("Pterodactyl API", new ExternalServiceDetail(
+                            "Pterodactyl API", "Pterodactyl", "https://*", "게임 및 도커 컨테이너 원격 인프라 제어 관리 API"));
+                } else if (n.contains("cloudflare")) {
+                    detected.putIfAbsent("Cloudflare Services", new ExternalServiceDetail(
+                            "Cloudflare Services", "Cloudflare Inc.", "https://api.cloudflare.com", "네트워크 터널링, 프록시, CDN 및 DNS 보안 연동"));
+                } else if (n.contains("kafka") || n.equals("pika") || n.equals("amqplib") || n.contains("spring-kafka") || n.contains("spring-rabbit") || n.equals("kafkajs")) {
+                    detected.putIfAbsent("Message Broker (Kafka / RabbitMQ)", new ExternalServiceDetail(
+                            "Message Broker (Kafka / RabbitMQ)", "Apache / VMware", "amqp:// / kafka://", "분산 이벤트 스트리밍 및 비동기 메시지 큐"));
+                } else if (n.contains("elasticsearch") || n.contains("opensearch")) {
+                    detected.putIfAbsent("Elasticsearch / OpenSearch", new ExternalServiceDetail(
+                            "Elasticsearch / OpenSearch", "Elastic / AWS", "https://*", "분산 실시간 검색 엔진 및 로그 분석 인덱스"));
+                } else if (n.equals("boto3") || n.equals("botocore") || n.startsWith("@aws-sdk/") || n.startsWith("aws-sdk") || n.contains("aws-java-sdk")) {
+                    detected.putIfAbsent("AWS", new ExternalServiceDetail(
+                            "Amazon Web Services (AWS)", "Amazon", "https://*.amazonaws.com", "클라우드 스토리지(S3), DynamoDB 및 백엔드 인프라 자원"));
+                } else if (n.equals("firebase-admin") || n.startsWith("@firebase/") || n.equals("firebase")) {
+                    detected.putIfAbsent("Firebase", new ExternalServiceDetail(
+                            "Firebase", "Google Cloud", "https://*.firebaseio.com", "실시간 데이터베이스, 푸시 알림 및 모바일 백엔드 서비스"));
                 } else if (n.equals("notion-client") || n.contains("@notionhq/client")) {
                     detected.putIfAbsent("Notion API", new ExternalServiceDetail(
                             "Notion API", "Notion Labs Inc.", "https://api.notion.com", "워크스페이스 문서 및 데이터베이스 연동"));
@@ -220,7 +252,10 @@ public class CycloneDxSbomService {
                     // 오직 실제 외부 환경/설정이 기술되는 설정 파일 및 배포 매니페스트만 검사 (소스코드 오탐 방지)
                     if (lower.endsWith(".properties") || lower.endsWith(".yml") || lower.endsWith(".yaml")
                             || lower.startsWith(".env") || lower.equals("dockerfile") || lower.endsWith("compose.yml")
-                            || lower.endsWith("compose.yaml") || lower.equals("settings.py") || lower.equals("config.py")) {
+                            || lower.endsWith("compose.yaml") || lower.equals("settings.py") || lower.equals("config.py")
+                            || lower.endsWith(".ini")
+                            || (lower.endsWith(".json") && !lower.contains("package") && !lower.contains("lock") && !lower.contains("tsconfig"))
+                            || lower.contains("config") || lower.contains("setting") || lower.contains("database")) {
                         try {
                             String content = Files.readString(file, StandardCharsets.UTF_8);
                             checkContentForConfiguredUrls(content, detected);
@@ -239,6 +274,58 @@ public class CycloneDxSbomService {
     private void checkContentForConfiguredUrls(String content, Map<String, ExternalServiceDetail> map) {
         if (content == null || content.isBlank()) {
             return;
+        }
+
+        // 1. 데이터베이스 및 큐 프로토콜 엔드포인트 감지 (postgresql://, redis://, mongodb://, mysql://, amqp://)
+        Matcher dbm = DB_PROTOCOL_PATTERN.matcher(content);
+        while (dbm.find()) {
+            String proto = dbm.group(1).toLowerCase();
+            if (proto.startsWith("postgres")) {
+                map.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
+                        "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+            } else if (proto.startsWith("redis")) {
+                map.putIfAbsent("Redis", new ExternalServiceDetail(
+                        "Redis", "Redis Ltd.", "redis://", "인메모리 캐시, 세션 저장소 및 NoSQL 키-값 데이터베이스"));
+            } else if (proto.startsWith("mongodb")) {
+                map.putIfAbsent("MongoDB", new ExternalServiceDetail(
+                        "MongoDB", "MongoDB Inc.", "mongodb://", "NoSQL 도큐먼트 지향 데이터베이스"));
+            } else if (proto.startsWith("mysql")) {
+                map.putIfAbsent("MySQL / MariaDB", new ExternalServiceDetail(
+                        "MySQL / MariaDB", "Oracle / MariaDB Corp", "mysql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+            } else if (proto.startsWith("amqp")) {
+                map.putIfAbsent("Message Broker (RabbitMQ)", new ExternalServiceDetail(
+                        "RabbitMQ", "VMware", "amqp://", "비동기 메시지 브로커 및 큐 서비스"));
+            }
+        }
+
+        // 2. 환경변수 및 설정 키워드 감지 (.env, application.yml, config.py 등)
+        if (content.contains("SUPABASE_URL") || content.contains("SUPABASE_KEY") || content.contains("NEXT_PUBLIC_SUPABASE")) {
+            map.putIfAbsent("Supabase", new ExternalServiceDetail(
+                    "Supabase", "Supabase Inc.", "https://*.supabase.co", "클라우드 BaaS, 사용자 인증(Auth) 및 관리형 데이터베이스"));
+        }
+        if (content.contains("NOTION_API_KEY") || content.contains("NOTION_TOKEN")) {
+            map.putIfAbsent("Notion API", new ExternalServiceDetail(
+                    "Notion API", "Notion Labs Inc.", "https://api.notion.com", "워크스페이스 문서 및 데이터베이스 연동"));
+        }
+        if (content.contains("PTERO_URL") || content.contains("PTERODACTYL_URL") || content.contains("PTERO_KEY")) {
+            map.putIfAbsent("Pterodactyl API", new ExternalServiceDetail(
+                    "Pterodactyl API", "Pterodactyl", "https://*", "게임 및 도커 컨테이너 원격 인프라 제어 API"));
+        }
+        if (content.contains("GEMINI_API_KEY") || content.contains("GOOGLE_API_KEY")) {
+            map.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
+                    "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+        }
+        if (content.contains("REDIS_URL") || content.contains("REDIS_HOST")) {
+            map.putIfAbsent("Redis", new ExternalServiceDetail(
+                    "Redis", "Redis Ltd.", "redis://", "인메모리 캐시 및 세션 저장소"));
+        }
+        if (content.contains("POSTGRES_") || (content.contains("DATABASE_URL") && content.toLowerCase().contains("postgres"))) {
+            map.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
+                    "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+        }
+        if (content.contains("PLAYWRIGHT") || content.contains("BROWSER_WS_ENDPOINT")) {
+            map.putIfAbsent("Playwright", new ExternalServiceDetail(
+                    "Playwright", "Microsoft", "Headless Chromium/Firefox/WebKit", "엔드투엔드(E2E) 브라우저 자동화 및 웹 크롤링"));
         }
 
         Matcher m = EXTERNAL_URL_PATTERN.matcher(content);

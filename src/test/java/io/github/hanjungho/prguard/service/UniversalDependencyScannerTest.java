@@ -534,4 +534,117 @@ class UniversalDependencyScannerTest {
         assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("uvicorn")));
         assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("supabase")));
     }
+
+    @Test
+    @DisplayName("Go go.mod에서 직접 의존성과 // indirect 간접 의존성을 정확히 구분해야 한다")
+    void shouldParseGoModDirectAndIndirectDependencies(@TempDir Path tempDir) throws IOException {
+        String goMod = """
+                module github.com/example/myservice
+
+                go 1.21
+
+                require (
+                    github.com/gin-gonic/gin v1.9.1
+                    golang.org/x/crypto v0.14.0 // indirect
+                    github.com/google/uuid v1.3.0
+                )
+                """;
+        Files.writeString(tempDir.resolve("go.mod"), goMod);
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertEquals(3, pkgs.size());
+        LLMAnalysisService.SbomPackageDetail gin = pkgs.stream().filter(p -> p.name().contains("gin")).findFirst().orElseThrow();
+        assertFalse(gin.indirect(), "gin은 직접 의존성이어야 함");
+        assertEquals("1.9.1", gin.version());
+
+        LLMAnalysisService.SbomPackageDetail crypto = pkgs.stream().filter(p -> p.name().contains("crypto")).findFirst().orElseThrow();
+        assertTrue(crypto.indirect(), "crypto는 // indirect 로 간접 의존성이어야 함");
+        assertEquals("0.14.0", crypto.version());
+    }
+
+    @Test
+    @DisplayName("requirements/ 하위 디렉토리에 위치한 base.txt 및 prod.txt도 누락 없이 파싱해야 한다")
+    void shouldParseSubdirectoryRequirements(@TempDir Path tempDir) throws IOException {
+        Path reqDir = tempDir.resolve("requirements");
+        Files.createDirectories(reqDir);
+
+        Files.writeString(reqDir.resolve("base.txt"), "fastapi>=0.100.0\nuvicorn\n");
+        Files.writeString(reqDir.resolve("prod.txt"), "-r base.txt\npsycopg[binary]>=3.1.8\nredis>=5.0.0\n");
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertTrue(pkgs.size() >= 4);
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("fastapi") && "0.100.0".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("psycopg")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("redis") && "5.0.0".equals(p.version())));
+    }
+
+    @Test
+    @DisplayName("Python setup.py 파일의 install_requires 선언을 파싱해야 한다")
+    void shouldParseSetupPyDependencies(@TempDir Path tempDir) throws IOException {
+        String setupPy = """
+                from setuptools import setup
+
+                setup(
+                    name="my_pkg",
+                    version="0.1.0",
+                    install_requires=[
+                        "fastapi>=0.95.0",
+                        "pydantic>=2.0.0",
+                        "requests"
+                    ]
+                )
+                """;
+        Files.writeString(tempDir.resolve("setup.py"), setupPy);
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertEquals(3, pkgs.size());
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("fastapi") && "0.95.0".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("pydantic")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("requests")));
+    }
+
+    @Test
+    @DisplayName("packages/ 모노레포 하위 디렉토리를 건너뛰지 않고 프론트엔드와 백엔드 의존성을 전수 추출해야 한다")
+    void shouldScanMonorepoPackagesDirectory(@TempDir Path tempDir) throws IOException {
+        Path webDir = tempDir.resolve("packages").resolve("web");
+        Path apiDir = tempDir.resolve("packages").resolve("api");
+        Files.createDirectories(webDir);
+        Files.createDirectories(apiDir);
+
+        Files.writeString(webDir.resolve("package.json"), "{\"dependencies\": {\"react\": \"18.2.0\"}}");
+        Files.writeString(apiDir.resolve("requirements.txt"), "fastapi>=0.100.0\nuvicorn\n");
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("react")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("fastapi")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("uvicorn")));
+    }
+
+    @Test
+    @DisplayName("React 프론트엔드와 FastAPI 백엔드가 공존하는 Polyglot 프로젝트 환경을 복합 식별해야 한다")
+    void shouldDetectPolyglotEnvironmentForReactAndFastApi(@TempDir Path tempDir) throws IOException {
+        Files.writeString(tempDir.resolve("package.json"), "{\"name\": \"frontend\"}");
+        Files.writeString(tempDir.resolve("requirements.txt"), "fastapi\n");
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("react", "18.2.0", false, "npm/Node.js"),
+                new LLMAnalysisService.SbomPackageDetail("fastapi", "0.100.0", false, "PyPI(Python)")
+        );
+
+        UniversalDependencyScanner.ProjectEnvironment env = scanner.detectProjectEnvironment(tempDir, pkgs);
+
+        assertNotNull(env);
+        String summary = env.toSummaryString();
+        assertTrue(summary.contains("React") || summary.contains("Node.js"), "React 또는 Node.js가 포함되어야 함");
+        assertTrue(summary.contains("FastAPI") || summary.contains("Python"), "FastAPI 또는 Python이 포함되어야 함");
+        assertTrue(summary.contains(" + "), "Polyglot 환경이 '+' 기호로 결합되어야 함");
+    }
 }

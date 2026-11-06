@@ -165,6 +165,41 @@ public class LLMAnalysisService {
     }
 
     /**
+     * PR Diff 변경 코드 정적 프리-스크리닝 보안 결함 레코드
+     */
+    public record PreScreeningFinding(
+            String patternName,
+            String cweId,
+            String severity, // "CRITICAL", "HIGH", "WARNING"
+            String targetFile,
+            int lineNumber,
+            String snippet,
+            String description,
+            String fixSuggestion) {
+    }
+
+    private static final java.util.regex.Pattern TLS_BYPASS_PATTERN = java.util.regex.Pattern.compile(
+            "(?i)(?:ignore_https_errors\\s*=\\s*(?:True|true|1)|--ignore-certificate-errors|verify\\s*=\\s*(?:False|false)|rejectUnauthorized\\s*:\\s*false|NODE_TLS_REJECT_UNAUTHORIZED\\s*=\\s*['\"]?0['\"]?|check_hostname\\s*=\\s*(?:False|false)|ssl\\.CERT_NONE)"
+    );
+
+    private static final java.util.regex.Pattern SENSITIVE_ROUTE_PATTERN = java.util.regex.Pattern.compile(
+            "@(?:app|router)\\.(?:post|put|patch|delete)\\s*\\(\\s*['\"][^'\"]*(?:admin|manage|report|monitor|exec|cmd|run|kill|ptero|server|reboot|shutdown|config|token|export|backup)[^'\"]*['\"]",
+            java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
+    private static final java.util.regex.Pattern COMMAND_INJECTION_PATTERN = java.util.regex.Pattern.compile(
+            "(?:os\\.system\\s*\\(|subprocess\\.[a-zA-Z0-9_]+\\s*\\([^)]*shell\\s*=\\s*True|\\bchild_process\\.exec\\s*\\(|\\bexec\\s*\\(|\\beval\\s*\\()"
+    );
+
+    private static final java.util.regex.Pattern INSECURE_CORS_PATTERN = java.util.regex.Pattern.compile(
+            "allow_origins\\s*=\\s*\\[\\s*['\"]\\*['\"]\\s*\\]"
+    );
+
+    private static final java.util.regex.Pattern HARDCODED_SECRET_PATTERN = java.util.regex.Pattern.compile(
+            "(?i)(?:api_key|secret_key|private_key|auth_token|jwt_secret)\\s*=\\s*['\"]([a-zA-Z0-9_\\-\\.]{20,})['\"]"
+    );
+
+    /**
      * 대용량 Trivy JSON을 경량화한 종합 스캔 요약 페이로드
      * (sbomPackages는 토큰 비용 절감을 위해 LLM 전송 시 @JsonIgnore로 제외)
      */
@@ -375,8 +410,10 @@ public class LLMAnalysisService {
         String reportText;
         SecurityVerdict verdict;
 
-        // 3. 취약점, 설정 오류, 시크릿이 전혀 없고 PR Diff도 없는 경우 조기 반환 (Short-Circuit PASS)
-        if (!summaryPayload.hasSecurityFindings() && !hasCodeDiff) {
+        List<PreScreeningFinding> preScreenings = scanDiffForHighRiskPatterns(prDiff);
+
+        // 3. 취약점, 설정 오류, 시크릿이 전혀 없고 PR Diff도 없으며 프리-스크리닝 위험이 없는 경우 조기 반환 (Short-Circuit PASS)
+        if (!summaryPayload.hasSecurityFindings() && !hasCodeDiff && preScreenings.isEmpty()) {
             log.info("[LLMAnalysis] ⚡ 보안 위험 요소가 없고 코드 변경(Diff)이 없거나 보안 무관 파일만 수정되어 즉시 승인 (Short-Circuit PASS)");
             verdict = SecurityVerdict.PASS;
             reportText = """
@@ -401,7 +438,7 @@ public class LLMAnalysisService {
                 String minifiedJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(summaryPayload);
 
                 // 5. Reachability, 비즈니스 로직, 런타임/Base Image 검증 및 커스텀 정책 주입 프롬프트 생성
-                String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config, projectEnvironment);
+                String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config, projectEnvironment, preScreenings);
 
                 // 6. Google Gemini API 호출 (일시적 503/429 장애 시 지수 백오프 및 다중 모델 Fallback 후 자가 복구 리포트 생성)
                 try {
@@ -412,12 +449,22 @@ public class LLMAnalysisService {
                 }
 
                 // 7. SecurityVerdict 종합 판정
-                if (reportText.contains("[!CAUTION]") || hasBlockingVulnerabilities(summaryPayload, config)) {
+                boolean hasCriticalFinding = preScreenings.stream().anyMatch(f -> "CRITICAL".equalsIgnoreCase(f.severity()));
+                boolean hasPreScreeningFinding = !preScreenings.isEmpty();
+
+                if (reportText.contains("[!CAUTION]") || hasBlockingVulnerabilities(summaryPayload, config) || hasCriticalFinding) {
                     verdict = SecurityVerdict.BLOCK;
-                } else if (reportText.contains("[!WARNING]") || summaryPayload.hasSecurityFindings()) {
+                } else if (reportText.contains("[!WARNING]") || summaryPayload.hasSecurityFindings() || hasPreScreeningFinding) {
                     verdict = SecurityVerdict.WARN;
                 } else {
                     verdict = SecurityVerdict.PASS;
+                }
+
+                // 7-1. Fail-Safe Interceptor: 프리-스크리닝 위험이 검출되었으나 리포트에 주의/차단 배너 또는 결함 섹션이 누락된 경우 방어
+                if (hasPreScreeningFinding && (verdict == SecurityVerdict.PASS || (!reportText.contains("주의 (WARN)") && !reportText.contains("차단 권고 (BLOCK)")))) {
+                    log.warn("[LLMAnalysis] 🛡️ 정적 보안 프리-스크리닝 위험({}건)이 검출되었으나 LLM이 PASS를 반환했거나 리포트가 누락되었습니다. 판정을 WARN/BLOCK으로 강제 보정하고 결함 섹션을 보강합니다.", preScreenings.size());
+                    verdict = hasCriticalFinding ? SecurityVerdict.BLOCK : SecurityVerdict.WARN;
+                    reportText = patchReportForPreScreeningFindings(reportText, preScreenings, projectEnvironment);
                 }
 
                 // 8. AI 리포트 하단에 전체 SBOM 패키지 토글 표 Append
@@ -863,11 +910,16 @@ public class LLMAnalysisService {
      * 보안 전문 AI 시스템 프롬프트 및 마크다운 고정 템플릿 구성 (커스텀 정책 및 프로젝트 환경 적용)
      */
     String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config, String projectEnvironment) {
+        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, config, projectEnvironment, scanDiffForHighRiskPatterns(prDiff));
+    }
+
+    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config, String projectEnvironment, List<PreScreeningFinding> preScreenings) {
         String safeEnv = (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "미지정 (기타 프로젝트)";
+        String preScreeningSection = formatPreScreeningSection(preScreenings);
         return """
                 [System Prompt]
                 너는 10년 차 수석 애플리케이션 보안 아키텍트이자 DevSecOps 코드 리뷰어다.
-                제공된 [1. SBOM 및 Trivy 보안 스캔 요약 JSON], [2. PR 변경 소스코드(Diff)], [3. 프로젝트 런타임 및 환경 설정 컨텍스트], [4. 프로젝트 커스텀 보안 정책(.prguard.yml)]을 종합 분석하여 개발자가 즉시 조치할 수 있는 전문적인 보안 리포트를 작성하라.
+                제공된 [1. SBOM 및 Trivy 보안 스캔 요약 JSON], [2. PR 변경 소스코드(Diff)], [2-1. 정적 코드 보안 프리-스크리닝 감지 항목], [3. 프로젝트 런타임 및 환경 설정 컨텍스트], [4. 프로젝트 커스텀 보안 정책(.prguard.yml)]을 종합 분석하여 개발자가 즉시 조치할 수 있는 전문적인 보안 리포트를 작성하라.
 
                 [절대 준수 지침]
                 1. 모든 이모지(Emoji) 원칙적 배제:
@@ -891,12 +943,12 @@ public class LLMAnalysisService {
 
                 3. 애플리케이션 및 비즈니스 로직 보안 전수 감사 지침 (핵심):
                    - Trivy 정적 스캐너는 오직 알려진 오픈소스 라이브러리 CVE만을 감지하며, 개발자가 작성한 소스코드의 비즈니스 로직 결함(CWE)은 절대 검출하지 못한다.
-                   - 따라서 너는 반드시 [입력 데이터 2: PR 변경 소스코드 (Diff)]를 전수 정밀 감사하여 다음 보안 결함을 검출해야 한다:
+                   - 따라서 너는 반드시 [입력 데이터 2: PR 변경 소스코드 (Diff)]와 [입력 데이터 2-1: 정적 코드 보안 프리-스크리닝 감지 항목]을 전수 정밀 감사하여 다음 보안 결함을 검출해야 한다:
                      a. TLS/SSL 인증서 검증 무력화 (CWE-295): `ignore_https_errors=True`, `--ignore-certificate-errors`, `verify=False`, `rejectUnauthorized: false` 등 중간자 공격(MITM)을 유발하는 취약한 네트워크/브라우저 옵션
                      b. 인증 및 인가 누락 (CWE-306, CWE-862): FastAPI, Express, Spring 등의 라우터에서 인증 의존성(`Depends(...)`, 미들웨어, 토큰 검증 등) 없이 외부에 노출된 민감 API (모니터링, 상태 변경, 보고서 조회/수정, AI 실행 등)
                      c. 인젝션 및 미검증 외부 입력 (CWE-89, CWE-78, CWE-918): SQL 파라미터 미바인딩, 안전하지 않은 커맨드 실행, SSRF
                      d. 외부 공유 시 보호 장치 부재: 인증 없이 Cloudflare 터널 등으로 임의 호출 가능한 취약점
-                   - [절대 판정 규칙]: Trivy 스캔 요약 JSON의 CVE가 0건이라 하더라도, PR Diff에서 위와 같은 코드 레벨 보안 결함이 1건이라도 발견되면 절대로 [!TIP] 승인 (PASS)을 주지 말고, 반드시 [!WARNING] 주의 (WARN) 또는 [!CAUTION] 차단 권고 (BLOCK)로 판정하라!
+                   - [절대 판정 규칙]: Trivy 스캔 요약 JSON의 CVE가 0건이라 하더라도, PR Diff 또는 프리-스크리닝에서 코드 레벨 보안 결함이 1건이라도 발견되면 절대로 [!TIP] 승인 (PASS)을 주지 말고, 반드시 [!WARNING] 주의 (WARN) 또는 [!CAUTION] 차단 권고 (BLOCK)로 판정하라!
                    - 그리고 `### 2. 코드 로직 및 설정 결함 — 총 N건` 섹션을 생성하여 해당 라인 위치, 위협 요인(CWE 번호 명시), 구체적 악용 시나리오, 그리고 올바른 diff 수정 코드를 반드시 제시하라!
 
                 4. 결함이 존재하는 섹션만 상세 표기 및 <details open> 기본 펼침:
@@ -939,6 +991,9 @@ public class LLMAnalysisService {
                 %s
 
                 [입력 데이터 2: PR 변경 소스코드 (Diff)]
+                %s
+
+                [입력 데이터 2-1: 정적 코드 보안 프리-스크리닝 감지 항목 (주의/차단 필수)]
                 %s
 
                 [입력 데이터 3: 프로젝트 런타임 및 환경 설정 컨텍스트]
@@ -1015,11 +1070,249 @@ public class LLMAnalysisService {
                         safeEnv,
                         minifiedSummaryJson,
                         (prDiff != null && !prDiff.isBlank()) ? prDiff : "(PR 변경 코드 Diff 없음)",
+                        preScreeningSection,
                         safeEnv,
                         (runtimeContext != null && !runtimeContext.isBlank()) ? runtimeContext : "(런타임 환경 설정 컨텍스트 없음)",
                         (config != null) ? config.toSummaryString() : "(기본 엔터프라이즈 정책 적용 중 - 예외 룰 없음)",
                         safeEnv,
                         safeEnv);
+    }
+
+    public List<PreScreeningFinding> scanDiffForHighRiskPatterns(String prDiff) {
+        if (prDiff == null || prDiff.isBlank()) {
+            return Collections.emptyList();
+        }
+
+        List<PreScreeningFinding> findings = new ArrayList<>();
+        String currentFile = "unknown";
+        int currentLine = 1;
+
+        String[] lines = prDiff.split("\r?\n");
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+
+            if (line.startsWith("diff --git ")) {
+                currentFile = extractDiffFilePath(line);
+                continue;
+            } else if (line.startsWith("+++ b/")) {
+                currentFile = line.substring(6).trim();
+                continue;
+            } else if (line.startsWith("@@ ")) {
+                currentLine = parseHunkStartLine(line);
+                continue;
+            }
+
+            if (line.startsWith("+") && !line.startsWith("+++")) {
+                String codeLine = line.substring(1).trim();
+
+                // 1. CWE-295: TLS 인증서 검증 무력화
+                if (TLS_BYPASS_PATTERN.matcher(codeLine).find()) {
+                    findings.add(new PreScreeningFinding(
+                            "TLS 인증서 검증 무력화",
+                            "CWE-295",
+                            "HIGH",
+                            currentFile,
+                            currentLine,
+                            codeLine,
+                            "TLS/SSL 인증서 검증 옵션이 무력화되어 중간자 공격(MITM) 및 데이터 변조/도청에 취약합니다.",
+                            "인증서 검증 옵션을 활성화(`verify=True`, `ignore_https_errors=False`)하고 안전한 통신을 유지하십시오."
+                    ));
+                }
+
+                // 2. CWE-306: 민감 엔드포인트 인증 의존성 누락
+                if (SENSITIVE_ROUTE_PATTERN.matcher(codeLine).find()) {
+                    boolean hasAuth = false;
+                    for (int j = i + 1; j < Math.min(lines.length, i + 5); j++) {
+                        String nextLine = lines[j];
+                        if (nextLine.contains("Depends(") || nextLine.contains("Security(") || nextLine.contains("authenticate") || nextLine.contains("auth")) {
+                            hasAuth = true;
+                            break;
+                        }
+                        if (nextLine.contains("def ") || nextLine.contains("async def ") || nextLine.contains("function")) {
+                            break;
+                        }
+                    }
+                    if (!hasAuth) {
+                        findings.add(new PreScreeningFinding(
+                                "민감 API 엔드포인트 인증 누락",
+                                "CWE-306",
+                                "HIGH",
+                                currentFile,
+                                currentLine,
+                                codeLine,
+                                "시스템 제어 및 모니터링/보고서 엔드포인트에 인증 의존성(`Depends`)이 누락되어 비인가 호출이 가능합니다.",
+                                "FastAPI `Depends(get_current_user)` 또는 인증 미들웨어를 엔드포인트에 필수로 적용하십시오."
+                        ));
+                    }
+                }
+
+                // 3. CWE-78: 커맨드 인젝션 및 안전하지 않은 쉘 실행
+                if (COMMAND_INJECTION_PATTERN.matcher(codeLine).find()) {
+                    findings.add(new PreScreeningFinding(
+                            "커맨드 인젝션 위험",
+                            "CWE-78",
+                            "CRITICAL",
+                            currentFile,
+                            currentLine,
+                            codeLine,
+                            "신뢰할 수 없는 입력값이 OS 쉘에 직접 전달될 경우 원격 코드 실행(RCE) 위험을 유발합니다.",
+                            "`shell=False` 옵션과 인자 리스트(`['cmd', arg]`)를 사용하거나 전용 라이브러리로 대체하십시오."
+                    ));
+                }
+
+                // 4. CWE-942: 와일드카드 CORS에 인증 허용
+                if (INSECURE_CORS_PATTERN.matcher(codeLine).find()) {
+                    findings.add(new PreScreeningFinding(
+                            "취약한 CORS 와일드카드 설정",
+                            "CWE-942",
+                            "HIGH",
+                            currentFile,
+                            currentLine,
+                            codeLine,
+                            "모든 도메인 허용(`*`)과 인증 정보 허용이 결합될 경우 브라우저 자격 증명 탈취 위험이 있습니다.",
+                            "신뢰할 수 있는 특정 출처(Origin) 도메인을 명시하십시오."
+                    ));
+                }
+
+                // 5. CWE-798: 시크릿 하드코딩
+                java.util.regex.Matcher secretMatcher = HARDCODED_SECRET_PATTERN.matcher(codeLine);
+                if (secretMatcher.find()) {
+                    String val = secretMatcher.group(1).toLowerCase();
+                    if (!val.contains("example") && !val.contains("dummy") && !val.contains("test") && !val.contains("placeholder")) {
+                        findings.add(new PreScreeningFinding(
+                                "비밀키/토큰 하드코딩 노출",
+                                "CWE-798",
+                                "CRITICAL",
+                                currentFile,
+                                currentLine,
+                                codeLine,
+                                "소스코드에 실제 비밀키 또는 API 인증 토큰이 평문으로 포함되어 있습니다.",
+                                "환경 변수(`.env`, `os.environ`) 또는 Vault 시크릿 매니저를 통해 외부에서 주입하십시오."
+                        ));
+                    }
+                }
+
+                currentLine++;
+            } else if (!line.startsWith("-")) {
+                currentLine++;
+            }
+        }
+
+        return findings;
+    }
+
+    private String extractDiffFilePath(String headerLine) {
+        int bIdx = headerLine.indexOf(" b/");
+        if (bIdx != -1) {
+            return headerLine.substring(bIdx + 3).trim();
+        }
+        return "unknown";
+    }
+
+    private int parseHunkStartLine(String hunkLine) {
+        try {
+            int plusIdx = hunkLine.indexOf("+");
+            if (plusIdx != -1) {
+                int commaIdx = hunkLine.indexOf(",", plusIdx);
+                int spaceIdx = hunkLine.indexOf(" ", plusIdx);
+                int endIdx = (commaIdx != -1 && commaIdx < spaceIdx) ? commaIdx : spaceIdx;
+                if (endIdx != -1) {
+                    return Integer.parseInt(hunkLine.substring(plusIdx + 1, endIdx).trim());
+                }
+            }
+        } catch (Exception ignored) {}
+        return 1;
+    }
+
+    public String formatPreScreeningSection(List<PreScreeningFinding> preScreenings) {
+        if (preScreenings == null || preScreenings.isEmpty()) {
+            return "(정적 위험 패턴 미검출 - PR Diff 비즈니스 로직 심층 감사 필요)";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("⚠️ 정적 코드 보안 프리-스크리닝에서 다음 보안 결함이 직접 검출되었습니다 (총 ").append(preScreenings.size()).append("건):\n");
+        for (PreScreeningFinding f : preScreenings) {
+            sb.append("- [").append(f.patternName()).append(" (").append(f.cweId()).append(")] `")
+                    .append(f.targetFile()).append("` (라인 ").append(f.lineNumber()).append("): ")
+                    .append(f.snippet()).append(" -> ").append(f.description()).append("\n");
+        }
+        sb.append("\n[절대 지침]: 위 프리-스크리닝 항목이 존재하므로, Trivy CVE가 0건이라 하더라도 절대로 승인(PASS)을 주지 말고, 반드시 [!WARNING] 또는 [!CAUTION]으로 판정하고 2번 결함 섹션에 상세 분석 및 diff 수정 코드를 작성하라!");
+        return sb.toString();
+    }
+
+    public String patchReportForPreScreeningFindings(String originalReport, List<PreScreeningFinding> findings, String projectEnvironment) {
+        if (findings == null || findings.isEmpty()) {
+            return originalReport;
+        }
+
+        String safeEnv = (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "미지정 (기타 프로젝트)";
+        boolean hasCritical = findings.stream().anyMatch(f -> "CRITICAL".equalsIgnoreCase(f.severity()));
+        String alertType = hasCritical ? "[!CAUTION]" : "[!WARNING]";
+        String verdictTitle = hasCritical ? "### 차단 권고 (BLOCK)" : "### 주의 (WARN)";
+
+        StringBuilder defectSection = new StringBuilder();
+        defectSection.append("### 2. 코드 로직 및 설정 결함 — 총 ").append(findings.size()).append("건\n\n");
+        defectSection.append("<details open>\n");
+        defectSection.append("<summary><b>상세 코드 결함 및 수정 제안 (Diff) 보기</b></summary>\n\n");
+
+        for (PreScreeningFinding f : findings) {
+            defectSection.append("- **[").append(f.patternName()).append(" (").append(f.cweId()).append(")]** `")
+                    .append(f.targetFile()).append("` (라인 ").append(f.lineNumber()).append("): ")
+                    .append(f.description()).append("\n");
+        }
+        defectSection.append("\n**(수정 제안 코드)**\n```diff\n");
+        for (PreScreeningFinding f : findings) {
+            defectSection.append("- // ❌ 기존 취약한 코드 (").append(f.targetFile()).append(":").append(f.lineNumber()).append(")\n");
+            defectSection.append("- ").append(f.snippet()).append("\n");
+            defectSection.append("+ // ✅ 안전하게 수정된 코드 (").append(f.fixSuggestion()).append(")\n\n");
+        }
+        defectSection.append("```\n\n</details>");
+
+        if (originalReport.contains("### 승인 (PASS)") || originalReport.contains("[!TIP]")
+                || (!originalReport.contains("### 주의 (WARN)") && !originalReport.contains("### 차단 권고 (BLOCK)"))) {
+            String banner = """
+                    > %s
+                    > %s
+                    > 오픈소스 취약점(CVE)은 안전하나, PR 코드 내에서 애플리케이션 보안 결함(%d건)이 검출되었습니다.
+                    >
+                    > - **프로젝트 환경:** %s
+                    > - **오픈소스 취약점 (CVE):** 0건 (안전)
+                    > - **코드 로직 및 설정 결함:** 총 %d건 (%s)
+                    """.formatted(
+                            alertType,
+                            verdictTitle,
+                            findings.size(),
+                            safeEnv,
+                            findings.size(),
+                            findings.get(0).patternName()
+                    ).trim();
+
+            int sbomIdx = originalReport.indexOf("<details>\n<summary><b>소프트웨어 자재 명세서");
+            if (sbomIdx == -1) {
+                sbomIdx = originalReport.indexOf("<details>\r\n<summary><b>소프트웨어 자재 명세서");
+            }
+            if (sbomIdx != -1) {
+                String sbomPart = originalReport.substring(sbomIdx);
+                return banner + "\n\n---\n\n" + defectSection.toString() + "\n\n---\n\n" + sbomPart;
+            } else {
+                return banner + "\n\n---\n\n" + defectSection.toString();
+            }
+        }
+
+        if (!originalReport.contains("### 2. 코드 로직 및 설정 결함")) {
+            int sbomIdx = originalReport.indexOf("<details>\n<summary><b>소프트웨어 자재 명세서");
+            if (sbomIdx == -1) {
+                sbomIdx = originalReport.indexOf("<details>\r\n<summary><b>소프트웨어 자재 명세서");
+            }
+            if (sbomIdx != -1) {
+                String head = originalReport.substring(0, sbomIdx).trim();
+                String sbomPart = originalReport.substring(sbomIdx);
+                return head + "\n\n---\n\n" + defectSection.toString() + "\n\n---\n\n" + sbomPart;
+            } else {
+                return originalReport.trim() + "\n\n---\n\n" + defectSection.toString();
+            }
+        }
+
+        return originalReport;
     }
 
     /**

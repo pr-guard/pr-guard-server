@@ -209,5 +209,30 @@ class GitHubBotServiceTest {
                 "APPROVE", "보안 검증 통과"
         ));
     }
+
+    @Test
+    @DisplayName("Diff가 최대 허용 길이를 초과할 때 단순 잘림이 아닌 고위험 보안 파일(scraper, auth 등)을 최우선 보존해야 한다")
+    void shouldPrioritizeSecuritySensitiveHunksWhenSmartTruncatingDiff() {
+        String longLowRiskFile = "diff --git a/src/utils/formatter.py b/src/utils/formatter.py\n" +
+                "--- a/src/utils/formatter.py\n" +
+                "+++ b/src/utils/formatter.py\n" +
+                "@@ -1,5 +1,10 @@\n" +
+                "+# " + "A".repeat(800) + "\n";
+
+        String highRiskSecurityFile = "diff --git a/src/services/scraper.py b/src/services/scraper.py\n" +
+                "--- a/src/services/scraper.py\n" +
+                "+++ b/src/services/scraper.py\n" +
+                "@@ -10,3 +10,4 @@\n" +
+                "+context = await browser.new_context(ignore_https_errors=True)\n";
+
+        String combined = longLowRiskFile + highRiskSecurityFile;
+
+        // 500자로 잘라낼 때, 뒤에 위치한 고위험 scraper 파일이 우선 보존되어야 함
+        String truncated = gitHubBotService.smartTruncateDiff(combined, 500);
+
+        assertNotNull(truncated);
+        assertTrue(truncated.contains("scraper.py"), "고위험 파일인 scraper.py가 반드시 보존되어야 함");
+        assertTrue(truncated.contains("ignore_https_errors=True"), "CWE-295 취약 코드 라인이 보존되어야 함");
+    }
 }
 

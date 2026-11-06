@@ -54,6 +54,9 @@ public class UniversalDependencyScanner {
         }
 
         public String toSummaryString() {
+            if (language != null && language.contains(" + ")) {
+                return language;
+            }
             StringBuilder sb = new StringBuilder();
             if (language != null && !language.isBlank() && !"알 수 없음".equals(language)) {
                 sb.append(language);
@@ -72,7 +75,7 @@ public class UniversalDependencyScanner {
             ".git", ".gradle", ".idea", "node_modules", "target", "build", "bin", "obj",
             ".vs", ".vscode", "vendor", "dist", "out", ".next", ".nuxt",
             "venv", ".venv", "env", ".env", "__pycache__", ".pytest_cache", ".mypy_cache",
-            ".tox", "Pods", "packages"
+            ".tox", "Pods"
     );
 
     // Gradle Regex
@@ -213,41 +216,51 @@ public class UniversalDependencyScanner {
         }
 
         List<LLMAnalysisService.SbomPackageDetail> safePackages = (packages != null) ? packages : Collections.emptyList();
+        List<ProjectEnvironment> detectedList = new ArrayList<>();
 
         // 1. Java / Kotlin (JVM)
-        boolean hasGradleKts = Files.exists(rootDir.resolve("build.gradle.kts"));
-        boolean hasGradle = Files.exists(rootDir.resolve("build.gradle")) || hasGradleKts;
-        boolean hasMaven = Files.exists(rootDir.resolve("pom.xml"));
+        boolean hasGradleKts = hasFile(rootDir, "build.gradle.kts");
+        boolean hasGradle = hasFile(rootDir, "build.gradle") || hasGradleKts;
+        boolean hasMaven = hasFile(rootDir, "pom.xml");
+        boolean hasJvmPackages = safePackages.stream().anyMatch(p -> {
+            String lic = p.license() != null ? p.license().toLowerCase() : "";
+            return lic.contains("maven") || lic.contains("gradle") || p.name().contains(":");
+        });
 
-        if (hasGradle || hasMaven) {
+        if (hasGradle || hasMaven || hasJvmPackages) {
             String javaVersion = null;
             if (hasGradle) {
-                Path gFile = hasGradleKts ? rootDir.resolve("build.gradle.kts") : rootDir.resolve("build.gradle");
-                try {
-                    String gContent = Files.readString(gFile, StandardCharsets.UTF_8);
-                    Matcher jm = GRADLE_JAVA_VERSION_PATTERN.matcher(gContent);
-                    if (jm.find()) {
-                        for (int i = 1; i <= jm.groupCount(); i++) {
-                            if (jm.group(i) != null) {
-                                javaVersion = jm.group(i);
-                                break;
+                Path gFile = hasGradleKts ? resolveFilePath(rootDir, "build.gradle.kts") : resolveFilePath(rootDir, "build.gradle");
+                if (gFile != null && Files.exists(gFile)) {
+                    try {
+                        String gContent = Files.readString(gFile, StandardCharsets.UTF_8);
+                        Matcher jm = GRADLE_JAVA_VERSION_PATTERN.matcher(gContent);
+                        if (jm.find()) {
+                            for (int i = 1; i <= jm.groupCount(); i++) {
+                                if (jm.group(i) != null) {
+                                    javaVersion = jm.group(i);
+                                    break;
+                                }
                             }
                         }
-                    }
-                } catch (Exception ignored) {}
-            } else {
-                try {
-                    String mContent = Files.readString(rootDir.resolve("pom.xml"), StandardCharsets.UTF_8);
-                    Matcher jm = MAVEN_JAVA_VERSION_PATTERN.matcher(mContent);
-                    if (jm.find()) {
-                        javaVersion = jm.group(1);
-                    }
-                } catch (Exception ignored) {}
+                    } catch (Exception ignored) {}
+                }
+            } else if (hasMaven) {
+                Path mFile = resolveFilePath(rootDir, "pom.xml");
+                if (mFile != null && Files.exists(mFile)) {
+                    try {
+                        String mContent = Files.readString(mFile, StandardCharsets.UTF_8);
+                        Matcher jm = MAVEN_JAVA_VERSION_PATTERN.matcher(mContent);
+                        if (jm.find()) {
+                            javaVersion = jm.group(1);
+                        }
+                    } catch (Exception ignored) {}
+                }
             }
 
             String langSuffix = (javaVersion != null && !javaVersion.isBlank()) ? " " + javaVersion : "";
             String language = hasGradleKts ? ("Kotlin / Java" + langSuffix) : ("Java" + langSuffix);
-            String buildTool = hasGradle ? "Gradle" : "Maven";
+            String buildTool = hasGradle ? "Gradle" : (hasMaven ? "Maven" : "Gradle/Maven");
             String framework = "미지정";
 
             for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
@@ -265,36 +278,49 @@ public class UniversalDependencyScanner {
                     break;
                 }
             }
-            return new ProjectEnvironment(language, buildTool, framework);
+            detectedList.add(new ProjectEnvironment(language, buildTool, framework));
         }
 
         // 2. Node.js (JavaScript / TypeScript)
-        if (Files.exists(rootDir.resolve("package.json"))) {
-            boolean isTs = Files.exists(rootDir.resolve("tsconfig.json"));
+        boolean hasPackageJson = hasFile(rootDir, "package.json");
+        boolean hasNodePackages = safePackages.stream().anyMatch(p -> {
+            String lic = p.license() != null ? p.license().toLowerCase() : "";
+            return lic.contains("npm") || lic.contains("yarn") || lic.contains("pnpm") || lic.contains("node");
+        });
+
+        if (hasPackageJson || hasNodePackages) {
+            boolean isTs = hasFile(rootDir, "tsconfig.json") || hasFileExtension(rootDir, ".ts") || hasFileExtension(rootDir, ".tsx");
             String language = isTs ? "TypeScript" : "JavaScript";
             String buildTool;
-            if (Files.exists(rootDir.resolve("pnpm-lock.yaml"))) buildTool = "pnpm";
-            else if (Files.exists(rootDir.resolve("yarn.lock"))) buildTool = "Yarn";
-            else if (Files.exists(rootDir.resolve("package-lock.json"))) buildTool = "npm";
+            if (hasFile(rootDir, "pnpm-lock.yaml")) buildTool = "pnpm";
+            else if (hasFile(rootDir, "yarn.lock")) buildTool = "Yarn";
+            else if (hasFile(rootDir, "package-lock.json")) buildTool = "npm";
             else buildTool = "npm";
 
             String framework = "Node.js";
             for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
                 String n = p.name().toLowerCase();
                 if (n.equals("next")) { framework = "Next.js"; break; }
-                if (n.equals("react")) { framework = "React"; break; }
+                if (n.equals("react") || n.equals("react-dom")) { framework = "React"; break; }
                 if (n.equals("vue")) { framework = "Vue.js"; break; }
                 if (n.equals("express")) { framework = "Express"; break; }
                 if (n.equals("@nestjs/core")) { framework = "NestJS"; break; }
             }
-            return new ProjectEnvironment(language, buildTool, framework);
+            detectedList.add(new ProjectEnvironment(language, buildTool, framework));
         }
 
         // 3. Python
-        if (Files.exists(rootDir.resolve("requirements.txt")) || Files.exists(rootDir.resolve("pyproject.toml")) || Files.exists(rootDir.resolve("Pipfile"))) {
+        boolean hasPythonManifest = hasFile(rootDir, "requirements.txt") || hasFile(rootDir, "pyproject.toml")
+                || hasFile(rootDir, "Pipfile") || hasFile(rootDir, "setup.py") || hasFile(rootDir, "setup.cfg");
+        boolean hasPythonPackages = safePackages.stream().anyMatch(p -> {
+            String lic = p.license() != null ? p.license().toLowerCase() : "";
+            return lic.contains("pypi") || lic.contains("python") || lic.contains("poetry") || lic.contains("pip");
+        });
+
+        if (hasPythonManifest || hasPythonPackages) {
             String buildTool;
-            if (Files.exists(rootDir.resolve("poetry.lock"))) buildTool = "Poetry";
-            else if (Files.exists(rootDir.resolve("Pipfile.lock"))) buildTool = "Pipenv";
+            if (hasFile(rootDir, "poetry.lock")) buildTool = "Poetry";
+            else if (hasFile(rootDir, "Pipfile.lock")) buildTool = "Pipenv";
             else buildTool = "pip";
 
             String framework = "미지정";
@@ -304,11 +330,11 @@ public class UniversalDependencyScanner {
                 if (n.equals("fastapi")) { framework = "FastAPI"; break; }
                 if (n.equals("flask")) { framework = "Flask"; break; }
             }
-            return new ProjectEnvironment("Python", buildTool, framework);
+            detectedList.add(new ProjectEnvironment("Python", buildTool, framework));
         }
 
         // 4. Rust
-        if (Files.exists(rootDir.resolve("Cargo.toml"))) {
+        if (hasFile(rootDir, "Cargo.toml") || safePackages.stream().anyMatch(p -> p.license() != null && p.license().toLowerCase().contains("cargo"))) {
             String framework = "미지정";
             for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
                 String n = p.name().toLowerCase();
@@ -316,11 +342,11 @@ public class UniversalDependencyScanner {
                 if (n.equals("axum")) { framework = "Axum"; break; }
                 if (n.equals("tokio")) { framework = "Tokio"; break; }
             }
-            return new ProjectEnvironment("Rust", "Cargo", framework);
+            detectedList.add(new ProjectEnvironment("Rust", "Cargo", framework));
         }
 
         // 5. Go
-        if (Files.exists(rootDir.resolve("go.mod"))) {
+        if (hasFile(rootDir, "go.mod") || safePackages.stream().anyMatch(p -> p.license() != null && p.license().toLowerCase().contains("go"))) {
             String framework = "미지정";
             for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
                 String n = p.name().toLowerCase();
@@ -328,95 +354,77 @@ public class UniversalDependencyScanner {
                 if (n.contains("labstack/echo")) { framework = "Echo"; break; }
                 if (n.contains("gofiber/fiber")) { framework = "Fiber"; break; }
             }
-            return new ProjectEnvironment("Go", "Go Modules", framework);
+            detectedList.add(new ProjectEnvironment("Go", "Go Modules", framework));
         }
 
         // 6. C# / .NET
-        boolean hasCsproj = false;
-        try (var s = Files.list(rootDir)) {
-            hasCsproj = s.anyMatch(p -> p.getFileName().toString().toLowerCase().endsWith(".csproj"));
-        } catch (Exception ignored) {}
-        if (hasCsproj) {
-            return new ProjectEnvironment("C# (.NET)", "NuGet / MSBuild", "ASP.NET Core / .NET");
+        boolean hasCsproj = hasFileWithExtension(rootDir, ".csproj") || hasFileWithExtension(rootDir, ".fsproj");
+        if (hasCsproj || safePackages.stream().anyMatch(p -> p.license() != null && p.license().toLowerCase().contains("nuget"))) {
+            detectedList.add(new ProjectEnvironment("C# (.NET)", "NuGet / MSBuild", "ASP.NET Core / .NET"));
         }
 
         // 7. C / C++
-        if (Files.exists(rootDir.resolve("CMakeLists.txt")) || Files.exists(rootDir.resolve("conanfile.txt")) || Files.exists(rootDir.resolve("vcpkg.json"))) {
-            String buildTool = Files.exists(rootDir.resolve("CMakeLists.txt")) ? "CMake" : (Files.exists(rootDir.resolve("conanfile.txt")) ? "Conan" : "vcpkg");
-            return new ProjectEnvironment("C / C++", buildTool, "Native");
+        if (hasFile(rootDir, "CMakeLists.txt") || hasFile(rootDir, "conanfile.txt") || hasFile(rootDir, "vcpkg.json")) {
+            String buildTool = hasFile(rootDir, "CMakeLists.txt") ? "CMake" : (hasFile(rootDir, "conanfile.txt") ? "Conan" : "vcpkg");
+            detectedList.add(new ProjectEnvironment("C / C++", buildTool, "Native"));
         }
 
-        // 8. Mobile / iOS / Flutter
-        if (Files.exists(rootDir.resolve("pubspec.yaml"))) {
-            return new ProjectEnvironment("Dart", "Flutter / pub", "Flutter");
+        // 8. Mobile
+        if (hasFile(rootDir, "pubspec.yaml")) {
+            detectedList.add(new ProjectEnvironment("Dart", "Flutter / pub", "Flutter"));
         }
-        if (Files.exists(rootDir.resolve("Podfile")) || Files.exists(rootDir.resolve("Package.swift"))) {
-            return new ProjectEnvironment("Swift", "SPM / CocoaPods", "iOS / Apple");
+        if (hasFile(rootDir, "Podfile") || hasFile(rootDir, "Package.swift")) {
+            detectedList.add(new ProjectEnvironment("Swift", "SPM / CocoaPods", "iOS / Apple"));
         }
 
-        // 9. 루트 매니페스트 부재 시, 검출된 패키지들의 생태계 메타데이터(safePackages)로부터 언어/도구 역추론 (서브폴더/모노레포 지원)
-        if (!safePackages.isEmpty()) {
-            int npmCount = 0;
-            int javaCount = 0;
-            int pythonCount = 0;
-            int rustCount = 0;
-            int goCount = 0;
-            int nugetCount = 0;
+        // 단일 스택 감지 시 해당 단일 환경 반환
+        if (detectedList.size() == 1) {
+            return detectedList.get(0);
+        }
 
-            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
-                String lic = p.license() != null ? p.license().toLowerCase() : "";
-                if (lic.contains("npm") || lic.contains("yarn") || lic.contains("pnpm") || lic.contains("node")) npmCount++;
-                else if (lic.contains("maven") || lic.contains("gradle")) javaCount++;
-                else if (lic.contains("pypi") || lic.contains("python") || lic.contains("poetry") || lic.contains("pip")) pythonCount++;
-                else if (lic.contains("cargo") || lic.contains("rust") || lic.contains("crates")) rustCount++;
-                else if (lic.contains("go")) goCount++;
-                else if (lic.contains("nuget")) nugetCount++;
-            }
-
-            if (npmCount > 0 && npmCount >= javaCount && npmCount >= pythonCount) {
-                boolean hasTs = hasFileExtension(rootDir, ".ts") || hasFileExtension(rootDir, ".tsx");
-                String language = hasTs ? "TypeScript" : "JavaScript";
-                String framework = "Node.js";
-                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
-                    String n = p.name().toLowerCase();
-                    if (n.equals("next")) { framework = "Next.js"; break; }
-                    if (n.equals("react")) { framework = "React"; break; }
-                    if (n.equals("vue")) { framework = "Vue.js"; break; }
-                    if (n.equals("express")) { framework = "Express"; break; }
-                    if (n.equals("@nestjs/core")) { framework = "NestJS"; break; }
-                }
-                String buildTool = "npm";
-                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
-                    String lic = p.license() != null ? p.license().toLowerCase() : "";
-                    if (lic.contains("pnpm")) { buildTool = "pnpm"; break; }
-                    if (lic.contains("yarn")) { buildTool = "Yarn"; break; }
-                }
-                return new ProjectEnvironment(language, buildTool, framework);
-            } else if (javaCount > 0) {
-                String framework = "JVM";
-                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
-                    if (p.name().contains("spring-boot")) { framework = "Spring Boot"; break; }
-                }
-                return new ProjectEnvironment("Java", "Gradle/Maven", framework);
-            } else if (pythonCount > 0) {
-                String framework = "Python";
-                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
-                    String n = p.name().toLowerCase();
-                    if (n.equals("django")) { framework = "Django"; break; }
-                    if (n.equals("fastapi")) { framework = "FastAPI"; break; }
-                    if (n.equals("flask")) { framework = "Flask"; break; }
-                }
-                return new ProjectEnvironment("Python", "pip", framework);
-            } else if (rustCount > 0) {
-                return new ProjectEnvironment("Rust", "Cargo", "Native");
-            } else if (goCount > 0) {
-                return new ProjectEnvironment("Go", "Go Modules", "Native");
-            } else if (nugetCount > 0) {
-                return new ProjectEnvironment("C# (.NET)", "NuGet", ".NET");
-            }
+        // 다중 스택(Polyglot) 감지 시: 개별 스택 요약을 " + "로 연결하여 복합 환경 생성
+        if (detectedList.size() > 1) {
+            String composite = detectedList.stream()
+                    .map(ProjectEnvironment::toSummaryString)
+                    .distinct()
+                    .reduce((a, b) -> a + " + " + b)
+                    .orElse("기타/다중 언어 프로젝트");
+            return new ProjectEnvironment(composite, "다중 빌드 도구", "다중 프레임워크");
         }
 
         return ProjectEnvironment.unknown();
+    }
+
+    private boolean hasFile(Path rootDir, String fileName) {
+        if (rootDir == null || !Files.exists(rootDir)) return false;
+        if (Files.exists(rootDir.resolve(fileName))) return true;
+        try (var s = Files.walk(rootDir, 3)) {
+            return s.anyMatch(p -> p.getFileName() != null && p.getFileName().toString().equalsIgnoreCase(fileName));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private Path resolveFilePath(Path rootDir, String fileName) {
+        if (rootDir == null || !Files.exists(rootDir)) return null;
+        Path direct = rootDir.resolve(fileName);
+        if (Files.exists(direct)) return direct;
+        try (var s = Files.walk(rootDir, 3)) {
+            return s.filter(p -> p.getFileName() != null && p.getFileName().toString().equalsIgnoreCase(fileName))
+                    .findFirst()
+                    .orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean hasFileWithExtension(Path rootDir, String ext) {
+        if (rootDir == null || !Files.exists(rootDir)) return false;
+        try (var s = Files.walk(rootDir, 3)) {
+            return s.anyMatch(p -> p.getFileName() != null && p.getFileName().toString().toLowerCase().endsWith(ext));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private boolean hasFileExtension(Path rootDir, String ext) {
@@ -453,9 +461,11 @@ public class UniversalDependencyScanner {
             } else if (lowerName.equals("pnpm-lock.yaml") && !file.toString().contains("node_modules")) {
                 parsePnpmLock(file, packagesMap);
             }
-            // 4. Python: requirements*.txt, requirements*.in, pyproject.toml, Pipfile, poetry.lock, Pipfile.lock
-            else if (lowerName.contains("requirements") && (lowerName.endsWith(".txt") || lowerName.endsWith(".in"))) {
+            // 4. Python: requirements*.txt, requirements*.in, pyproject.toml, Pipfile, poetry.lock, Pipfile.lock, setup.py, setup.cfg
+            else if ((lowerName.contains("requirements") || isInsideRequirementsDir(file)) && (lowerName.endsWith(".txt") || lowerName.endsWith(".in"))) {
                 parsePythonReqs(file, packagesMap);
+            } else if (lowerName.equals("setup.py") || lowerName.equals("setup.cfg")) {
+                parsePythonSetup(file, packagesMap);
             } else if (lowerName.equals("pyproject.toml")) {
                 parsePyprojectToml(file, packagesMap);
             } else if (lowerName.equals("pipfile")) {
@@ -762,6 +772,66 @@ public class UniversalDependencyScanner {
         }
     }
 
+    private boolean isInsideRequirementsDir(Path file) {
+        if (file == null || file.getParent() == null) return false;
+        Path parent = file.getParent();
+        String parentName = parent.getFileName() != null ? parent.getFileName().toString().toLowerCase() : "";
+        return parentName.contains("requirements") || parentName.equals("reqs") || parentName.equals("pip");
+    }
+
+    private void parsePythonSetup(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            boolean inInstallRequires = false;
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+
+                if (line.contains("install_requires")) {
+                    inInstallRequires = true;
+                    if (line.contains("]") || (line.endsWith(")") && !line.contains("["))) {
+                        extractPackagesFromLine(line, map);
+                        inInstallRequires = false;
+                    }
+                    continue;
+                }
+
+                if (inInstallRequires) {
+                    if (line.equals("]") || line.equals(")") || (line.startsWith("[") && line.endsWith("]"))) {
+                        inInstallRequires = false;
+                        continue;
+                    }
+                    extractPackagesFromLine(line, map);
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] setup.py/cfg 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void extractPackagesFromLine(String line, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        String clean = line.replace("\"", "").replace("'", "").replace(",", "").trim();
+        int commentIdx = clean.indexOf('#');
+        if (commentIdx != -1) clean = clean.substring(0, commentIdx).trim();
+        int semiIdx = clean.indexOf(';');
+        if (semiIdx != -1) clean = clean.substring(0, semiIdx).trim();
+        if (clean.isEmpty()) return;
+
+        String[] split = clean.split("[><=~@!]+", 2);
+        String name = split[0].trim();
+        String ver = "latest";
+        if (split.length > 1) {
+            ver = split[1].split("[,;\\s]+")[0].trim();
+        }
+        int bracketIdx = name.indexOf('[');
+        if (bracketIdx != -1) {
+            name = name.substring(0, bracketIdx).trim();
+        }
+        if (!name.isBlank() && !name.contains("install_requires") && !name.equals("=") && !name.contains("(")) {
+            map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+        }
+    }
+
     private void parsePyprojectToml(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
         try {
             List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
@@ -980,12 +1050,35 @@ public class UniversalDependencyScanner {
     }
 
     private void parseGoMod(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) throws IOException {
-        String content = Files.readString(file, StandardCharsets.UTF_8);
-        Matcher m = GO_MOD_PATTERN.matcher(content);
-        while (m.find()) {
-            String name = m.group(1).trim();
-            String ver = m.group(2).trim();
-            map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "Go-Modules"));
+        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        boolean inRequire = false;
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+            if (line.startsWith("require (")) {
+                inRequire = true;
+                continue;
+            }
+            if (inRequire && line.equals(")")) {
+                inRequire = false;
+                continue;
+            }
+            String targetLine = line;
+            if (line.startsWith("require ") && !line.startsWith("require (")) {
+                targetLine = line.substring("require ".length()).trim();
+            } else if (!inRequire) {
+                continue;
+            }
+
+            Matcher m = GO_MOD_PATTERN.matcher(targetLine);
+            if (m.find()) {
+                String name = m.group(1).trim();
+                String ver = m.group(2).trim();
+                boolean isIndirect = targetLine.contains("// indirect");
+                LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                if (existing == null || (existing.indirect() && !isIndirect)) {
+                    map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "Go-Modules"));
+                }
+            }
         }
     }
 

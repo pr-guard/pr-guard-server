@@ -27,6 +27,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.PrivateKey;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
@@ -296,8 +297,9 @@ public class GitHubBotService {
 
             int maxLength = Math.max(1000, maxDiffLength);
             if (filteredDiff.length() > maxLength) {
-                log.info("[GitHubBot] PR Diff 길이가 {}자이므로 최대 {}자로 잘라냅니다.", filteredDiff.length(), maxLength);
-                return filteredDiff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 " + maxLength + "자 이후는 생략되었습니다)";
+                log.info("[GitHubBot] PR Diff 길이가 {}자이므로 스마트 보안 우선순위 기반으로 {}자 내로 압축/보존합니다.",
+                        filteredDiff.length(), maxLength);
+                return smartTruncateDiff(filteredDiff, maxLength);
             }
 
             return filteredDiff;
@@ -340,6 +342,99 @@ public class GitHubBotService {
         }
 
         return relevantDiff.toString().trim();
+    }
+
+    private record FileDiffScore(String diff, int score) {}
+
+    public String smartTruncateDiff(String filteredDiff, int maxLength) {
+        if (filteredDiff == null || filteredDiff.length() <= maxLength) {
+            return filteredDiff;
+        }
+
+        String[] fileDiffs = filteredDiff.split("(?=diff --git )");
+        if (fileDiffs.length <= 1) {
+            return filteredDiff.substring(0, maxLength) + "\n\n... (Diff가 너무 길어 " + maxLength + "자 이후는 생략되었습니다)";
+        }
+
+        List<FileDiffScore> scoredList = new ArrayList<>();
+        for (String fd : fileDiffs) {
+            if (fd.isBlank()) continue;
+            int score = calculateSecurityScore(fd);
+            scoredList.add(new FileDiffScore(fd, score));
+        }
+
+        scoredList.sort((a, b) -> Integer.compare(b.score(), a.score()));
+
+        StringBuilder result = new StringBuilder();
+        int preservedFiles = 0;
+        int omittedFiles = 0;
+
+        for (FileDiffScore fds : scoredList) {
+            if (result.length() + fds.diff().length() <= maxLength) {
+                result.append(fds.diff());
+                preservedFiles++;
+            } else if (result.length() < maxLength) {
+                int remaining = maxLength - result.length();
+                if (remaining > 500) {
+                    result.append(fds.diff(), 0, remaining).append("\n... (파일 diff 일부 생략)\n");
+                    preservedFiles++;
+                } else {
+                    omittedFiles++;
+                }
+            } else {
+                omittedFiles++;
+            }
+        }
+
+        if (omittedFiles > 0) {
+            result.append("\n\n... (보안 우선순위 기반 선별: 고위험/핵심 로직 파일 ")
+                    .append(preservedFiles)
+                    .append("개 보존, 저위험 파일 ")
+                    .append(omittedFiles)
+                    .append("개 생략됨)");
+        }
+
+        return result.toString().trim();
+    }
+
+    private int calculateSecurityScore(String fileDiff) {
+        int score = 0;
+        String lower = fileDiff.toLowerCase();
+
+        if (lower.contains("ignore_https_errors") || lower.contains("--ignore-certificate-errors")
+                || lower.contains("verify=false") || lower.contains("rejectunauthorized")
+                || lower.contains("node_tls_reject_unauthorized")) {
+            score += 1000;
+        }
+        if (lower.contains("os.system(") || lower.contains("shell=true") || lower.contains("eval(") || lower.contains("exec(")) {
+            score += 800;
+        }
+        if (lower.contains("allow_origins") || lower.contains("cors")) {
+            score += 500;
+        }
+        if (lower.contains("password") || lower.contains("secret") || lower.contains("token") || lower.contains("private_key")) {
+            score += 500;
+        }
+        if (lower.contains("@app.") || lower.contains("@router.") || lower.contains("router.post") || lower.contains("router.get")) {
+            score += 400;
+        }
+
+        String firstLine = fileDiff.lines().findFirst().orElse("");
+        String path = extractFilePathFromDiffHeader(firstLine).toLowerCase();
+        if (path.contains("auth") || path.contains("security") || path.contains("login") || path.contains("permission")) {
+            score += 300;
+        }
+        if (path.contains("api") || path.contains("route") || path.contains("controller") || path.contains("service") || path.contains("handler")) {
+            score += 200;
+        }
+        if (path.contains("config") || path.contains("setting") || path.contains("env") || path.contains("docker")) {
+            score += 200;
+        }
+        if (path.contains("scraper") || path.contains("crawler") || path.contains("bot") || path.contains("client")) {
+            score += 150;
+        }
+
+        return score;
     }
 
     private String extractFilePathFromDiffHeader(String headerLine) {

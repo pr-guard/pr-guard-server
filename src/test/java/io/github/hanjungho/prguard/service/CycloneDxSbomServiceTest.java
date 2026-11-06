@@ -5,8 +5,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -307,6 +311,51 @@ class CycloneDxSbomServiceTest {
         assertTrue(services.stream().anyMatch(s -> s.name().equals("PostgreSQL")));
         assertTrue(services.stream().anyMatch(s -> s.name().equals("Notion API")));
         assertTrue(services.stream().anyMatch(s -> s.name().equals("Playwright")));
+    }
+
+    @Test
+    @DisplayName("Redis, MongoDB, MySQL, Kafka, Pterodactyl 등 다양한 외부 서비스 및 DB 패키지를 자동 매핑해야 한다")
+    void shouldDetectExtendedDatabasesAndSaaSPackages() {
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("redis", "5.0.0", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("pymongo", "4.6.0", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("mysqlclient", "2.2.0", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("pika", "1.3.2", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("pydactyl", "1.1.0", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("boto3", "1.34.0", false, "PyPI(Python)")
+        );
+
+        List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(null, pkgs);
+
+        assertNotNull(services);
+        assertEquals(6, services.size());
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Redis")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("MongoDB")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("MySQL")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("RabbitMQ") || s.name().contains("Message Broker")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Pterodactyl")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("AWS") || s.name().contains("Amazon")));
+    }
+
+    @Test
+    @DisplayName("환경변수(.env) 및 compose.yml 파일에 기술된 데이터베이스 프로토콜 및 키워드를 감지해야 한다")
+    void shouldDetectExternalServicesFromConfigFiles(@TempDir Path tempDir) throws IOException {
+        String envContent = """
+                DATABASE_URL=postgresql://app_user:pwd@db.supabase.co:5432/postgres
+                REDIS_URL=redis://default:pass@redis-server:6379
+                PTERO_URL=https://panel.myptero.com
+                NOTION_API_KEY=ntn_secret_12345
+                """;
+        Files.writeString(tempDir.resolve(".env"), envContent);
+
+        List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(tempDir, Collections.emptyList());
+
+        assertNotNull(services);
+        assertTrue(services.size() >= 3);
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("PostgreSQL")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Redis")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Pterodactyl")));
+        assertTrue(services.stream().anyMatch(s -> s.name().contains("Notion")));
     }
 }
 
