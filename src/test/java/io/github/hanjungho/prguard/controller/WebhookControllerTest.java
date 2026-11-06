@@ -283,4 +283,31 @@ class WebhookControllerTest {
         assertEquals(HttpStatus.ACCEPTED, response.getStatusCode());
         verify(pipeline, times(1)).executeRescanForPr("octocat/Hello-World", 33, 78910L);
     }
+
+    @Test
+    @DisplayName("GET /api/sbom/{owner}/{repo}/{prNumber} 호출 시 캐시된 CycloneDX JSON이 반환되어야 한다")
+    void shouldReturnCachedCycloneDxSbom() {
+        io.github.hanjungho.prguard.service.CycloneDxSbomService sbomService =
+                new io.github.hanjungho.prguard.service.CycloneDxSbomService(objectMapper);
+        sbomService.cacheSbom("octocat/Hello-World", 15, "{\"bomFormat\": \"CycloneDX\", \"specVersion\": \"1.5\"}");
+
+        WebhookController c = new WebhookController(pipeline, gitHubBotService, objectMapper, sbomService);
+
+        ResponseEntity<String> response = c.getCycloneDxSbom("octocat", "Hello-World", 15);
+        assertEquals(HttpStatus.OK, response.getStatusCode());
+        assertEquals("{\"bomFormat\": \"CycloneDX\", \"specVersion\": \"1.5\"}", response.getBody());
+    }
+
+    @Test
+    @DisplayName("캐시되지 않은 SBOM 요청 시 404 Not Found가 반환되어야 한다")
+    void shouldReturn404WhenSbomNotCached() {
+        io.github.hanjungho.prguard.service.CycloneDxSbomService sbomService =
+                new io.github.hanjungho.prguard.service.CycloneDxSbomService(objectMapper);
+
+        WebhookController c = new WebhookController(pipeline, gitHubBotService, objectMapper, sbomService);
+
+        ResponseEntity<String> response = c.getCycloneDxSbom("octocat", "Hello-World", 999);
+        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());
+        org.junit.jupiter.api.Assertions.assertTrue(response.getBody().contains("SBOM not found"));
+    }
 }

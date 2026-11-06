@@ -29,13 +29,23 @@ import java.util.stream.Stream;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class TrivyScannerService {
 
     private final UniversalDependencyScanner universalDependencyScanner;
+    private final CycloneDxSbomService cycloneDxSbomService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public TrivyScannerService(UniversalDependencyScanner universalDependencyScanner, CycloneDxSbomService cycloneDxSbomService) {
+        this.universalDependencyScanner = universalDependencyScanner;
+        this.cycloneDxSbomService = cycloneDxSbomService;
+    }
+
+    public TrivyScannerService(UniversalDependencyScanner universalDependencyScanner) {
+        this(universalDependencyScanner, new CycloneDxSbomService(new ObjectMapper()));
+    }
 
     public TrivyScannerService() {
-        this.universalDependencyScanner = new UniversalDependencyScanner(new ObjectMapper());
+        this(new UniversalDependencyScanner(new ObjectMapper()), new CycloneDxSbomService(new ObjectMapper()));
     }
 
     @org.springframework.beans.factory.annotation.Value("${trivy.process.timeout-minutes:5}")
@@ -67,11 +77,28 @@ public class TrivyScannerService {
     private final AtomicLong lastDbUpdateTime = new AtomicLong(0L);
 
     /**
-     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책 및 범용 매니페스트 패키지 목록을 담는 반환 레코드
+     * Trivy 스캔 JSON, 프로젝트 런타임/환경 설정 컨텍스트, .prguard.yml 커스텀 정책, 범용 매니페스트 패키지 목록,
+     * 기술 스택 메타데이터 및 외부 연동 SaaS 서비스 목록을 담는 반환 레코드
      */
-    public record ScanResult(String scanJson, String runtimeContext, PrguardConfig config, List<LLMAnalysisService.SbomPackageDetail> manifestPackages) {
+    public record ScanResult(
+            String scanJson,
+            String runtimeContext,
+            PrguardConfig config,
+            List<LLMAnalysisService.SbomPackageDetail> manifestPackages,
+            String projectEnvironment,
+            List<CycloneDxSbomService.ExternalServiceDetail> externalServices
+    ) {
+        public ScanResult(String scanJson, String runtimeContext, PrguardConfig config,
+                          List<LLMAnalysisService.SbomPackageDetail> manifestPackages, String projectEnvironment) {
+            this(scanJson, runtimeContext, config, manifestPackages, projectEnvironment, Collections.emptyList());
+        }
+
+        public ScanResult(String scanJson, String runtimeContext, PrguardConfig config, List<LLMAnalysisService.SbomPackageDetail> manifestPackages) {
+            this(scanJson, runtimeContext, config, manifestPackages, "미지정 (기타 프로젝트)", Collections.emptyList());
+        }
+
         public ScanResult(String scanJson, String runtimeContext, PrguardConfig config) {
-            this(scanJson, runtimeContext, config, Collections.emptyList());
+            this(scanJson, runtimeContext, config, Collections.emptyList(), "미지정 (기타 프로젝트)", Collections.emptyList());
         }
     }
 
@@ -106,11 +133,22 @@ public class TrivyScannerService {
             // 3. 커스텀 보안 정책 파일(.prguard.yml) 탐색 및 파싱
             PrguardConfig prguardConfig = extractPrguardConfig(tempDir);
 
-            // 4. 범용 매니페스트 스캐너 실행 (C++, C#, Unity, Unreal, Mobile, Flutter, Gradle 등 모든 생태계 직접 의존성 수집)
+            // 4. 범용 매니페스트 스캐너 실행 (C++, C#, Unity, Unreal, Mobile, Flutter, Gradle 등 모든 생태계 직접/간접 의존성 수집)
             List<LLMAnalysisService.SbomPackageDetail> manifestPackages = (universalDependencyScanner != null)
                     ? universalDependencyScanner.scan(tempDir)
                     : Collections.emptyList();
             log.info("[TrivyScanner] 범용 매니페스트 패키지 수집 완료: 총 {}개", manifestPackages.size());
+
+            String projectEnvironment = (universalDependencyScanner != null)
+                    ? universalDependencyScanner.detectProjectEnvironment(tempDir, manifestPackages).toSummaryString()
+                    : "미지정 (기타 프로젝트)";
+            log.info("[TrivyScanner] 프로젝트 기술 스택 및 주요 언어 감지: {}", projectEnvironment);
+
+            // 4-1. 외부 연동 SaaS 및 타사 서비스 감지 (Gemini, GitHub, Toss, Stripe, AWS 등)
+            List<CycloneDxSbomService.ExternalServiceDetail> externalServices = (cycloneDxSbomService != null)
+                    ? cycloneDxSbomService.detectExternalServices(tempDir)
+                    : Collections.emptyList();
+            log.info("[TrivyScanner] 외부 연동 SaaS 서비스 감지: 총 {}개", externalServices.size());
 
             // 5. 런타임 환경 설정 컨텍스트 추출 (Dockerfile, .nvmrc, package.json, build.gradle 등)
             String runtimeContext = extractRuntimeContext(tempDir);
@@ -120,7 +158,7 @@ public class TrivyScannerService {
             String scanResult = executeTrivyScan(tempDir);
             log.info("[TrivyScanner] Trivy 스캔 완료");
 
-            return new ScanResult(scanResult, runtimeContext, prguardConfig, manifestPackages);
+            return new ScanResult(scanResult, runtimeContext, prguardConfig, manifestPackages, projectEnvironment, externalServices);
         } catch (Exception e) {
             log.error("[TrivyScanner] 스캔 파이프라인 수행 실패: {}", e.getMessage(), e);
             throw new RuntimeException("Trivy 스캔 실패: " + e.getMessage(), e);
@@ -164,54 +202,19 @@ public class TrivyScannerService {
     public String extractRuntimeContext(Path rootDir) {
         StringBuilder sb = new StringBuilder();
 
-        // 1. .nvmrc / .node-version
-        readAndAppendIfExists(rootDir, ".nvmrc", sb);
-        readAndAppendIfExists(rootDir, ".node-version", sb);
+        // 1. Node.js 버전 힌트 (.nvmrc / .node-version)
+        readAndAppendIfExists(rootDir, ".nvmrc", ".nvmrc", 1000, sb);
+        readAndAppendIfExists(rootDir, ".node-version", ".node-version", 1000, sb);
 
-        // 2. Dockerfile
-        readAndAppendIfExists(rootDir, "Dockerfile", sb);
-        readAndAppendIfExists(rootDir, "dockerfile", sb);
+        // 2. 컨테이너 환경 (Dockerfile)
+        readAndAppendIfExists(rootDir, "Dockerfile", "Dockerfile", 3000, sb);
+        readAndAppendIfExists(rootDir, "dockerfile", "dockerfile", 3000, sb);
 
-        // 3. package.json (engines, packageManager, dependencies 등 런타임/프레임워크 버전)
-        Path packageJson = rootDir.resolve("package.json");
-        if (Files.exists(packageJson) && Files.isRegularFile(packageJson)) {
-            try {
-                String content = Files.readString(packageJson, StandardCharsets.UTF_8);
-                sb.append("--- [package.json (런타임 및 프레임워크 버전)] ---\n");
-                if (content.length() <= 3000) {
-                    sb.append(content.trim()).append("\n\n");
-                } else {
-                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
-                }
-            } catch (Exception ignored) {}
-        }
-
-        // 4. build.gradle / pom.xml
-        Path buildGradle = rootDir.resolve("build.gradle");
-        if (Files.exists(buildGradle) && Files.isRegularFile(buildGradle)) {
-            try {
-                String content = Files.readString(buildGradle, StandardCharsets.UTF_8);
-                sb.append("--- [build.gradle (Java/Spring Boot 버전)] ---\n");
-                if (content.length() <= 3000) {
-                    sb.append(content.trim()).append("\n\n");
-                } else {
-                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
-                }
-            } catch (Exception ignored) {}
-        }
-
-        Path pomXml = rootDir.resolve("pom.xml");
-        if (Files.exists(pomXml) && Files.isRegularFile(pomXml)) {
-            try {
-                String content = Files.readString(pomXml, StandardCharsets.UTF_8);
-                sb.append("--- [pom.xml (Java/Spring Boot 버전)] ---\n");
-                if (content.length() <= 3000) {
-                    sb.append(content.trim()).append("\n\n");
-                } else {
-                    sb.append(content.substring(0, 3000)).append("\n... (일부 생략)\n\n");
-                }
-            } catch (Exception ignored) {}
-        }
+        // 3. 언어 및 프레임워크 빌드 명세서
+        readAndAppendIfExists(rootDir, "package.json", "package.json (런타임 및 프레임워크 버전)", 3000, sb);
+        readAndAppendIfExists(rootDir, "build.gradle", "build.gradle (Java/Spring Boot 버전)", 3000, sb);
+        readAndAppendIfExists(rootDir, "build.gradle.kts", "build.gradle.kts (Kotlin/Spring Boot 버전)", 3000, sb);
+        readAndAppendIfExists(rootDir, "pom.xml", "pom.xml (Java/Spring Boot 버전)", 3000, sb);
 
         if (sb.isEmpty()) {
             return "(탐지된 런타임/빌드 환경 설정 파일 없음)";
@@ -219,16 +222,16 @@ public class TrivyScannerService {
         return sb.toString().trim();
     }
 
-    private void readAndAppendIfExists(Path rootDir, String fileName, StringBuilder sb) {
+    private void readAndAppendIfExists(Path rootDir, String fileName, String label, int maxChars, StringBuilder sb) {
         Path filePath = rootDir.resolve(fileName);
         if (Files.exists(filePath) && Files.isRegularFile(filePath)) {
             try {
-                String content = Files.readString(filePath, StandardCharsets.UTF_8);
-                sb.append("--- [").append(fileName).append("] ---\n");
-                if (content.length() <= 2000) {
-                    sb.append(content.trim()).append("\n\n");
+                String content = Files.readString(filePath, StandardCharsets.UTF_8).trim();
+                sb.append("--- [").append(label).append("] ---\n");
+                if (content.length() <= maxChars) {
+                    sb.append(content).append("\n\n");
                 } else {
-                    sb.append(content.substring(0, 2000)).append("\n... (생략)\n\n");
+                    sb.append(content.substring(0, maxChars)).append("\n... (일부 생략)\n\n");
                 }
             } catch (Exception ignored) {}
         }

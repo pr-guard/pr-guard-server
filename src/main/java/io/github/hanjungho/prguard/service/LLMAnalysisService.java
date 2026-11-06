@@ -32,11 +32,22 @@ import java.util.Set;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class LLMAnalysisService {
 
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
+    private final CycloneDxSbomService cycloneDxSbomService;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public LLMAnalysisService(ObjectMapper objectMapper, RestTemplate restTemplate, CycloneDxSbomService cycloneDxSbomService) {
+        this.objectMapper = objectMapper;
+        this.restTemplate = restTemplate;
+        this.cycloneDxSbomService = cycloneDxSbomService;
+    }
+
+    public LLMAnalysisService(ObjectMapper objectMapper, RestTemplate restTemplate) {
+        this(objectMapper, restTemplate, new CycloneDxSbomService(objectMapper));
+    }
 
     private static final int MAX_CACHE_SIZE = 500;
 
@@ -86,10 +97,15 @@ public class LLMAnalysisService {
             String name,
             String version,
             boolean indirect,
-            String license) {
+            String license,
+            String purl) {
+
+        public SbomPackageDetail(String name, String version, boolean indirect, String license) {
+            this(name, version, indirect, license, "");
+        }
 
         public SbomPackageDetail(String name, String version, boolean indirect) {
-            this(name, version, indirect, "-");
+            this(name, version, indirect, "-", "");
         }
     }
 
@@ -228,7 +244,31 @@ public class LLMAnalysisService {
      */
     public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
                                                  PrguardConfig config, List<SbomPackageDetail> manifestPackages) {
-        log.info("[LLMAnalysis] 종합 보안 분석 시작 (커스텀 정책 적용 여부: {}, 범용 매니페스트 패키지: {}개)",
+        return analyzeVulnerabilities(rawTrivyJson, prDiff, runtimeContext, config, manifestPackages, "미지정 (기타 프로젝트)");
+    }
+
+    /**
+     * 프로젝트 기본 사용 언어/빌드 도구/프레임워크 환경 메타데이터(projectEnvironment)를 포함한 종합 분석
+     */
+    public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
+                                                 PrguardConfig config, List<SbomPackageDetail> manifestPackages,
+                                                 String projectEnvironment) {
+        return analyzeVulnerabilities(rawTrivyJson, prDiff, runtimeContext, config, manifestPackages,
+                projectEnvironment, Collections.emptyList(), null, null);
+    }
+
+    /**
+     * 외부 SaaS 연동 서비스 및 GitHub 레포지토리/PR 식별자를 포함한 OWASP CycloneDX v1.5 연계 종합 보안 분석
+     */
+    public AnalysisOutcome analyzeVulnerabilities(String rawTrivyJson, String prDiff, String runtimeContext,
+                                                 PrguardConfig config, List<SbomPackageDetail> manifestPackages,
+                                                 String projectEnvironment,
+                                                 List<CycloneDxSbomService.ExternalServiceDetail> externalServices,
+                                                 String repoFullName,
+                                                 Integer prNumber) {
+        log.info("[LLMAnalysis] 종합 보안 분석 시작 (프로젝트 환경: {}, 외부서비스: {}개, 커스텀 정책: {}, 매니페스트 패키지: {}개)",
+                projectEnvironment != null ? projectEnvironment : "미지정",
+                externalServices != null ? externalServices.size() : 0,
                 config != null && !config.toSummaryString().contains("예외 룰 없음"),
                 manifestPackages != null ? manifestPackages.size() : 0);
 
@@ -248,14 +288,17 @@ public class LLMAnalysisService {
                 if (existing == null) {
                     mergedMap.put(pkg.name(), pkg);
                 } else {
-                    String version = (existing.version() != null && !"-".equals(existing.version()) && !"(managed)".equals(existing.version()))
+                    String version = (existing.version() != null && !"-".equals(existing.version()) && !"(managed)".equals(existing.version()) && !"BOM-managed".equals(existing.version()))
                             ? existing.version()
-                            : pkg.version();
+                            : (pkg.version() != null && !"(managed)".equals(pkg.version()) && !"BOM-managed".equals(pkg.version()) ? pkg.version() : "BOM-managed");
                     String license = (existing.license() != null && !"-".equals(existing.license()))
                             ? existing.license()
                             : pkg.license();
+                    String purl = (existing.purl() != null && !existing.purl().isBlank() && !existing.purl().contains("(managed)"))
+                            ? existing.purl()
+                            : CycloneDxSbomService.generatePurl(pkg.name(), version, license);
                     // manifestPackages의 direct/indirect 분류를 최우선 적용 (트리 기반 정확도 반영)
-                    mergedMap.put(pkg.name(), new SbomPackageDetail(pkg.name(), version, pkg.indirect(), license));
+                    mergedMap.put(pkg.name(), new SbomPackageDetail(pkg.name(), version, pkg.indirect(), license, purl));
                 }
             }
             List<SbomPackageDetail> combinedList = new ArrayList<>(mergedMap.values());
@@ -279,26 +322,47 @@ public class LLMAnalysisService {
             );
         }
 
-        log.info("[LLMAnalysis] 스캔 집계 결과: SBOM 총 {}개(직접 {}, 간접 {}), CVE 총 {}건(상위 {}건 선별), Misconfig {}건, Secret {}건",
+        log.info("[LLMAnalysis] 스캔 집계 결과: 환경 [{}], SBOM 총 {}개(직접 {}, 간접 {}), 외부서비스 {}개, CVE 총 {}건, Misconfig {}건, Secret {}건",
+                projectEnvironment != null ? projectEnvironment : "미지정",
                 summaryPayload.sbomStats().totalCount(),
                 summaryPayload.sbomStats().directCount(),
                 summaryPayload.sbomStats().transitiveCount(),
+                externalServices != null ? externalServices.size() : 0,
                 summaryPayload.totalVulnerabilitiesCount(),
-                summaryPayload.topVulnerabilities().size(),
                 summaryPayload.totalMisconfigCount(),
                 summaryPayload.totalSecretCount());
 
         boolean hasCodeDiff = prDiff != null && !prDiff.isBlank() && !prDiff.contains("(PR 변경 코드 Diff가 비어 있습니다)");
 
-        // 2. Java 단에서 직접 전체 SBOM 패키지 토글 마크다운 생성 (LLM 토큰 0 소모)
-        String sbomMarkdownTable = generateSbomMarkdownTable(summaryPayload.sbomPackages());
+        // 1-2. 기계 판독형 CycloneDX v1.5 JSON 생성 및 REST 캐시 등록
+        String cycloneDxJson = null;
+        if (cycloneDxSbomService != null) {
+            cycloneDxJson = cycloneDxSbomService.buildCycloneDxJson(
+                    repoFullName,
+                    prNumber,
+                    projectEnvironment,
+                    summaryPayload.sbomPackages(),
+                    summaryPayload.topVulnerabilities(),
+                    externalServices
+            );
+        }
 
-        // ⚡ 입력 컨텍스트(요약 JSON + Diff + 런타임 + 설정) SHA-256 메모이제이션 캐시 조회
+        // 2. Java 단에서 직접 전체 SBOM 4-카테고리 상세 마크다운 생성 (LLM 토큰 0 소모)
+        String sbomMarkdownTable = (cycloneDxSbomService != null)
+                ? cycloneDxSbomService.renderSbomMarkdownReport(
+                        repoFullName, prNumber, projectEnvironment, runtimeContext,
+                        summaryPayload.sbomPackages(), externalServices, cycloneDxJson)
+                : generateSbomMarkdownTable(summaryPayload.sbomPackages(), projectEnvironment);
+
+        // ⚡ 입력 컨텍스트(요약 JSON + Diff + 런타임 + 설정 + 프로젝트 환경) SHA-256 메모이제이션 캐시 조회
         String cacheKey = computeSha256(
                 summaryPayload.toString(),
                 prDiff != null ? prDiff : "",
                 runtimeContext != null ? runtimeContext : "",
-                config != null ? config.toSummaryString() : ""
+                config != null ? config.toSummaryString() : "",
+                projectEnvironment != null ? projectEnvironment : "",
+                String.valueOf(repoFullName),
+                String.valueOf(prNumber)
         );
 
         AnalysisOutcome cached = reportCache.get(cacheKey);
@@ -320,9 +384,10 @@ public class LLMAnalysisService {
                     > ### 승인 (PASS)
                     > 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.
                     >
+                    > - **프로젝트 환경:** %s
                     > - **오픈소스 취약점 (CVE):** 0건 (안전)
                     > - **코드 로직 및 설정 결함:** 0건 (안전)
-                    """;
+                    """.formatted((projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "미지정 (기타 프로젝트)");
             String finalReport = (sbomMarkdownTable != null && !sbomMarkdownTable.isBlank())
                     ? reportText.trim() + "\n\n---\n\n" + sbomMarkdownTable.trim()
                     : reportText.trim();
@@ -336,14 +401,14 @@ public class LLMAnalysisService {
                 String minifiedJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(summaryPayload);
 
                 // 5. Reachability, 비즈니스 로직, 런타임/Base Image 검증 및 커스텀 정책 주입 프롬프트 생성
-                String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config);
+                String prompt = buildPrompt(minifiedJson, prDiff, runtimeContext, config, projectEnvironment);
 
                 // 6. Google Gemini API 호출 (일시적 503/429 장애 시 지수 백오프 및 다중 모델 Fallback 후 자가 복구 리포트 생성)
                 try {
                     reportText = callGeminiApi(prompt);
                 } catch (Exception llmEx) {
                     log.warn("[LLMAnalysis] ⚠️ 모든 Gemini 모델 호출 일시 장애 발생({}). Trivy 정적 전수 검사 결과 기반으로 자가 복구 리포트를 생성합니다.", llmEx.getMessage());
-                    reportText = buildFallbackDeterministicReport(summaryPayload, config, llmEx.getMessage());
+                    reportText = buildFallbackDeterministicReport(summaryPayload, config, llmEx.getMessage(), projectEnvironment);
                 }
 
                 // 7. SecurityVerdict 종합 판정
@@ -416,6 +481,23 @@ public class LLMAnalysisService {
      * LLM 토큰 비용을 0으로 유지합니다 (최대 200개 제한 안전장치 적용).
      */
     public String generateSbomMarkdownTable(List<SbomPackageDetail> packages) {
+        return generateSbomMarkdownTable(packages, null);
+    }
+
+    /**
+     * Java 단에서 직접 전체 SBOM 패키지 목록을 마크다운 표 및 <details> 태그로 렌더링합니다.
+     * 직접 의존성과 간접 의존성을 2개의 독립된 표로 분리하고 라이선스 정보를 포함하여 가독성을 극대화하며,
+     * LLM 토큰 비용을 0으로 유지합니다 (최대 200개 제한 안전장치 적용).
+     */
+    public String generateSbomMarkdownTable(List<SbomPackageDetail> packages, String projectEnvironment) {
+        if (cycloneDxSbomService != null) {
+            return cycloneDxSbomService.renderSbomMarkdownReport(
+                    null, null, projectEnvironment, null, packages, Collections.emptyList(), null);
+        }
+        return fallbackSbomMarkdownTable(packages, projectEnvironment);
+    }
+
+    private String fallbackSbomMarkdownTable(List<SbomPackageDetail> packages, String projectEnvironment) {
         if (packages == null || packages.isEmpty()) {
             return """
                     <details>
@@ -445,24 +527,33 @@ public class LLMAnalysisService {
         StringBuilder sb = new StringBuilder();
         sb.append("<details>\n");
         sb.append("<summary><b>소프트웨어 자재 명세서 (SBOM) 구성 요소 보기 (총 ").append(totalCount).append("개)</b></summary>\n\n");
-        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개\n\n");
+        sb.append("> **소프트웨어 구성 요소:** 직접 의존성 ").append(directCount).append("개 / 간접 의존성 ").append(indirectCount).append("개<br>\n");
+        if (projectEnvironment != null && !projectEnvironment.isBlank() && !"미지정".equals(projectEnvironment) && !"미지정 (기타 프로젝트)".equals(projectEnvironment)) {
+            sb.append("> **프로젝트 환경:** ").append(projectEnvironment).append("<br>\n");
+        }
+        sb.append("> **표준 규격:** OWASP CycloneDX v1.5 JSON (Package URL `purl` 매핑)<br>\n");
+        sb.append(">\n");
+        sb.append("> 💡 **의존성 구분 안내**<br>\n");
+        sb.append("> • **직접 의존성 (Direct):** 개발자가 매니페스트에 직접 선언한 상위 라이브러리<br>\n");
+        sb.append("> • **간접 의존성 (Transitive):** 런타임 종속 전이 패키지 (*공급망 취약점의 80% 이상 발생*)<br>\n\n");
 
         // 1. 직접 의존성 표 (Direct Dependencies)
         sb.append("#### 직접 의존성 (Direct Dependencies - ").append(directCount).append("개)\n\n");
         if (directPackages.isEmpty()) {
             sb.append("*(등록된 직접 의존성이 없습니다)*\n\n");
         } else {
-            sb.append("| 패키지명 | 설치된 버전 | 라이선스 |\n");
-            sb.append("| :--- | :--- | :--- |\n");
+            sb.append("| 패키지명 | 설치된 버전 | 라이선스 | 식별자 (PURL) |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
             int directLimit = Math.min(directPackages.size(), maxRender);
             for (int i = 0; i < directLimit; i++) {
                 SbomPackageDetail pkg = directPackages.get(i);
                 String versionDisplay = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
                 String licenseDisplay = pkg.license().isBlank() ? "-" : pkg.license();
-                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" |\n");
+                String purlDisplay = (pkg.purl() != null && !pkg.purl().isBlank()) ? "`" + pkg.purl() + "`" : "-";
+                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" | ").append(purlDisplay).append(" |\n");
             }
             if (directPackages.size() > maxRender) {
-                sb.append("| ... | 외 ").append(directPackages.size() - maxRender).append("개 패키지 생략됨 | ... |\n");
+                sb.append("| ... | 외 ").append(directPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
             }
             sb.append("\n");
         }
@@ -472,17 +563,18 @@ public class LLMAnalysisService {
         if (indirectPackages.isEmpty()) {
             sb.append("*(등록된 간접 의존성이 없습니다)*\n\n");
         } else {
-            sb.append("| 패키지명 | 설치된 버전 | 라이선스 |\n");
-            sb.append("| :--- | :--- | :--- |\n");
+            sb.append("| 패키지명 | 설치된 버전 | 라이선스 | 식별자 (PURL) |\n");
+            sb.append("| :--- | :--- | :--- | :--- |\n");
             int indirectLimit = Math.min(indirectPackages.size(), maxRender);
             for (int i = 0; i < indirectLimit; i++) {
                 SbomPackageDetail pkg = indirectPackages.get(i);
                 String versionDisplay = pkg.version().isBlank() ? "-" : "`" + pkg.version() + "`";
                 String licenseDisplay = pkg.license().isBlank() ? "-" : pkg.license();
-                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" |\n");
+                String purlDisplay = (pkg.purl() != null && !pkg.purl().isBlank()) ? "`" + pkg.purl() + "`" : "-";
+                sb.append("| `").append(pkg.name()).append("` | ").append(versionDisplay).append(" | ").append(licenseDisplay).append(" | ").append(purlDisplay).append(" |\n");
             }
             if (indirectPackages.size() > maxRender) {
-                sb.append("| ... | 외 ").append(indirectPackages.size() - maxRender).append("개 패키지 생략됨 | ... |\n");
+                sb.append("| ... | 외 ").append(indirectPackages.size() - maxRender).append("개 패키지 생략됨 | ... | ... |\n");
             }
             sb.append("\n");
         }
@@ -510,7 +602,7 @@ public class LLMAnalysisService {
         int[] packageCounts = new int[2]; // [0]: direct, [1]: transitive
 
         Map<String, VulnerabilityDetail> vulnMap = new LinkedHashMap<>();
-        int criticalCount = 0, highCount = 0, mediumCount = 0, lowCount = 0;
+        int[] severityCounts = new int[4]; // [0]: critical, [1]: high, [2]: medium, [3]: low
 
         Map<String, MisconfigDetail> misconfigMap = new LinkedHashMap<>();
         Map<String, SecretDetail> secretMap = new LinkedHashMap<>();
@@ -523,93 +615,23 @@ public class LLMAnalysisService {
                 for (JsonNode resultNode : results) {
                     String targetFile = resultNode.path("Target").asText("");
 
-                    // 1. SBOM Packages 수집 (다중 Results 완전 순회)
+                    // 1. SBOM Packages 수집
                     collectPackagesFromResultNode(resultNode, seenPackageKeys, sbomPackages, packageCounts);
 
                     // 2. Vulnerabilities 수집 (커스텀 룰 필터링 적용)
-                    JsonNode vulnerabilities = resultNode.path("Vulnerabilities");
-                    if (vulnerabilities.isArray()) {
-                        for (JsonNode vulnNode : vulnerabilities) {
-                            String vulnId = vulnNode.path("VulnerabilityID").asText("");
-                            String pkgName = vulnNode.path("PkgName").asText("");
-                            String severity = vulnNode.path("Severity").asText("UNKNOWN").toUpperCase();
-                            String installedVer = vulnNode.path("InstalledVersion").asText("");
-                            String fixedVer = vulnNode.path("FixedVersion").asText("");
-                            String title = vulnNode.path("Title").asText("");
-
-                            // 커스텀 예외 정책(.prguard.yml)에 해당하는 취약점은 제외
-                            if (config != null && config.isVulnerabilityIgnored(vulnId, pkgName, severity)) {
-                                continue;
-                            }
-
-                            String key = vulnId + ":" + pkgName;
-                            if (!vulnMap.containsKey(key)) {
-                                vulnMap.put(key, new VulnerabilityDetail(vulnId, pkgName, installedVer, fixedVer,
-                                        severity, title));
-
-                                switch (severity) {
-                                    case "CRITICAL" -> criticalCount++;
-                                    case "HIGH" -> highCount++;
-                                    case "MEDIUM" -> mediumCount++;
-                                    case "LOW" -> lowCount++;
-                                }
-                            }
-                        }
-                    }
+                    collectVulnerabilitiesFromResultNode(resultNode.path("Vulnerabilities"), config, vulnMap, severityCounts);
 
                     // 3. Misconfigurations 수집
-                    JsonNode misconfigs = resultNode.path("Misconfigurations");
-                    if (misconfigs.isArray()) {
-                        for (JsonNode misNode : misconfigs) {
-                            String id = misNode.path("ID").asText("");
-                            String type = misNode.path("Type").asText("");
-                            String severity = misNode.path("Severity").asText("UNKNOWN").toUpperCase();
-                            String title = misNode.path("Title").asText("");
-                            String message = misNode.path("Message").asText("");
-                            String resolution = misNode.path("Resolution").asText("");
-                            int startLine = misNode.path("CauseMetadata").path("StartLine").asInt(1);
+                    collectMisconfigurationsFromResultNode(resultNode.path("Misconfigurations"), targetFile, misconfigMap);
 
-                            String key = id + ":" + title + ":" + targetFile;
-                            if (!misconfigMap.containsKey(key)) {
-                                misconfigMap.put(key,
-                                        new MisconfigDetail(id, type, severity, title, message, resolution, startLine, targetFile));
-                            }
-                        }
-                    }
-
-                    // 4. Secrets 수집 (실제 노출된 비밀값 Match는 마스킹 처리하여 제외)
-                    JsonNode secrets = resultNode.path("Secrets");
-                    if (secrets.isArray()) {
-                        for (JsonNode secNode : secrets) {
-                            String ruleId = secNode.path("RuleID").asText("");
-                            String category = secNode.path("Category").asText("");
-                            String severity = secNode.path("Severity").asText("UNKNOWN").toUpperCase();
-                            String title = secNode.path("Title").asText("");
-                            int startLine = secNode.path("StartLine").asInt(1);
-
-                            String key = ruleId + ":" + title + ":" + targetFile + ":" + startLine;
-                            if (!secretMap.containsKey(key)) {
-                                secretMap.put(key, new SecretDetail(ruleId, category, severity, title, startLine, targetFile));
-                            }
-                        }
-                    }
+                    // 4. Secrets 수집
+                    collectSecretsFromResultNode(resultNode.path("Secrets"), targetFile, secretMap);
                 }
             }
 
-            // 5. 트리 전체 재검색 방어 로직: 만약 Results 순회 후에도 sbomPackages가 비어 있다면 JSON 전체에서 Packages
-            // 탐색
+            // 5. 트리 전체 재검색 방어 로직: Results 순회 후에도 sbomPackages가 비어 있다면 JSON 전체에서 탐색
             if (sbomPackages.isEmpty()) {
-                List<JsonNode> allPackageArrays = root.findValues("Packages");
-                if (allPackageArrays.isEmpty()) {
-                    allPackageArrays = root.findValues("packages");
-                }
-                for (JsonNode pkgArray : allPackageArrays) {
-                    if (pkgArray.isArray()) {
-                        for (JsonNode pkgNode : pkgArray) {
-                            parseAndAddPackage(pkgNode, seenPackageKeys, sbomPackages, packageCounts);
-                        }
-                    }
-                }
+                collectFallbackPackages(root, seenPackageKeys, sbomPackages, packageCounts);
             }
 
         } catch (Exception e) {
@@ -630,7 +652,7 @@ public class LLMAnalysisService {
         List<SecretDetail> topSecrets = secretMap.values().stream().limit(20).toList();
 
         SbomStats sbomStats = new SbomStats(sbomPackages.size(), packageCounts[0], packageCounts[1]);
-        VulnStats vulnStats = new VulnStats(vulnMap.size(), criticalCount, highCount, mediumCount, lowCount);
+        VulnStats vulnStats = new VulnStats(vulnMap.size(), severityCounts[0], severityCounts[1], severityCounts[2], severityCounts[3]);
 
         return new ScanSummaryPayload(
                 sbomStats,
@@ -642,6 +664,88 @@ public class LLMAnalysisService {
                 misconfigMap.size(),
                 topSecrets,
                 secretMap.size());
+    }
+
+    private void collectVulnerabilitiesFromResultNode(JsonNode vulnerabilities, PrguardConfig config,
+                                                     Map<String, VulnerabilityDetail> vulnMap, int[] severityCounts) {
+        if (!vulnerabilities.isArray()) return;
+
+        for (JsonNode vulnNode : vulnerabilities) {
+            String vulnId = vulnNode.path("VulnerabilityID").asText("");
+            String pkgName = vulnNode.path("PkgName").asText("");
+            String severity = vulnNode.path("Severity").asText("UNKNOWN").toUpperCase();
+            String installedVer = vulnNode.path("InstalledVersion").asText("");
+            String fixedVer = vulnNode.path("FixedVersion").asText("");
+            String title = vulnNode.path("Title").asText("");
+
+            if (config != null && config.isVulnerabilityIgnored(vulnId, pkgName, severity)) {
+                continue;
+            }
+
+            String key = vulnId + ":" + pkgName;
+            if (!vulnMap.containsKey(key)) {
+                vulnMap.put(key, new VulnerabilityDetail(vulnId, pkgName, installedVer, fixedVer, severity, title));
+
+                switch (severity) {
+                    case "CRITICAL" -> severityCounts[0]++;
+                    case "HIGH" -> severityCounts[1]++;
+                    case "MEDIUM" -> severityCounts[2]++;
+                    case "LOW" -> severityCounts[3]++;
+                }
+            }
+        }
+    }
+
+    private void collectMisconfigurationsFromResultNode(JsonNode misconfigs, String targetFile,
+                                                         Map<String, MisconfigDetail> misconfigMap) {
+        if (!misconfigs.isArray()) return;
+
+        for (JsonNode misNode : misconfigs) {
+            String id = misNode.path("ID").asText("");
+            String type = misNode.path("Type").asText("");
+            String severity = misNode.path("Severity").asText("UNKNOWN").toUpperCase();
+            String title = misNode.path("Title").asText("");
+            String message = misNode.path("Message").asText("");
+            String resolution = misNode.path("Resolution").asText("");
+            int startLine = misNode.path("CauseMetadata").path("StartLine").asInt(1);
+
+            String key = id + ":" + title + ":" + targetFile;
+            if (!misconfigMap.containsKey(key)) {
+                misconfigMap.put(key, new MisconfigDetail(id, type, severity, title, message, resolution, startLine, targetFile));
+            }
+        }
+    }
+
+    private void collectSecretsFromResultNode(JsonNode secrets, String targetFile, Map<String, SecretDetail> secretMap) {
+        if (!secrets.isArray()) return;
+
+        for (JsonNode secNode : secrets) {
+            String ruleId = secNode.path("RuleID").asText("");
+            String category = secNode.path("Category").asText("");
+            String severity = secNode.path("Severity").asText("UNKNOWN").toUpperCase();
+            String title = secNode.path("Title").asText("");
+            int startLine = secNode.path("StartLine").asInt(1);
+
+            String key = ruleId + ":" + title + ":" + targetFile + ":" + startLine;
+            if (!secretMap.containsKey(key)) {
+                secretMap.put(key, new SecretDetail(ruleId, category, severity, title, startLine, targetFile));
+            }
+        }
+    }
+
+    private void collectFallbackPackages(JsonNode root, Set<String> seenPackageKeys,
+                                         List<SbomPackageDetail> sbomPackages, int[] packageCounts) {
+        List<JsonNode> allPackageArrays = root.findValues("Packages");
+        if (allPackageArrays.isEmpty()) {
+            allPackageArrays = root.findValues("packages");
+        }
+        for (JsonNode pkgArray : allPackageArrays) {
+            if (pkgArray.isArray()) {
+                for (JsonNode pkgNode : pkgArray) {
+                    parseAndAddPackage(pkgNode, seenPackageKeys, sbomPackages, packageCounts);
+                }
+            }
+        }
     }
 
     private void collectPackagesFromResultNode(JsonNode resultNode, Set<String> seenKeys, List<SbomPackageDetail> list,
@@ -748,13 +852,18 @@ public class LLMAnalysisService {
     }
 
     String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext) {
-        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, PrguardConfig.defaultConfig());
+        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, PrguardConfig.defaultConfig(), "미지정 (기타 프로젝트)");
+    }
+
+    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config) {
+        return buildPrompt(minifiedSummaryJson, prDiff, runtimeContext, config, "미지정 (기타 프로젝트)");
     }
 
     /**
-     * 보안 전문 AI 시스템 프롬프트 및 마크다운 고정 템플릿 구성 (커스텀 정책 적용)
+     * 보안 전문 AI 시스템 프롬프트 및 마크다운 고정 템플릿 구성 (커스텀 정책 및 프로젝트 환경 적용)
      */
-    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config) {
+    String buildPrompt(String minifiedSummaryJson, String prDiff, String runtimeContext, PrguardConfig config, String projectEnvironment) {
+        String safeEnv = (projectEnvironment != null && !projectEnvironment.isBlank()) ? projectEnvironment : "미지정 (기타 프로젝트)";
         return """
                 [System Prompt]
                 너는 10년 차 수석 애플리케이션 보안 아키텍트이자 DevSecOps 코드 리뷰어다.
@@ -775,7 +884,8 @@ public class LLMAnalysisService {
                    - 최상단 마스터 Alert 배너 내부 구성:
                      - 판정 헤드라인: `### 차단 권고 (BLOCK)` 또는 `### 주의 (WARN)` 또는 `### 승인 (PASS)`
                      - 핵심 판정 사유 1~2줄 요약
-                     - 2개 항목 퀵 체크리스트(불릿 리스트):
+                     - 3개 항목 퀵 체크리스트(불릿 리스트):
+                       - `- **프로젝트 환경:** %s`
                        - `- **오픈소스 취약점 (CVE):** 총 N건 (CRITICAL N건, HIGH N건, ...)` 또는 `0건 (안전)`
                        - `- **코드 로직 및 설정 결함:** 총 N건 (핵심 결함 요약)` 또는 `0건 (안전)`
 
@@ -821,6 +931,7 @@ public class LLMAnalysisService {
                 %s
 
                 [입력 데이터 3: 프로젝트 런타임 및 환경 설정 컨텍스트]
+                - 프로젝트 환경: %s
                 %s
 
                 [입력 데이터 4: 프로젝트 커스텀 보안 정책 (.prguard.yml)]
@@ -835,6 +946,7 @@ public class LLMAnalysisService {
                 > ### 차단 권고 (BLOCK) *(또는 ### 주의 (WARN))*
                 > (핵심 판정 사유 1~2줄 요약)
                 >
+                > - **프로젝트 환경:** %s
                 > - **오픈소스 취약점 (CVE):** 총 N건 (CRITICAL N건, HIGH N건, ...)
                 > - **코드 로직 및 설정 결함:** 총 N건 (핵심 결함 요약)
 
@@ -884,14 +996,19 @@ public class LLMAnalysisService {
                 > ### 승인 (PASS)
                 > 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.
                 >
+                > - **프로젝트 환경:** %s
                 > - **오픈소스 취약점 (CVE):** 0건 (안전)
                 > - **코드 로직 및 설정 결함:** 0건 (안전)
                 """
                 .formatted(
+                        safeEnv,
                         minifiedSummaryJson,
                         (prDiff != null && !prDiff.isBlank()) ? prDiff : "(PR 변경 코드 Diff 없음)",
+                        safeEnv,
                         (runtimeContext != null && !runtimeContext.isBlank()) ? runtimeContext : "(런타임 환경 설정 컨텍스트 없음)",
-                        (config != null) ? config.toSummaryString() : "(기본 엔터프라이즈 정책 적용 중 - 예외 룰 없음)");
+                        (config != null) ? config.toSummaryString() : "(기본 엔터프라이즈 정책 적용 중 - 예외 룰 없음)",
+                        safeEnv,
+                        safeEnv);
     }
 
     /**
@@ -1006,10 +1123,14 @@ public class LLMAnalysisService {
      * 파이프라인 중단 없이 안전하게 자동 판정하는 자가 복구 리포트 생성기.
      */
     public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config) {
-        return buildFallbackDeterministicReport(payload, config, null);
+        return buildFallbackDeterministicReport(payload, config, null, null);
     }
 
     public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config, String errorReason) {
+        return buildFallbackDeterministicReport(payload, config, errorReason, null);
+    }
+
+    public String buildFallbackDeterministicReport(ScanSummaryPayload payload, PrguardConfig config, String errorReason, String projectEnv) {
         StringBuilder sb = new StringBuilder();
 
         if (hasBlockingVulnerabilities(payload, config)) {
@@ -1026,6 +1147,9 @@ public class LLMAnalysisService {
             sb.append("> 오픈소스 취약점(CVE), 런타임 환경, 설정 오류 및 코드 내 보안 위협이 발견되지 않았습니다.\n>\n");
         }
 
+        if (projectEnv != null && !projectEnv.isBlank()) {
+            sb.append("> - **프로젝트 환경:** ").append(projectEnv).append("\n");
+        }
         sb.append("> - **오픈소스 취약점 (CVE):** 총 ").append(payload.totalVulnerabilitiesCount()).append("건");
         if (payload.totalVulnerabilitiesCount() == 0) {
             sb.append(" (안전)\n");

@@ -17,6 +17,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,8 +38,35 @@ public class UniversalDependencyScanner {
 
     private final ObjectMapper objectMapper;
 
-    @org.springframework.beans.factory.annotation.Value("${scanner.wrapper.enabled:false}")
-    private boolean wrapperExecutionEnabled = false;
+    @org.springframework.beans.factory.annotation.Value("${scanner.wrapper.enabled:true}")
+    private boolean wrapperExecutionEnabled = true;
+
+    /**
+     * 프로젝트 기본 사용 언어, 빌드 도구 및 주요 프레임워크 환경 메타데이터
+     */
+    public record ProjectEnvironment(
+            String language,
+            String buildTool,
+            String framework
+    ) {
+        public static ProjectEnvironment unknown() {
+            return new ProjectEnvironment("알 수 없음", "미지정", "미지정");
+        }
+
+        public String toSummaryString() {
+            StringBuilder sb = new StringBuilder();
+            if (language != null && !language.isBlank() && !"알 수 없음".equals(language)) {
+                sb.append(language);
+            }
+            if (buildTool != null && !buildTool.isBlank() && !"미지정".equals(buildTool)) {
+                sb.append(" (").append(buildTool).append(")");
+            }
+            if (framework != null && !framework.isBlank() && !"미지정".equals(framework)) {
+                sb.append(" / ").append(framework);
+            }
+            return sb.isEmpty() ? "기타/다중 언어 프로젝트" : sb.toString();
+        }
+    }
 
     private static final Set<String> IGNORED_DIRS = Set.of(
             ".git", ".gradle", ".idea", "node_modules", "target", "build", "bin", "obj",
@@ -63,6 +91,14 @@ public class UniversalDependencyScanner {
     private static final Pattern MAVEN_PARENT_PATTERN = Pattern.compile(
             "<parent>\\s*<groupId>([^<]+)</groupId>\\s*<artifactId>([^<]+)</artifactId>\\s*<version>([^<]+)</version>",
             Pattern.DOTALL
+    );
+
+    // Java Version Regex (Gradle / Maven)
+    private static final Pattern GRADLE_JAVA_VERSION_PATTERN = Pattern.compile(
+            "(?:JavaLanguageVersion\\.of\\((\\d+)\\)|jvmToolchain\\((\\d+)\\)|(?:sourceCompatibility|targetCompatibility)\\s*=\\s*['\"]?(?:1\\.)?(\\d+)['\"]?|VERSION_1_(\\d+)|VERSION_(\\d+))"
+    );
+    private static final Pattern MAVEN_JAVA_VERSION_PATTERN = Pattern.compile(
+            "<(?:java\\.version|maven\\.compiler\\.source|maven\\.compiler\\.release|maven\\.compiler\\.target)>(?:1\\.)?(\\d+)</"
     );
 
     // C# / .NET / Unity Regex
@@ -168,6 +204,230 @@ public class UniversalDependencyScanner {
         return result;
     }
 
+    /**
+     * 저장소 내 실제 매니페스트 파일 및 패키지 구성을 바탕으로 기본 프로그래밍 언어, 빌드 툴, 프레임워크를 동적으로 식별합니다.
+     */
+    public ProjectEnvironment detectProjectEnvironment(Path rootDir, List<LLMAnalysisService.SbomPackageDetail> packages) {
+        if (rootDir == null || !Files.exists(rootDir)) {
+            return ProjectEnvironment.unknown();
+        }
+
+        List<LLMAnalysisService.SbomPackageDetail> safePackages = (packages != null) ? packages : Collections.emptyList();
+
+        // 1. Java / Kotlin (JVM)
+        boolean hasGradleKts = Files.exists(rootDir.resolve("build.gradle.kts"));
+        boolean hasGradle = Files.exists(rootDir.resolve("build.gradle")) || hasGradleKts;
+        boolean hasMaven = Files.exists(rootDir.resolve("pom.xml"));
+
+        if (hasGradle || hasMaven) {
+            String javaVersion = null;
+            if (hasGradle) {
+                Path gFile = hasGradleKts ? rootDir.resolve("build.gradle.kts") : rootDir.resolve("build.gradle");
+                try {
+                    String gContent = Files.readString(gFile, StandardCharsets.UTF_8);
+                    Matcher jm = GRADLE_JAVA_VERSION_PATTERN.matcher(gContent);
+                    if (jm.find()) {
+                        for (int i = 1; i <= jm.groupCount(); i++) {
+                            if (jm.group(i) != null) {
+                                javaVersion = jm.group(i);
+                                break;
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            } else {
+                try {
+                    String mContent = Files.readString(rootDir.resolve("pom.xml"), StandardCharsets.UTF_8);
+                    Matcher jm = MAVEN_JAVA_VERSION_PATTERN.matcher(mContent);
+                    if (jm.find()) {
+                        javaVersion = jm.group(1);
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            String langSuffix = (javaVersion != null && !javaVersion.isBlank()) ? " " + javaVersion : "";
+            String language = hasGradleKts ? ("Kotlin / Java" + langSuffix) : ("Java" + langSuffix);
+            String buildTool = hasGradle ? "Gradle" : "Maven";
+            String framework = "미지정";
+
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                if (p.name().contains("spring-boot")) {
+                    String ver = (p.version() != null && !p.version().isBlank() && !"(managed)".equals(p.version()))
+                            ? " " + p.version().trim()
+                            : "";
+                    framework = "Spring Boot" + ver;
+                    break;
+                } else if (p.name().contains("quarkus")) {
+                    framework = "Quarkus";
+                    break;
+                } else if (p.name().contains("micronaut")) {
+                    framework = "Micronaut";
+                    break;
+                }
+            }
+            return new ProjectEnvironment(language, buildTool, framework);
+        }
+
+        // 2. Node.js (JavaScript / TypeScript)
+        if (Files.exists(rootDir.resolve("package.json"))) {
+            boolean isTs = Files.exists(rootDir.resolve("tsconfig.json"));
+            String language = isTs ? "TypeScript" : "JavaScript";
+            String buildTool;
+            if (Files.exists(rootDir.resolve("pnpm-lock.yaml"))) buildTool = "pnpm";
+            else if (Files.exists(rootDir.resolve("yarn.lock"))) buildTool = "Yarn";
+            else if (Files.exists(rootDir.resolve("package-lock.json"))) buildTool = "npm";
+            else buildTool = "npm";
+
+            String framework = "Node.js";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("next")) { framework = "Next.js"; break; }
+                if (n.equals("react")) { framework = "React"; break; }
+                if (n.equals("vue")) { framework = "Vue.js"; break; }
+                if (n.equals("express")) { framework = "Express"; break; }
+                if (n.equals("@nestjs/core")) { framework = "NestJS"; break; }
+            }
+            return new ProjectEnvironment(language, buildTool, framework);
+        }
+
+        // 3. Python
+        if (Files.exists(rootDir.resolve("requirements.txt")) || Files.exists(rootDir.resolve("pyproject.toml")) || Files.exists(rootDir.resolve("Pipfile"))) {
+            String buildTool;
+            if (Files.exists(rootDir.resolve("poetry.lock"))) buildTool = "Poetry";
+            else if (Files.exists(rootDir.resolve("Pipfile.lock"))) buildTool = "Pipenv";
+            else buildTool = "pip";
+
+            String framework = "미지정";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("django")) { framework = "Django"; break; }
+                if (n.equals("fastapi")) { framework = "FastAPI"; break; }
+                if (n.equals("flask")) { framework = "Flask"; break; }
+            }
+            return new ProjectEnvironment("Python", buildTool, framework);
+        }
+
+        // 4. Rust
+        if (Files.exists(rootDir.resolve("Cargo.toml"))) {
+            String framework = "미지정";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.equals("actix-web")) { framework = "Actix Web"; break; }
+                if (n.equals("axum")) { framework = "Axum"; break; }
+                if (n.equals("tokio")) { framework = "Tokio"; break; }
+            }
+            return new ProjectEnvironment("Rust", "Cargo", framework);
+        }
+
+        // 5. Go
+        if (Files.exists(rootDir.resolve("go.mod"))) {
+            String framework = "미지정";
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String n = p.name().toLowerCase();
+                if (n.contains("gin-gonic/gin")) { framework = "Gin"; break; }
+                if (n.contains("labstack/echo")) { framework = "Echo"; break; }
+                if (n.contains("gofiber/fiber")) { framework = "Fiber"; break; }
+            }
+            return new ProjectEnvironment("Go", "Go Modules", framework);
+        }
+
+        // 6. C# / .NET
+        boolean hasCsproj = false;
+        try (var s = Files.list(rootDir)) {
+            hasCsproj = s.anyMatch(p -> p.getFileName().toString().toLowerCase().endsWith(".csproj"));
+        } catch (Exception ignored) {}
+        if (hasCsproj) {
+            return new ProjectEnvironment("C# (.NET)", "NuGet / MSBuild", "ASP.NET Core / .NET");
+        }
+
+        // 7. C / C++
+        if (Files.exists(rootDir.resolve("CMakeLists.txt")) || Files.exists(rootDir.resolve("conanfile.txt")) || Files.exists(rootDir.resolve("vcpkg.json"))) {
+            String buildTool = Files.exists(rootDir.resolve("CMakeLists.txt")) ? "CMake" : (Files.exists(rootDir.resolve("conanfile.txt")) ? "Conan" : "vcpkg");
+            return new ProjectEnvironment("C / C++", buildTool, "Native");
+        }
+
+        // 8. Mobile / iOS / Flutter
+        if (Files.exists(rootDir.resolve("pubspec.yaml"))) {
+            return new ProjectEnvironment("Dart", "Flutter / pub", "Flutter");
+        }
+        if (Files.exists(rootDir.resolve("Podfile")) || Files.exists(rootDir.resolve("Package.swift"))) {
+            return new ProjectEnvironment("Swift", "SPM / CocoaPods", "iOS / Apple");
+        }
+
+        // 9. 루트 매니페스트 부재 시, 검출된 패키지들의 생태계 메타데이터(safePackages)로부터 언어/도구 역추론 (서브폴더/모노레포 지원)
+        if (!safePackages.isEmpty()) {
+            int npmCount = 0;
+            int javaCount = 0;
+            int pythonCount = 0;
+            int rustCount = 0;
+            int goCount = 0;
+            int nugetCount = 0;
+
+            for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                String lic = p.license() != null ? p.license().toLowerCase() : "";
+                if (lic.contains("npm") || lic.contains("yarn") || lic.contains("pnpm") || lic.contains("node")) npmCount++;
+                else if (lic.contains("maven") || lic.contains("gradle")) javaCount++;
+                else if (lic.contains("pypi") || lic.contains("python") || lic.contains("poetry") || lic.contains("pip")) pythonCount++;
+                else if (lic.contains("cargo") || lic.contains("rust") || lic.contains("crates")) rustCount++;
+                else if (lic.contains("go")) goCount++;
+                else if (lic.contains("nuget")) nugetCount++;
+            }
+
+            if (npmCount > 0 && npmCount >= javaCount && npmCount >= pythonCount) {
+                boolean hasTs = hasFileExtension(rootDir, ".ts") || hasFileExtension(rootDir, ".tsx");
+                String language = hasTs ? "TypeScript" : "JavaScript";
+                String framework = "Node.js";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    String n = p.name().toLowerCase();
+                    if (n.equals("next")) { framework = "Next.js"; break; }
+                    if (n.equals("react")) { framework = "React"; break; }
+                    if (n.equals("vue")) { framework = "Vue.js"; break; }
+                    if (n.equals("express")) { framework = "Express"; break; }
+                    if (n.equals("@nestjs/core")) { framework = "NestJS"; break; }
+                }
+                String buildTool = "npm";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    String lic = p.license() != null ? p.license().toLowerCase() : "";
+                    if (lic.contains("pnpm")) { buildTool = "pnpm"; break; }
+                    if (lic.contains("yarn")) { buildTool = "Yarn"; break; }
+                }
+                return new ProjectEnvironment(language, buildTool, framework);
+            } else if (javaCount > 0) {
+                String framework = "JVM";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    if (p.name().contains("spring-boot")) { framework = "Spring Boot"; break; }
+                }
+                return new ProjectEnvironment("Java", "Gradle/Maven", framework);
+            } else if (pythonCount > 0) {
+                String framework = "Python";
+                for (LLMAnalysisService.SbomPackageDetail p : safePackages) {
+                    String n = p.name().toLowerCase();
+                    if (n.equals("django")) { framework = "Django"; break; }
+                    if (n.equals("fastapi")) { framework = "FastAPI"; break; }
+                    if (n.equals("flask")) { framework = "Flask"; break; }
+                }
+                return new ProjectEnvironment("Python", "pip", framework);
+            } else if (rustCount > 0) {
+                return new ProjectEnvironment("Rust", "Cargo", "Native");
+            } else if (goCount > 0) {
+                return new ProjectEnvironment("Go", "Go Modules", "Native");
+            } else if (nugetCount > 0) {
+                return new ProjectEnvironment("C# (.NET)", "NuGet", ".NET");
+            }
+        }
+
+        return ProjectEnvironment.unknown();
+    }
+
+    private boolean hasFileExtension(Path rootDir, String ext) {
+        if (rootDir == null || !Files.exists(rootDir)) return false;
+        try (var stream = Files.walk(rootDir, 3)) {
+            return stream.anyMatch(p -> p.getFileName() != null && p.getFileName().toString().toLowerCase().endsWith(ext));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void parseManifestFile(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> packagesMap) {
         String fileName = file.getFileName().toString();
         String lowerName = fileName.toLowerCase();
@@ -183,15 +443,29 @@ public class UniversalDependencyScanner {
             else if (lowerName.equals("pom.xml")) {
                 parseMaven(file, packagesMap);
             }
-            // 3. Node.js: package.json & package-lock.json
+            // 3. Node.js: package.json & package-lock.json & yarn.lock & pnpm-lock.yaml
             else if (lowerName.equals("package.json") && !file.toString().contains("node_modules")) {
                 parsePackageJson(file, packagesMap);
             } else if (lowerName.equals("package-lock.json") && !file.toString().contains("node_modules")) {
                 parsePackageLockJson(file, packagesMap);
+            } else if (lowerName.equals("yarn.lock") && !file.toString().contains("node_modules")) {
+                parseYarnLock(file, packagesMap);
+            } else if (lowerName.equals("pnpm-lock.yaml") && !file.toString().contains("node_modules")) {
+                parsePnpmLock(file, packagesMap);
             }
-            // 4. Python: requirements.txt, pyproject.toml
+            // 4. Python: requirements.txt, pyproject.toml, poetry.lock, Pipfile.lock
             else if (lowerName.equals("requirements.txt") || lowerName.endsWith("-requirements.txt")) {
                 parsePythonReqs(file, packagesMap);
+            } else if (lowerName.equals("poetry.lock")) {
+                parsePoetryLock(file, packagesMap);
+            } else if (lowerName.equals("pipfile.lock")) {
+                parsePipfileLock(file, packagesMap);
+            }
+            // 4-1. PHP: composer.json & composer.lock
+            else if (lowerName.equals("composer.json")) {
+                parseComposerJson(file, packagesMap);
+            } else if (lowerName.equals("composer.lock")) {
+                parseComposerLock(file, packagesMap);
             }
             // 5. Rust: Cargo.toml & Cargo.lock
             else if (lowerName.equals("cargo.toml")) {
@@ -260,9 +534,10 @@ public class UniversalDependencyScanner {
             String name = m.group(2).trim();
             String version = m.group(3) != null ? m.group(3).trim() : null;
 
-            if ((version == null || version.isBlank() || "(managed)".equals(version))
-                    && group.startsWith("org.springframework.boot") && bootVersion != null) {
-                version = bootVersion;
+            if (group.startsWith("org.springframework.boot") && bootVersion != null) {
+                if (version == null || version.isBlank() || "(managed)".equals(version)) {
+                    version = bootVersion;
+                }
             } else if (version == null || version.isBlank()) {
                 version = "(managed)";
             }
@@ -329,14 +604,31 @@ public class UniversalDependencyScanner {
     private void parsePackageLockJson(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
         try {
             JsonNode root = objectMapper.readTree(file.toFile());
+            Set<String> directNames = new HashSet<>();
+
             JsonNode packagesNode = root.path("packages");
             if (packagesNode.isObject()) {
+                // npm lockfile v3: packages[""] represents the root project manifest
+                JsonNode rootPkg = packagesNode.path("");
+                if (rootPkg.isObject()) {
+                    for (String depField : List.of("dependencies", "devDependencies")) {
+                        JsonNode deps = rootPkg.path(depField);
+                        if (deps.isObject()) {
+                            deps.fieldNames().forEachRemaining(directNames::add);
+                        }
+                    }
+                }
+
                 packagesNode.fieldNames().forEachRemaining(key -> {
                     if (!key.isBlank()) {
                         String name = key.startsWith("node_modules/") ? key.substring("node_modules/".length()) : key;
                         String ver = packagesNode.path(key).path("version").asText("");
                         if (!name.isBlank() && !ver.isBlank() && !name.contains("node_modules/")) {
-                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "npm-lockfile"));
+                            LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                            boolean isIndirect = (existing != null)
+                                    ? existing.indirect()
+                                    : !directNames.contains(name);
+                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "npm-lockfile"));
                         }
                     }
                 });
@@ -346,12 +638,82 @@ public class UniversalDependencyScanner {
                 depsNode.fieldNames().forEachRemaining(name -> {
                     String ver = depsNode.path(name).path("version").asText("");
                     if (!name.isBlank() && !ver.isBlank()) {
-                        map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, true, "npm-lockfile"));
+                        LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                        boolean isIndirect = (existing != null)
+                                ? existing.indirect()
+                                : !directNames.contains(name);
+                        map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "npm-lockfile"));
                     }
                 });
             }
         } catch (Exception e) {
             log.debug("[UniversalScanner] package-lock.json 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parseYarnLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            String currentPkg = null;
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                if (!rawLine.startsWith(" ") && !rawLine.startsWith("\t") && line.endsWith(":")) {
+                    String firstDep = line.split(",")[0].trim().replace("\"", "").replace("'", "").replace(":", "");
+                    int atIdx = firstDep.lastIndexOf('@');
+                    if (atIdx > 0) {
+                        currentPkg = firstDep.substring(0, atIdx);
+                    }
+                } else if (currentPkg != null && line.startsWith("version ")) {
+                    String ver = line.substring("version ".length()).replace("\"", "").replace("'", "").trim();
+                    if (!currentPkg.isBlank() && !ver.isBlank()) {
+                        LLMAnalysisService.SbomPackageDetail existing = map.get(currentPkg);
+                        boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                        map.put(currentPkg, new LLMAnalysisService.SbomPackageDetail(currentPkg, ver, isIndirect, "yarn.lock"));
+                    }
+                    currentPkg = null;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] yarn.lock 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parsePnpmLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            boolean inPackages = false;
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.equals("packages:")) {
+                    inPackages = true;
+                    continue;
+                }
+                if (inPackages) {
+                    if (!rawLine.startsWith(" ") && !rawLine.startsWith("\t") && line.endsWith(":") && !line.equals("packages:")) {
+                        inPackages = false;
+                        continue;
+                    }
+                    if (line.startsWith("/") || line.startsWith("'") || line.startsWith("\"")) {
+                        String clean = line.replace("'", "").replace("\"", "").replace(":", "").trim();
+                        if (clean.startsWith("/")) clean = clean.substring(1);
+                        int atIdx = clean.lastIndexOf('@');
+                        if (atIdx > 0) {
+                            String name = clean.substring(0, atIdx);
+                            String ver = clean.substring(atIdx + 1);
+                            int parenIdx = ver.indexOf('(');
+                            if (parenIdx > 0) ver = ver.substring(0, parenIdx).trim();
+                            if (!name.isBlank() && !ver.isBlank()) {
+                                LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                                boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                                map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "pnpm-lock"));
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] pnpm-lock.yaml 파싱 스킵: {}", e.getMessage());
         }
     }
 
@@ -362,6 +724,94 @@ public class UniversalDependencyScanner {
             String name = m.group(1).trim();
             String ver = m.group(2).trim();
             map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+        }
+    }
+
+    private void parsePoetryLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            String currentName = null;
+            for (String line : lines) {
+                String trimmed = line.trim();
+                if (trimmed.equals("[[package]]")) {
+                    currentName = null;
+                } else if (trimmed.startsWith("name = \"")) {
+                    currentName = trimmed.substring(8, trimmed.length() - 1);
+                } else if (trimmed.startsWith("version = \"") && currentName != null) {
+                    String ver = trimmed.substring(11, trimmed.length() - 1);
+                    if (!currentName.isBlank() && !ver.isBlank()) {
+                        LLMAnalysisService.SbomPackageDetail existing = map.get(currentName);
+                        boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                        map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, isIndirect, "poetry.lock"));
+                    }
+                    currentName = null;
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] poetry.lock 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parsePipfileLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            JsonNode root = objectMapper.readTree(file.toFile());
+            for (String section : List.of("default", "develop")) {
+                JsonNode secNode = root.path(section);
+                if (secNode.isObject()) {
+                    secNode.fieldNames().forEachRemaining(pkgName -> {
+                        String ver = secNode.path(pkgName).path("version").asText("").replace("==", "").trim();
+                        if (!pkgName.isBlank() && !ver.isBlank()) {
+                            LLMAnalysisService.SbomPackageDetail existing = map.get(pkgName);
+                            boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                            map.put(pkgName, new LLMAnalysisService.SbomPackageDetail(pkgName, ver, isIndirect, "Pipfile.lock"));
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] Pipfile.lock 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parseComposerJson(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            JsonNode root = objectMapper.readTree(file.toFile());
+            for (String section : List.of("require", "require-dev")) {
+                JsonNode secNode = root.path(section);
+                if (secNode.isObject()) {
+                    secNode.fieldNames().forEachRemaining(pkgName -> {
+                        if (!pkgName.equals("php")) {
+                            String ver = secNode.path(pkgName).asText("latest");
+                            map.putIfAbsent(pkgName, new LLMAnalysisService.SbomPackageDetail(pkgName, ver, false, "Composer(PHP)"));
+                        }
+                    });
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] composer.json 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parseComposerLock(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            JsonNode root = objectMapper.readTree(file.toFile());
+            for (String section : List.of("packages", "packages-dev")) {
+                JsonNode arr = root.path(section);
+                if (arr.isArray()) {
+                    for (JsonNode item : arr) {
+                        String name = item.path("name").asText("");
+                        String ver = item.path("version").asText("");
+                        if (ver.startsWith("v")) ver = ver.substring(1);
+                        if (!name.isBlank() && !ver.isBlank()) {
+                            LLMAnalysisService.SbomPackageDetail existing = map.get(name);
+                            boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                            map.put(name, new LLMAnalysisService.SbomPackageDetail(name, ver, isIndirect, "composer.lock"));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] composer.lock 파싱 스킵: {}", e.getMessage());
         }
     }
 
@@ -385,7 +835,9 @@ public class UniversalDependencyScanner {
                     currentName = trimmed.substring(8, trimmed.length() - 1);
                 } else if (trimmed.startsWith("version = \"") && currentName != null) {
                     String ver = trimmed.substring(11, trimmed.length() - 1);
-                    map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, true, "Cargo.lock"));
+                    LLMAnalysisService.SbomPackageDetail existing = map.get(currentName);
+                    boolean isIndirect = (existing != null) ? existing.indirect() : true;
+                    map.put(currentName, new LLMAnalysisService.SbomPackageDetail(currentName, ver, isIndirect, "Cargo.lock"));
                     currentName = null;
                 }
             }
@@ -563,18 +1015,39 @@ public class UniversalDependencyScanner {
             command.add("/c");
             command.add(wrapper.toAbsolutePath().toString());
         } else {
+            command.add("/bin/sh");
             command.add(wrapper.toAbsolutePath().toString());
         }
         command.add("-q");
         command.add("dependencies");
         command.add("--configuration");
         command.add("runtimeClasspath");
+        command.add("--no-daemon");
+        command.add("--console=plain");
+        command.add("-Dorg.gradle.daemon=false");
+        command.add("-Dorg.gradle.parallel=false");
+        command.add("-Dorg.gradle.welcome=never");
+        command.add("-Dorg.gradle.jvmargs=-Xmx128m -XX:MaxMetaspaceSize=64m");
 
-        String output = runProcessWithTimeout(command, rootDir, 25, TimeUnit.SECONDS, "Gradle Wrapper");
+        String output = runProcessWithTimeout(command, rootDir, 90, TimeUnit.SECONDS, "Gradle Wrapper");
         if (output == null || !output.contains("---")) {
             List<String> fallbackCmd = new ArrayList<>(command);
-            fallbackCmd.set(fallbackCmd.size() - 1, "compileClasspath");
-            output = runProcessWithTimeout(fallbackCmd, rootDir, 20, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
+            int idx = fallbackCmd.indexOf("runtimeClasspath");
+            if (idx >= 0) {
+                fallbackCmd.set(idx, "compileClasspath");
+            }
+            output = runProcessWithTimeout(fallbackCmd, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper (compileClasspath)");
+        }
+
+        if (output == null || !output.contains("---")) {
+            // 3차 폴백: 특정 configuration 지정 없이 전체 의존성 트리 출력
+            List<String> allConfigCmd = new ArrayList<>(command);
+            int cfgIdx = allConfigCmd.indexOf("--configuration");
+            if (cfgIdx >= 0) {
+                allConfigCmd.remove(cfgIdx + 1);
+                allConfigCmd.remove(cfgIdx);
+            }
+            output = runProcessWithTimeout(allConfigCmd, rootDir, 60, TimeUnit.SECONDS, "Gradle Wrapper (all configurations)");
         }
 
         if (output != null && output.contains("---")) {
@@ -647,7 +1120,7 @@ public class UniversalDependencyScanner {
 
             LLMAnalysisService.SbomPackageDetail existing = map.get(name);
             if (existing != null && !existing.indirect()) {
-                if (("(managed)".equals(existing.version()) || existing.version().isBlank()) && !"(managed)".equals(version)) {
+                if (("(managed)".equals(existing.version()) || "BOM-managed".equals(existing.version()) || existing.version().isBlank()) && !"(managed)".equals(version)) {
                     map.put(name, new LLMAnalysisService.SbomPackageDetail(name, version, false, "Maven/Gradle"));
                 }
             } else {
@@ -673,13 +1146,14 @@ public class UniversalDependencyScanner {
             command.add("/c");
             command.add(wrapper.toAbsolutePath().toString());
         } else {
+            command.add("/bin/sh");
             command.add(wrapper.toAbsolutePath().toString());
         }
         command.add("-q");
         command.add("dependency:tree");
         command.add("-DoutputType=text");
 
-        String output = runProcessWithTimeout(command, rootDir, 25, TimeUnit.SECONDS, "Maven Wrapper");
+        String output = runProcessWithTimeout(command, rootDir, 60, TimeUnit.SECONDS, "Maven Wrapper");
         if (output != null && (output.contains("+-") || output.contains("\\-"))) {
             int beforeCount = packagesMap.size();
             parseMavenDependencyTreeOutput(output, packagesMap);
@@ -731,7 +1205,13 @@ public class UniversalDependencyScanner {
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.directory(rootDir.toFile());
         pb.redirectErrorStream(true);
-        pb.environment().put("GRADLE_OPTS", "-Dorg.gradle.daemon=false -Dorg.gradle.parallel=false");
+        // Render 512MB RAM 컨테이너 환경에서 Fork된 JVM 프로세스가 cgroup OOM Kill(코드 137)되지 않도록 엄격한 힙/메타스페이스 상한 지정
+        pb.environment().put("GRADLE_OPTS", "-Xmx128m -XX:MaxMetaspaceSize=64m -Dorg.gradle.daemon=false -Dorg.gradle.parallel=false");
+        pb.environment().put("JAVA_TOOL_OPTIONS", "-Xmx128m -XX:MaxMetaspaceSize=64m");
+        pb.environment().put("MAVEN_OPTS", "-Xmx128m -XX:MaxMetaspaceSize=64m");
+        String userHome = System.getProperty("user.home");
+        String gradleUserHome = (userHome != null && !userHome.isBlank()) ? (userHome + "/.gradle") : "/home/appuser/.gradle";
+        pb.environment().put("GRADLE_USER_HOME", gradleUserHome);
 
         try {
             Process process = pb.start();
@@ -759,8 +1239,11 @@ public class UniversalDependencyScanner {
 
             if (process.exitValue() != 0) {
                 String errOutput = readFuture.get(2, TimeUnit.SECONDS);
+                String preview = (errOutput != null && errOutput.length() > 400)
+                        ? errOutput.substring(errOutput.length() - 400)
+                        : (errOutput != null ? errOutput : "");
                 log.warn("[UniversalScanner] {} 프로세스 비정상 종료 (Exit code: {}): {}",
-                        processName, process.exitValue(), errOutput.length() > 300 ? errOutput.substring(0, 300) : errOutput);
+                        processName, process.exitValue(), preview);
                 return null;
             }
 

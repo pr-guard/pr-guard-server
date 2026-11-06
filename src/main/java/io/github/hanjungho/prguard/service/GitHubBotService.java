@@ -67,6 +67,9 @@ public class GitHubBotService {
     @Value("${github.status.context:pr-guard/security}")
     private String statusContext = "pr-guard/security";
 
+    @Value("${github.status.enabled:true}")
+    private boolean statusEnabled = true;
+
     @Value("${diff.max-length:15000}")
     private int maxDiffLength = 15000;
 
@@ -273,12 +276,10 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber);
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
+            HttpHeaders headers = createAuthHeaders(token);
             headers.set("Accept", "application/vnd.github.v3.diff");
 
-            HttpEntity<Void> entity = new HttpEntity<>(headers);
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, new HttpEntity<>(headers), String.class);
 
             String diff = response.getBody();
             if (diff == null || diff.isBlank()) {
@@ -432,11 +433,7 @@ public class GitHubBotService {
         if (repoFullName != null && !repoFullName.isBlank() && !"N/A".equalsIgnoreCase(repoFullName) && repoFullName.contains("/")) {
             try {
                 String repoInstallUrl = apiUrl("/repos/" + repoFullName + "/installation");
-                HttpHeaders headers = createBaseHeaders();
-                headers.setBearerAuth(jwt);
-
-                HttpEntity<Void> entity = new HttpEntity<>(headers);
-                ResponseEntity<String> response = restTemplate.exchange(repoInstallUrl, HttpMethod.GET, entity, String.class);
+                ResponseEntity<String> response = restTemplate.exchange(repoInstallUrl, HttpMethod.GET, createEmptyEntity(jwt), String.class);
                 JsonNode repoInstallNode = objectMapper.readTree(response.getBody());
                 long repoInstallId = repoInstallNode.path("id").asLong();
                 if (repoInstallId > 0) {
@@ -455,11 +452,7 @@ public class GitHubBotService {
         log.info("[GitHubBot] Installation ID가 누락되어 GitHub API를 통해 설치 목록을 자동 조회합니다.");
         try {
             String url = apiUrl("/app/installations");
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(jwt);
-
-            HttpEntity<Void> entity = new HttpEntity<>(headers);
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEmptyEntity(jwt), String.class);
             JsonNode installations = objectMapper.readTree(response.getBody());
 
             if (installations.isArray() && !installations.isEmpty()) {
@@ -483,14 +476,8 @@ public class GitHubBotService {
      */
     private String fetchAndCacheInstallationAccessToken(Long installationId, String jwt) {
         String url = apiUrl("/app/installations/" + installationId + "/access_tokens");
-
-        HttpHeaders headers = createBaseHeaders();
-        headers.setBearerAuth(jwt);
-
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(Map.of(), headers);
-
         try {
-            ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
+            ResponseEntity<String> response = restTemplate.postForEntity(url, createJsonEntity(Map.of(), jwt), String.class);
             JsonNode rootNode = objectMapper.readTree(response.getBody());
             String token = rootNode.path("token").asText("");
             String expiresAtStr = rootNode.path("expires_at").asText("");
@@ -519,15 +506,8 @@ public class GitHubBotService {
      */
     private void createIssueComment(String repoFullName, Integer prNumber, String accessToken, String commentBody) {
         String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/comments");
-
-        HttpHeaders headers = createBaseHeaders();
-        headers.setBearerAuth(accessToken);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-
-        Map<String, String> requestBody = Map.of("body", commentBody);
-        HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
-
         try {
+            HttpEntity<Map<String, String>> entity = createJsonEntity(Map.of("body", commentBody), accessToken);
             ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
             if (!response.getStatusCode().is2xxSuccessful()) {
                 throw new RuntimeException("코멘트 작성 실패: HTTP " + response.getStatusCode());
@@ -548,11 +528,7 @@ public class GitHubBotService {
 
         try {
             String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/comments?per_page=100");
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(accessToken);
-
-            HttpEntity<Void> entity = new HttpEntity<>(headers);
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEmptyEntity(accessToken), String.class);
             JsonNode comments = objectMapper.readTree(response.getBody());
 
             if (comments.isArray()) {
@@ -575,15 +551,8 @@ public class GitHubBotService {
      */
     private void updateIssueComment(String repoFullName, Long commentId, String accessToken, String commentBody) {
         String url = apiUrl("/repos/" + repoFullName + "/issues/comments/" + commentId);
-
-        HttpHeaders headers = createBaseHeaders();
-        headers.setBearerAuth(accessToken);
-        headers.setContentType(MediaType.APPLICATION_JSON);
-
-        Map<String, String> requestBody = Map.of("body", commentBody);
-        HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
-
         try {
+            HttpEntity<Map<String, String>> entity = createJsonEntity(Map.of("body", commentBody), accessToken);
             ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.PATCH, entity, String.class);
             if (!response.getStatusCode().is2xxSuccessful()) {
                 throw new RuntimeException("코멘트 수정 실패: HTTP " + response.getStatusCode());
@@ -607,12 +576,7 @@ public class GitHubBotService {
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber);
-
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-
-            HttpEntity<Void> entity = new HttpEntity<>(headers);
-            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, entity, String.class);
+            ResponseEntity<String> response = restTemplate.exchange(url, HttpMethod.GET, createEmptyEntity(token), String.class);
 
             JsonNode root = objectMapper.readTree(response.getBody());
             String branch = root.path("head").path("ref").asText("");
@@ -644,10 +608,6 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/check-runs");
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
             Map<String, Object> body = Map.of(
                     "name", (checkRunName != null && !checkRunName.isBlank()) ? checkRunName : "PR Guard / Security Scan",
                     "head_sha", headSha,
@@ -659,7 +619,7 @@ public class GitHubBotService {
                     )
             );
 
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, Object>> entity = createJsonEntity(body, token);
             ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
 
             JsonNode root = objectMapper.readTree(response.getBody());
@@ -715,10 +675,6 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/check-runs/" + checkRunId);
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
             Map<String, Object> outputMap = new LinkedHashMap<>();
             outputMap.put("title", title);
             outputMap.put("summary", summary);
@@ -752,7 +708,7 @@ public class GitHubBotService {
                     "output", outputMap
             );
 
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, Object>> entity = createJsonEntity(body, token);
             restTemplate.exchange(url, HttpMethod.PATCH, entity, String.class);
             log.info("[GitHubBot] Check Run 결과 업데이트 완료 (ID: {})", checkRunId);
         } catch (Exception e) {
@@ -775,10 +731,6 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber + "/comments");
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
             String cleanPath = filePath.startsWith("./") ? filePath.substring(2) : filePath;
             if (cleanPath.startsWith("/")) cleanPath = cleanPath.substring(1);
 
@@ -790,7 +742,7 @@ public class GitHubBotService {
                     "side", "RIGHT"
             );
 
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, Object>> entity = createJsonEntity(body, token);
             ResponseEntity<String> response = restTemplate.postForEntity(url, entity, String.class);
             boolean success = response.getStatusCode().is2xxSuccessful();
             if (success) {
@@ -811,7 +763,7 @@ public class GitHubBotService {
      */
     public void createCommitStatus(String repoFullName, String commitSha, Long installationId,
                                    String state, String description, String targetUrl) {
-        if (commitSha == null || commitSha.isBlank() || repoFullName == null || repoFullName.isBlank()) {
+        if (!statusEnabled || commitSha == null || commitSha.isBlank() || repoFullName == null || repoFullName.isBlank()) {
             return;
         }
 
@@ -819,10 +771,6 @@ public class GitHubBotService {
         try {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/statuses/" + commitSha);
-
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
 
             Map<String, String> body = new HashMap<>();
             body.put("state", state);
@@ -834,7 +782,7 @@ public class GitHubBotService {
                 body.put("target_url", targetUrl);
             }
 
-            HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, String>> entity = createJsonEntity(body, token);
             restTemplate.postForEntity(url, entity, String.class);
             log.info("[GitHubBot] 커밋 Status 업데이트 성공 (SHA: {}, State: {})", commitSha, state);
         } catch (Exception e) {
@@ -854,12 +802,7 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/labels");
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
-            Map<String, Object> body = Map.of("labels", List.of(label));
-            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, Object>> entity = createJsonEntity(Map.of("labels", List.of(label)), token);
             restTemplate.postForEntity(url, entity, String.class);
             log.info("[GitHubBot] PR #{} 에 레이블 추가 성공: {}", prNumber, label);
         } catch (Exception e) {
@@ -879,11 +822,7 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/issues/" + prNumber + "/labels/" + label);
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-
-            HttpEntity<Void> entity = new HttpEntity<>(headers);
-            restTemplate.exchange(url, HttpMethod.DELETE, entity, Void.class);
+            restTemplate.exchange(url, HttpMethod.DELETE, createEmptyEntity(token), Void.class);
             log.info("[GitHubBot] PR #{} 에서 레이블 제거 성공: {}", prNumber, label);
         } catch (Exception e) {
             // 404 Not Found는 라벨이 이미 없는 정상 케이스이므로 info 레벨 로깅
@@ -902,12 +841,7 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/issues/comments/" + commentId + "/reactions");
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
-            Map<String, String> body = Map.of("content", content);
-            HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, String>> entity = createJsonEntity(Map.of("content", content), token);
             restTemplate.postForEntity(url, entity, String.class);
             log.info("[GitHubBot] 댓글 #{} 에 반응 추가 완료: {}", commentId, content);
         } catch (Exception e) {
@@ -930,17 +864,13 @@ public class GitHubBotService {
             String token = getInstallationAccessToken(repoFullName, installationId);
             String url = apiUrl("/repos/" + repoFullName + "/pulls/" + prNumber + "/reviews");
 
-            HttpHeaders headers = createBaseHeaders();
-            headers.setBearerAuth(token);
-            headers.setContentType(MediaType.APPLICATION_JSON);
-
             Map<String, String> body = Map.of(
                     "commit_id", commitSha,
                     "event", event,
                     "body", bodyText != null ? bodyText : "PR Guard 보안 검증 완료"
             );
 
-            HttpEntity<Map<String, String>> entity = new HttpEntity<>(body, headers);
+            HttpEntity<Map<String, String>> entity = createJsonEntity(body, token);
             restTemplate.postForEntity(url, entity, String.class);
             log.info("[GitHubBot] PR #{} 공식 리뷰 제출 성공 (이벤트: {})", prNumber, event);
         } catch (Exception e) {
@@ -954,5 +884,27 @@ public class GitHubBotService {
         headers.set("Accept", "application/vnd.github+json");
         headers.set("X-GitHub-Api-Version", "2022-11-28");
         return headers;
+    }
+
+    private HttpHeaders createAuthHeaders(String token) {
+        HttpHeaders headers = createBaseHeaders();
+        if (token != null && !token.isBlank()) {
+            headers.setBearerAuth(token);
+        }
+        return headers;
+    }
+
+    private HttpHeaders createJsonAuthHeaders(String token) {
+        HttpHeaders headers = createAuthHeaders(token);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        return headers;
+    }
+
+    private <T> HttpEntity<T> createJsonEntity(T body, String token) {
+        return new HttpEntity<>(body, createJsonAuthHeaders(token));
+    }
+
+    private HttpEntity<Void> createEmptyEntity(String token) {
+        return new HttpEntity<>(createAuthHeaders(token));
     }
 }

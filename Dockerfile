@@ -15,10 +15,11 @@ COPY src src
 RUN ./gradlew bootJar -x test --no-daemon
 
 # ==========================================
-# Stage 2: Runtime Image with Git & Trivy
+# Stage 2: Runtime Image with Git, Trivy & JDK
 # ==========================================
-FROM eclipse-temurin:17-jre-jammy
+FROM eclipse-temurin:17-jdk-jammy
 WORKDIR /app
+ENV GRADLE_USER_HOME=/home/appuser/.gradle
 
 # 필수 유틸리티, Git 및 헬스체크용 curl 설치
 RUN apt-get update && \
