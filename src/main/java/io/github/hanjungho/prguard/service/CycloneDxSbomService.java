@@ -160,11 +160,42 @@ public class CycloneDxSbomService {
      * (소스코드 내 문자열 리터럴을 맹목적으로 오탐하거나 가짜 목데이터를 생성하지 않습니다)
      */
     public List<ExternalServiceDetail> detectExternalServices(Path rootDir) {
-        if (rootDir == null || !Files.exists(rootDir)) {
-            return Collections.emptyList();
+        return detectExternalServices(rootDir, Collections.emptyList());
+    }
+
+    /**
+     * 저장소 내 실제 설정 파일 및 선언된 패키지(Supabase, Notion, PostgreSQL, Playwright 등)를 정밀 분석하여
+     * 외부 SaaS 및 인프라 연동 엔드포인트를 식별합니다.
+     */
+    public List<ExternalServiceDetail> detectExternalServices(Path rootDir, List<LLMAnalysisService.SbomPackageDetail> packages) {
+        Map<String, ExternalServiceDetail> detected = new LinkedHashMap<>();
+
+        // 1. 패키지 의존성 기반 명시적 외부 SaaS 및 데이터베이스 자산 감지
+        if (packages != null) {
+            for (LLMAnalysisService.SbomPackageDetail pkg : packages) {
+                String n = pkg.name().toLowerCase();
+                if (n.equals("supabase") || n.contains("@supabase/") || n.contains("gotrue") || n.contains("postgrest")) {
+                    detected.putIfAbsent("Supabase", new ExternalServiceDetail(
+                            "Supabase", "Supabase Inc.", "https://*.supabase.co", "클라우드 BaaS, 사용자 인증(Auth) 및 관리형 데이터베이스"));
+                } else if (n.startsWith("psycopg") || n.equals("asyncpg") || n.equals("pg") || n.equals("postgres")) {
+                    detected.putIfAbsent("PostgreSQL", new ExternalServiceDetail(
+                            "PostgreSQL", "PostgreSQL Global Development Group", "postgresql://", "관계형 데이터베이스 영속성 스토리지 (RDBMS)"));
+                } else if (n.equals("notion-client") || n.contains("@notionhq/client")) {
+                    detected.putIfAbsent("Notion API", new ExternalServiceDetail(
+                            "Notion API", "Notion Labs Inc.", "https://api.notion.com", "워크스페이스 문서 및 데이터베이스 연동"));
+                } else if (n.contains("google-generativeai") || n.contains("@google/generative-ai") || n.contains("@google/genai")) {
+                    detected.putIfAbsent("Google Gemini AI", new ExternalServiceDetail(
+                            "Google Gemini AI", "Google Cloud", "https://generativelanguage.googleapis.com", "AI 코드 분석 및 보안 진단 (민감 토큰 마스킹)"));
+                } else if (n.contains("playwright")) {
+                    detected.putIfAbsent("Playwright", new ExternalServiceDetail(
+                            "Playwright", "Microsoft", "Headless Chromium/Firefox/WebKit", "엔드투엔드(E2E) 브라우저 자동화 및 웹 크롤링"));
+                }
+            }
         }
 
-        Map<String, ExternalServiceDetail> detected = new LinkedHashMap<>();
+        if (rootDir == null || !Files.exists(rootDir)) {
+            return new ArrayList<>(detected.values());
+        }
 
         try {
             Files.walkFileTree(rootDir, new SimpleFileVisitor<>() {
@@ -188,7 +219,8 @@ public class CycloneDxSbomService {
                     String lower = file.getFileName().toString().toLowerCase();
                     // 오직 실제 외부 환경/설정이 기술되는 설정 파일 및 배포 매니페스트만 검사 (소스코드 오탐 방지)
                     if (lower.endsWith(".properties") || lower.endsWith(".yml") || lower.endsWith(".yaml")
-                            || lower.equals(".env") || lower.startsWith(".env.") || lower.equals("dockerfile")) {
+                            || lower.startsWith(".env") || lower.equals("dockerfile") || lower.endsWith("compose.yml")
+                            || lower.endsWith("compose.yaml") || lower.equals("settings.py") || lower.equals("config.py")) {
                         try {
                             String content = Files.readString(file, StandardCharsets.UTF_8);
                             checkContentForConfiguredUrls(content, detected);
@@ -257,6 +289,18 @@ public class CycloneDxSbomService {
             } else if (host.contains("sentry.io")) {
                 map.putIfAbsent("Sentry", new ExternalServiceDetail(
                         "Sentry Error Tracking", "Functional Software", "https://" + host, "애플리케이션 런타임 에러 스택 트레이스"));
+            } else if (host.contains("supabase.co") || host.contains("supabase.in")) {
+                map.putIfAbsent("Supabase", new ExternalServiceDetail(
+                        "Supabase", "Supabase Inc.", "https://" + host, "클라우드 BaaS, 사용자 인증(Auth) 및 관리형 데이터베이스"));
+            } else if (host.contains("notion.com") || host.contains("notion.so")) {
+                map.putIfAbsent("Notion API", new ExternalServiceDetail(
+                        "Notion API", "Notion Labs Inc.", "https://api.notion.com", "워크스페이스 문서 및 데이터베이스 연동"));
+            } else if (host.contains("pterodactyl") || host.contains("ptero")) {
+                map.putIfAbsent("Pterodactyl API", new ExternalServiceDetail(
+                        "Pterodactyl API", "Pterodactyl", "https://" + host, "게임 및 컨테이너 원격 인프라 제어 API"));
+            } else if (host.contains("trycloudflare.com") || host.contains("cloudflare")) {
+                map.putIfAbsent("Cloudflare Tunnel", new ExternalServiceDetail(
+                        "Cloudflare Tunnel", "Cloudflare", "https://" + host, "외부 인바운드 터널링 및 네트워크 프록시"));
             } else if (host.equals("hooks.slack.com")) {
                 map.putIfAbsent("Slack", new ExternalServiceDetail(
                         "Slack Webhook", "Salesforce", "https://hooks.slack.com", "CI/CD 빌드 알림 메시지"));

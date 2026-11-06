@@ -453,9 +453,13 @@ public class UniversalDependencyScanner {
             } else if (lowerName.equals("pnpm-lock.yaml") && !file.toString().contains("node_modules")) {
                 parsePnpmLock(file, packagesMap);
             }
-            // 4. Python: requirements.txt, pyproject.toml, poetry.lock, Pipfile.lock
-            else if (lowerName.equals("requirements.txt") || lowerName.endsWith("-requirements.txt")) {
+            // 4. Python: requirements*.txt, requirements*.in, pyproject.toml, Pipfile, poetry.lock, Pipfile.lock
+            else if (lowerName.contains("requirements") && (lowerName.endsWith(".txt") || lowerName.endsWith(".in"))) {
                 parsePythonReqs(file, packagesMap);
+            } else if (lowerName.equals("pyproject.toml")) {
+                parsePyprojectToml(file, packagesMap);
+            } else if (lowerName.equals("pipfile")) {
+                parsePipfile(file, packagesMap);
             } else if (lowerName.equals("poetry.lock")) {
                 parsePoetryLock(file, packagesMap);
             } else if (lowerName.equals("pipfile.lock")) {
@@ -718,12 +722,141 @@ public class UniversalDependencyScanner {
     }
 
     private void parsePythonReqs(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) throws IOException {
-        String content = Files.readString(file, StandardCharsets.UTF_8);
-        Matcher m = PYTHON_REQ_PATTERN.matcher(content);
-        while (m.find()) {
-            String name = m.group(1).trim();
-            String ver = m.group(2).trim();
-            map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+            // 주석 및 빈 줄, pip 옵션(-r, -i, -f, --extra-index-url 등) 제외
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("-")) {
+                continue;
+            }
+            // 인라인 주석 제거: "fastapi>=0.100 # web framework" -> "fastapi>=0.100"
+            int commentIdx = line.indexOf('#');
+            if (commentIdx != -1) {
+                line = line.substring(0, commentIdx).trim();
+            }
+            // 환경 마커 제거: "pywin32; sys_platform == 'win32'" -> "pywin32"
+            int semiIdx = line.indexOf(';');
+            if (semiIdx != -1) {
+                line = line.substring(0, semiIdx).trim();
+            }
+            if (line.isEmpty()) continue;
+
+            // 버전 연산자 분리 (==, >=, <=, ~=, !=, <, >, @)
+            String name;
+            String ver = "latest";
+            String[] split = line.split("[><=~@!]+", 2);
+            name = split[0].trim();
+            if (split.length > 1) {
+                ver = split[1].split("[,;\\s]+")[0].trim();
+            }
+
+            // extras 제거: "uvicorn[standard]" -> name: "uvicorn"
+            int bracketIdx = name.indexOf('[');
+            if (bracketIdx != -1) {
+                name = name.substring(0, bracketIdx).trim();
+            }
+
+            if (!name.isBlank()) {
+                map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+            }
+        }
+    }
+
+    private void parsePyprojectToml(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            boolean inDependencies = false;
+            boolean inPoetryDependencies = false;
+
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+
+                if (line.startsWith("[") && line.endsWith("]")) {
+                    inDependencies = line.equals("[project]") || line.equals("[project.dependencies]") || line.equals("[project.optional-dependencies]");
+                    inPoetryDependencies = line.equals("[tool.poetry.dependencies]") || line.equals("[tool.poetry.dev-dependencies]");
+                    continue;
+                }
+
+                // 1. PEP 621: dependencies = [ ... ]
+                if (line.startsWith("dependencies = [") || line.equals("dependencies = [")) {
+                    inDependencies = true;
+                    continue;
+                }
+
+                if (inDependencies) {
+                    if (line.equals("]")) {
+                        inDependencies = false;
+                        continue;
+                    }
+                    if (line.startsWith("\"") || line.startsWith("'")) {
+                        String clean = line.replace("\"", "").replace("'", "").replace(",", "").trim();
+                        int commentIdx = clean.indexOf('#');
+                        if (commentIdx != -1) clean = clean.substring(0, commentIdx).trim();
+                        int semiIdx = clean.indexOf(';');
+                        if (semiIdx != -1) clean = clean.substring(0, semiIdx).trim();
+
+                        String[] split = clean.split("[><=~@!]+", 2);
+                        String name = split[0].trim();
+                        int bIdx = name.indexOf('[');
+                        if (bIdx != -1) name = name.substring(0, bIdx).trim();
+                        String ver = (split.length > 1) ? split[1].split("[,;\\s]+")[0].trim() : "latest";
+
+                        if (!name.isBlank()) {
+                            map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+                        }
+                    }
+                }
+
+                // 2. Poetry: name = "^version" or name = { version = "..." }
+                if (inPoetryDependencies && line.contains("=")) {
+                    int eqIdx = line.indexOf('=');
+                    String name = line.substring(0, eqIdx).trim();
+                    if (!name.equals("python")) {
+                        String verPart = line.substring(eqIdx + 1).replace("\"", "").replace("'", "").trim();
+                        int bIdx = name.indexOf('[');
+                        if (bIdx != -1) name = name.substring(0, bIdx).trim();
+                        String ver = verPart.startsWith("^") ? verPart.substring(1) : verPart;
+                        if (ver.contains("version")) {
+                            int vIdx = ver.indexOf("version");
+                            ver = ver.substring(vIdx).replaceAll("[^0-9a-zA-Z.]", "");
+                        }
+                        if (!name.isBlank() && !ver.isBlank()) {
+                            map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] pyproject.toml 파싱 스킵: {}", e.getMessage());
+        }
+    }
+
+    private void parsePipfile(Path file, Map<String, LLMAnalysisService.SbomPackageDetail> map) {
+        try {
+            List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+            boolean inPackages = false;
+            for (String rawLine : lines) {
+                String line = rawLine.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+
+                if (line.startsWith("[") && line.endsWith("]")) {
+                    inPackages = line.equalsIgnoreCase("[packages]") || line.equalsIgnoreCase("[dev-packages]");
+                    continue;
+                }
+
+                if (inPackages && line.contains("=")) {
+                    int eqIdx = line.indexOf('=');
+                    String name = line.substring(0, eqIdx).trim();
+                    String ver = line.substring(eqIdx + 1).replace("\"", "").replace("'", "").trim();
+                    if (ver.equals("*")) ver = "latest";
+                    if (!name.isBlank()) {
+                        map.putIfAbsent(name, new LLMAnalysisService.SbomPackageDetail(name, ver, false, "PyPI(Python)"));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[UniversalScanner] Pipfile 파싱 스킵: {}", e.getMessage());
         }
     }
 

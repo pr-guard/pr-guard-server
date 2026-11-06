@@ -144,9 +144,9 @@ public class TrivyScannerService {
                     : "미지정 (기타 프로젝트)";
             log.info("[TrivyScanner] 프로젝트 기술 스택 및 주요 언어 감지: {}", projectEnvironment);
 
-            // 4-1. 외부 연동 SaaS 및 타사 서비스 감지 (Gemini, GitHub, Toss, Stripe, AWS 등)
+            // 4-1. 외부 연동 SaaS 및 타사 서비스 감지 (Gemini, GitHub, Supabase, Notion, Postgres 등)
             List<CycloneDxSbomService.ExternalServiceDetail> externalServices = (cycloneDxSbomService != null)
-                    ? cycloneDxSbomService.detectExternalServices(tempDir)
+                    ? cycloneDxSbomService.detectExternalServices(tempDir, manifestPackages)
                     : Collections.emptyList();
             log.info("[TrivyScanner] 외부 연동 SaaS 서비스 감지: 총 {}개", externalServices.size());
 

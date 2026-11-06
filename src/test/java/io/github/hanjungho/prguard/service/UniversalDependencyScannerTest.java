@@ -482,4 +482,56 @@ class UniversalDependencyScannerTest {
         assertTrue(packages.stream().anyMatch(p -> p.name().equals("guzzlehttp/guzzle") && p.version().equals("7.8.1")));
         assertTrue(packages.stream().anyMatch(p -> p.name().equals("monolog/monolog") && p.version().equals("3.5.0")));
     }
+
+    @Test
+    @DisplayName("Python requirements.txt에서 버전 핀 없는 패키지 및 extras(fastapi[all], uvicorn[standard])를 정확히 파싱해야 한다")
+    void shouldParsePythonRequirementsWithExtrasAndUnpinned(@TempDir Path tempDir) throws IOException {
+        String reqs = """
+                fastapi[all]>=0.100.0 # web framework
+                uvicorn[standard]
+                psycopg[binary]
+                supabase==2.3.4
+                notion-client
+                playwright
+                -r base.txt
+                """;
+        Files.writeString(tempDir.resolve("requirements.txt"), reqs);
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertEquals(6, pkgs.size());
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("fastapi") && "0.100.0".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("uvicorn") && "latest".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("psycopg") && "latest".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("supabase") && "2.3.4".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("notion-client")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("playwright")));
+    }
+
+    @Test
+    @DisplayName("Python pyproject.toml PEP 621 및 Poetry 의존성을 정확히 파싱해야 한다")
+    void shouldParsePyprojectTomlDependencies(@TempDir Path tempDir) throws IOException {
+        String toml = """
+                [project]
+                name = "unt-work-hub"
+                dependencies = [
+                    "fastapi>=0.109.0",
+                    "uvicorn[standard]",
+                    "psycopg",
+                    "supabase",
+                    "notion-client",
+                    "playwright"
+                ]
+                """;
+        Files.writeString(tempDir.resolve("pyproject.toml"), toml);
+
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = scanner.scan(tempDir);
+
+        assertNotNull(pkgs);
+        assertEquals(6, pkgs.size());
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("fastapi") && "0.109.0".equals(p.version())));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("uvicorn")));
+        assertTrue(pkgs.stream().anyMatch(p -> p.name().equals("supabase")));
+    }
 }

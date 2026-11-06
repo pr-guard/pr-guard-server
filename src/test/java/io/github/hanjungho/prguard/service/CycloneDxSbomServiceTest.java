@@ -288,5 +288,25 @@ class CycloneDxSbomServiceTest {
                 "다단계 빌드에서는 최종 런타임 베이스 이미지가 추출되어야 함 (실제 리포트: " + report + ")");
         assertFalse(report.contains("AS builder"), "빌더 별칭(AS builder)이 리포트에 노출되지 않아야 함");
     }
+
+    @Test
+    @DisplayName("선언된 라이브러리 목록에서 Supabase, PostgreSQL, Notion, Playwright 등을 감지해야 한다")
+    void shouldDetectPolyglotExternalServicesAndDatabases() {
+        List<LLMAnalysisService.SbomPackageDetail> pkgs = List.of(
+                new LLMAnalysisService.SbomPackageDetail("supabase", "2.3.4", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("psycopg", "3.1.8", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("notion-client", "2.2.1", false, "PyPI(Python)"),
+                new LLMAnalysisService.SbomPackageDetail("playwright", "1.40.0", false, "PyPI(Python)")
+        );
+
+        List<CycloneDxSbomService.ExternalServiceDetail> services = service.detectExternalServices(null, pkgs);
+
+        assertNotNull(services);
+        assertEquals(4, services.size());
+        assertTrue(services.stream().anyMatch(s -> s.name().equals("Supabase")));
+        assertTrue(services.stream().anyMatch(s -> s.name().equals("PostgreSQL")));
+        assertTrue(services.stream().anyMatch(s -> s.name().equals("Notion API")));
+        assertTrue(services.stream().anyMatch(s -> s.name().equals("Playwright")));
+    }
 }
 

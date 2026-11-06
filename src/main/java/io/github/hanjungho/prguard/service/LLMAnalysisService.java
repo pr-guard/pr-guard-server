@@ -878,8 +878,8 @@ public class LLMAnalysisService {
                    - 최상단 판정 배너에만 유일하게 GitHub Alert([!CAUTION], [!WARNING], [!TIP])를 1회 적용하라.
                    - 하위 1번(CVE)과 2번(코드 결함) 섹션에는 Alert 블록(> [!CAUTION] 등)을 절대 중복 사용하지 마라! (동일한 거대 Alert 박스가 연속으로 나오면 시각적 위계가 무너진다)
                    - 상태별 최상단 Alert 문법:
-                     - [!TIP] (초록색): 0건, 안전, 통과
-                     - [!WARNING] (노란색): MEDIUM/LOW 취약점 또는 경미한 설정 결함
+                     - [!TIP] (초록색): CVE 0건 및 코드 결함 0건 (완전한 안전, 통과)
+                     - [!WARNING] (노란색): MEDIUM/LOW 취약점 또는 코드 로직 결함(인증 누락, TLS 무력화, 미검증 엔드포인트 등)
                      - [!CAUTION] (빨간색): CRITICAL/HIGH 취약점, 치명적 코드 결함(RCE, SQLi, SSRF, 시크릿 노출 등)
                    - 최상단 마스터 Alert 배너 내부 구성:
                      - 판정 헤드라인: `### 차단 권고 (BLOCK)` 또는 `### 주의 (WARN)` 또는 `### 승인 (PASS)`
@@ -889,7 +889,17 @@ public class LLMAnalysisService {
                        - `- **오픈소스 취약점 (CVE):** 총 N건 (CRITICAL N건, HIGH N건, ...)` 또는 `0건 (안전)`
                        - `- **코드 로직 및 설정 결함:** 총 N건 (핵심 결함 요약)` 또는 `0건 (안전)`
 
-                3. 결함이 존재하는 섹션만 상세 표기 및 <details open> 기본 펼침:
+                3. 애플리케이션 및 비즈니스 로직 보안 전수 감사 지침 (핵심):
+                   - Trivy 정적 스캐너는 오직 알려진 오픈소스 라이브러리 CVE만을 감지하며, 개발자가 작성한 소스코드의 비즈니스 로직 결함(CWE)은 절대 검출하지 못한다.
+                   - 따라서 너는 반드시 [입력 데이터 2: PR 변경 소스코드 (Diff)]를 전수 정밀 감사하여 다음 보안 결함을 검출해야 한다:
+                     a. TLS/SSL 인증서 검증 무력화 (CWE-295): `ignore_https_errors=True`, `--ignore-certificate-errors`, `verify=False`, `rejectUnauthorized: false` 등 중간자 공격(MITM)을 유발하는 취약한 네트워크/브라우저 옵션
+                     b. 인증 및 인가 누락 (CWE-306, CWE-862): FastAPI, Express, Spring 등의 라우터에서 인증 의존성(`Depends(...)`, 미들웨어, 토큰 검증 등) 없이 외부에 노출된 민감 API (모니터링, 상태 변경, 보고서 조회/수정, AI 실행 등)
+                     c. 인젝션 및 미검증 외부 입력 (CWE-89, CWE-78, CWE-918): SQL 파라미터 미바인딩, 안전하지 않은 커맨드 실행, SSRF
+                     d. 외부 공유 시 보호 장치 부재: 인증 없이 Cloudflare 터널 등으로 임의 호출 가능한 취약점
+                   - [절대 판정 규칙]: Trivy 스캔 요약 JSON의 CVE가 0건이라 하더라도, PR Diff에서 위와 같은 코드 레벨 보안 결함이 1건이라도 발견되면 절대로 [!TIP] 승인 (PASS)을 주지 말고, 반드시 [!WARNING] 주의 (WARN) 또는 [!CAUTION] 차단 권고 (BLOCK)로 판정하라!
+                   - 그리고 `### 2. 코드 로직 및 설정 결함 — 총 N건` 섹션을 생성하여 해당 라인 위치, 위협 요인(CWE 번호 명시), 구체적 악용 시나리오, 그리고 올바른 diff 수정 코드를 반드시 제시하라!
+
+                4. 결함이 존재하는 섹션만 상세 표기 및 <details open> 기본 펼침:
                    - 상단 마스터 Alert 배너에 이미 CVE와 코드 결함의 총 건수가 명시되어 있으므로, 0건인 안전한 항목은 하위 세부 섹션을 생성하지 말고 과감히 생략하라.
                    - 취약점(CVE)이 1건 이상 존재하는 경우에만:
                      - `### 1. 오픈소스 취약점 (CVE) — 총 N건 (CRITICAL N건, HIGH N건, MEDIUM N건, LOW N건)` 헤더 및 `<details open>` 토글 출력
@@ -898,19 +908,20 @@ public class LLMAnalysisService {
                    - 둘 다 0건인 안전한 경우(케이스 B):
                      - 최상단 [!TIP] 승인 배너만 출력하고 하위 빈 섹션들은 일절 생성하지 마라.
 
-                4. 의존성 목록(SBOM)은 AI 생성 제외 (Java 백엔드 자동 부록 첨부):
+                5. 의존성 목록(SBOM)은 AI 생성 제외 (Java 백엔드 자동 부록 첨부):
                    - 소프트웨어 자재 명세서(SBOM)는 Java 백엔드 단에서 리포트 최하단에 별도 부록으로 자동 첨부된다.
                    - 따라서 AI는 SBOM 섹션이나 의존성 표를 일절 출력하지 말고, 1번 CVE와 2번 코드 결함 분석에만 집중하라.
 
-                5. 코드 로직 및 설정 결함의 구조화된 Bullet points 작성 (줄글 문단 엄격 금지):
+                6. 코드 로직 및 설정 결함의 구조화된 Bullet points 작성 (줄글 문단 엄격 금지):
                    - 2번 '코드 로직 및 설정 결함'을 설명할 때 절대로 긴 문단이나 장황한 줄글을 쓰지 마라.
                    - 반드시 `- **[취약점 종류]** `발생 위치`: 구체적인 위협 설명 1줄` 형식의 리스트(-)로 명확하게 끊어서 출력하라.
                    - 예시:
                      - **[시크릿 하드코딩]** `index.js`: JWT 서명 검증 시 `pipeline-test-secret`이 평문으로 노출됨.
                      - **[SSRF 위험]** `index.js`: 검증되지 않은 외부 입력값(`targetUrl`)이 `axios.get`으로 직접 전달됨.
-                     - **[런타임 Base Image 취약점]** `Dockerfile`: Node.js 18.x 구버전 베이스 이미지에 Node2Shell CVE 존재.
+                     - **[TLS 인증서 검증 무력화 (CWE-295)]** `scraper.py`: `ignore_https_errors=True`로 인해 중간자 공격(MITM)에 취약함.
+                     - **[인증/인가 누락 (CWE-306)]** `main.py`: 민감 API 엔드포인트에 인증 의존성(`Depends`) 부재.
 
-                6. 토글 내 조치 가이드 및 코드 Diff 개행 규칙 (줄바꿈 깨짐 엄격 방지):
+                7. 토글 내 조치 가이드 및 코드 Diff 개행 규칙 (줄바꿈 깨짐 엄격 방지):
                    - `<summary>...</summary>` 태그 바로 다음 줄에는 반드시 빈 줄(Blank line, 2개 연속 개행)을 넣어라. 빈 줄이 없으면 깃허브에서 요약 제목과 내용이 한 줄로 합쳐진다.
                    - `<details>` 내부에는 `[!NOTE]`, `[!TIP]` 등의 Alert 문법을 쓰지 마라 (깃허브 details 내에서는 렌더링되지 않음).
                    - 1번 CVE 토글 내부 하단: 의존성 패치 명령어(```bash ... ```)
@@ -921,7 +932,7 @@ public class LLMAnalysisService {
                      - `+ // ✅ 안전하게 수정된 코드`
                      - `+ 수정 코드 줄`
 
-                7. 마크다운 구분선:
+                8. 마크다운 구분선:
                    - 각 섹션 사이에는 반드시 `---` 구분선을 삽입하라.
 
                 [입력 데이터 1: SBOM 및 Trivy 스캔 요약 JSON]
